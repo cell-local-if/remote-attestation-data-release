@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, String, Text, TypeDecorator, UniqueConstraint
+from sqlalchemy import DateTime, Integer, String, Text, TypeDecorator, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -99,3 +99,59 @@ class TrustRoot(Base):
     # SHA-256 of the DER encoding, used for exact duplicate detection.
     cert_sha256: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+#: Persisted release-decision outcomes.
+DECISION_GRANTED = "granted"
+DECISION_DENIED = "denied"
+DECISION_STATUSES = frozenset({DECISION_GRANTED, DECISION_DENIED})
+
+
+class Policy(Base):
+    __tablename__ = "policies"
+    # Versions are allocated per (tenant, workload, name); the constraint
+    # guarantees concurrent creators can never be assigned the same number.
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "name",
+            "version",
+            name="uq_policy_scope_name_version",
+        ),
+    )
+
+    policy_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    name: Mapped[str] = mapped_column(String(256))
+    # Monotonically increasing within the (tenant, workload, name) scope,
+    # starting at 1. Every version is a distinct row; old versions are kept.
+    version: Mapped[int] = mapped_column(Integer)
+    # Canonical JSON serialization of the validated rule document. The rule
+    # is a policy definition, not evidence: it never contains raw evidence
+    # or attestation claims.
+    rule: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class Decision(Base):
+    __tablename__ = "decisions"
+    # Exactly one audit decision per evidence and policy (each policy row is
+    # one immutable version, so this is per evidence + policy version).
+    __table_args__ = (
+        UniqueConstraint(
+            "evidence_id", "policy_id", name="uq_decision_evidence_policy"
+        ),
+    )
+
+    decision_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    evidence_id: Mapped[str] = mapped_column(String(36), index=True)
+    policy_id: Mapped[str] = mapped_column(String(36))
+    policy_version: Mapped[int] = mapped_column(Integer)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # One of DECISION_*; the audit record stores only the outcome, never the
+    # raw evidence or the claims it was evaluated against.
+    status: Mapped[str] = mapped_column(String(16))
+    decided_at: Mapped[datetime] = mapped_column(UTCDateTime())
