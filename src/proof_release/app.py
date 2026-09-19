@@ -12,9 +12,10 @@ from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
 from sqlalchemy import create_engine, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
-from proof_release.db import Base, Challenge
+from proof_release.db import Base, Challenge, Evidence
 
 DEFAULT_DATABASE_URL = "sqlite:///./proof_release.db"
 DATABASE_URL_ENV = "PROOF_RELEASE_DATABASE_URL"
@@ -37,6 +38,10 @@ def _rfc3339(value: datetime) -> str:
 
 def _nonce_digest(nonce: str) -> str:
     return hashlib.sha256(nonce.encode("ascii")).hexdigest()
+
+
+def _evidence_digest(evidence: str) -> str:
+    return hashlib.sha256(evidence.encode("utf-8")).hexdigest()
 
 
 def _require_non_blank(value: str) -> str:
@@ -82,6 +87,33 @@ class ChallengeConsumedResponse(BaseModel):
     challenge_id: str
     status: str
     consumed_at: str
+
+
+class SubmitEvidenceRequest(BaseModel):
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    challenge_id: StrictStr = Field(min_length=1)
+    nonce: StrictStr = Field(min_length=1)
+    evidence_format: StrictStr = Field(min_length=1)
+    evidence: StrictStr = Field(min_length=1)
+
+    _non_blank = field_validator(
+        "tenant_id", "workload_id", "challenge_id", "evidence_format", "evidence"
+    )(_require_non_blank)
+
+    @field_validator("nonce")
+    @classmethod
+    def _nonce_format(cls, value: str) -> str:
+        if not _NONCE_RE.fullmatch(value):
+            raise ValueError("nonce must be unpadded base64url")
+        return value
+
+
+class EvidenceReceivedResponse(BaseModel):
+    evidence_id: str
+    challenge_id: str
+    status: str
+    received_at: str
 
 
 def create_app(database_url: str | None = None) -> FastAPI:
@@ -175,6 +207,80 @@ def create_app(database_url: str | None = None) -> FastAPI:
             challenge_id=challenge_id,
             status="consumed",
             consumed_at=_rfc3339(now),
+        )
+
+    @app.post(
+        "/v1/evidence",
+        status_code=201,
+        response_model=EvidenceReceivedResponse,
+    )
+    def submit_evidence(
+        body: SubmitEvidenceRequest,
+    ) -> EvidenceReceivedResponse:
+        digest = _nonce_digest(body.nonce)
+        now = _utcnow()
+        with session_factory() as session:
+            challenge = session.get(Challenge, body.challenge_id)
+            if (
+                challenge is None
+                or challenge.tenant_id != body.tenant_id
+                or challenge.workload_id != body.workload_id
+            ):
+                raise HTTPException(status_code=404, detail="challenge not found")
+            if not hmac.compare_digest(challenge.nonce_digest, digest):
+                raise HTTPException(status_code=401, detail="invalid nonce")
+            if challenge.status == "consumed":
+                raise HTTPException(
+                    status_code=409, detail="challenge already consumed"
+                )
+            if challenge.expires_at <= now:
+                raise HTTPException(status_code=410, detail="challenge expired")
+            # Atomic claim: only one concurrent request can flip pending ->
+            # consumed, whether via this endpoint or the consume endpoint.
+            result = session.execute(
+                update(Challenge)
+                .where(
+                    Challenge.challenge_id == body.challenge_id,
+                    Challenge.status == "pending",
+                    Challenge.expires_at > now,
+                )
+                .values(status="consumed", consumed_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            if result.rowcount != 1:
+                session.rollback()
+                fresh = session.get(Challenge, body.challenge_id)
+                if fresh is not None and fresh.status == "consumed":
+                    raise HTTPException(
+                        status_code=409, detail="challenge already consumed"
+                    )
+                raise HTTPException(status_code=410, detail="challenge expired")
+            evidence = Evidence(
+                evidence_id=str(uuid.uuid4()),
+                tenant_id=body.tenant_id,
+                workload_id=body.workload_id,
+                challenge_id=body.challenge_id,
+                evidence_format=body.evidence_format,
+                evidence_digest=_evidence_digest(body.evidence),
+                status="received",
+                received_at=now,
+            )
+            session.add(evidence)
+            # Consuming the challenge and recording the evidence commit together.
+            # The unique challenge_id index is the final guard against a racing
+            # insert that claimed the challenge first.
+            try:
+                session.commit()
+            except IntegrityError:
+                session.rollback()
+                raise HTTPException(
+                    status_code=409, detail="evidence already received"
+                )
+        return EvidenceReceivedResponse(
+            evidence_id=evidence.evidence_id,
+            challenge_id=body.challenge_id,
+            status="received",
+            received_at=_rfc3339(now),
         )
 
     return app
