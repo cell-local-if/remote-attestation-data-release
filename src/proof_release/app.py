@@ -15,10 +15,11 @@ from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
 from sqlalchemy import create_engine, event, select, text, update
 from sqlalchemy.orm import sessionmaker
 
-from proof_release.db import Base, Challenge, Evidence
+from proof_release.db import Base, Challenge, Evidence, VerificationResultCode
 from proof_release.verifiers import (
     ChallengeContext,
     VerificationContext,
+    VerificationResult,
     VerifierRegistry,
     default_registry,
 )
@@ -131,17 +132,40 @@ class EvidenceVerifiedResponse(BaseModel):
     verified_at: str
 
 
+def _sqlite_version(conn) -> tuple[int, ...]:
+    raw = conn.execute(text("SELECT sqlite_version()")).scalar() or ""
+    return tuple(int(part) for part in str(raw).split(".") if part.isdigit())
+
+
 def _migrate_additive(engine) -> None:
-    """Apply forward-only additive column additions to pre-existing databases."""
+    """Apply forward-only, additive upgrades to pre-existing databases.
+
+    Older releases stored a free-text ``verification_detail`` note supplied
+    by the verifier plugin. That column could carry raw evidence or private
+    context, so it is retired in favour of ``verification_result_code``: a
+    finite, service-defined code derived only from the pass/fail verdict.
+
+    The upgrade is deliberately forward-compatible and never destructive to
+    settled conclusions:
+
+    * the new nullable column is added when missing (databases created from
+      current metadata already have it);
+    * settled rows are backfilled from their ``status`` — verified rows get
+      ``accepted``, rejected rows get ``rejected``;
+    * any legacy free-text note is scrubbed (and the obsolete column dropped
+      when the SQLite version supports it). An old database therefore opens
+      cleanly and historical notes can neither fail verification nor leak.
+    """
     if engine.dialect.name != "sqlite":
         # Non-sqlite deployments are created from metadata; nothing to add.
         return
     additions = {
         "evidence": (
             ("verified_at", "DATETIME"),
-            ("verification_detail", "VARCHAR(256)"),
+            ("verification_result_code", "VARCHAR(32)"),
         ),
     }
+    scrubbed_legacy_text = False
     with engine.begin() as conn:
         for table, columns in additions.items():
             existing = {
@@ -153,6 +177,53 @@ def _migrate_additive(engine) -> None:
                     conn.execute(
                         text(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
                     )
+            # Re-read the column set in case columns were just added.
+            existing = {
+                row[1]
+                for row in conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
+            }
+            if table == "evidence" and "verification_result_code" in existing:
+                # Backfill the controlled code solely from the already
+                # settled status; never from the old free-text note.
+                conn.execute(
+                    text(
+                        "UPDATE evidence SET verification_result_code = CASE status "
+                        "WHEN 'verified' THEN :accepted "
+                        "WHEN 'rejected' THEN :rejected "
+                        "ELSE NULL END "
+                        "WHERE verification_result_code IS NULL "
+                        "AND status IN ('verified', 'rejected')"
+                    ).bindparams(
+                        accepted=VerificationResultCode.ACCEPTED.value,
+                        rejected=VerificationResultCode.REJECTED.value,
+                    )
+                )
+            # Scrub the retired free-text column so nothing a legacy plugin
+            # wrote (potentially raw evidence or secrets) remains on disk.
+            if table == "evidence" and "verification_detail" in existing:
+                conn.execute(text("UPDATE evidence SET verification_detail = NULL"))
+                if _sqlite_version(conn) >= (3, 35, 0):
+                    # DROP COLUMN is available from SQLite 3.35; on older
+                    # versions the column stays behind but is always NULL and
+                    # is not mapped by the ORM, so it cannot leak.
+                    conn.execute(
+                        text("ALTER TABLE evidence DROP COLUMN verification_detail")
+                    )
+                scrubbed_legacy_text = True
+
+    if scrubbed_legacy_text:
+        # Updating/dropping can leave the old note bytes behind in freed
+        # pages; VACUUM once to physically erase them. Run it on a raw pooled
+        # connection so it executes outside SQLAlchemy's BEGIN IMMEDIATE
+        # handling (VACUUM cannot run inside a transaction).
+        raw_connection = engine.pool.connect()
+        try:
+            cursor = raw_connection.cursor()
+            cursor.execute("VACUUM")
+            cursor.close()
+            raw_connection.commit()
+        finally:
+            raw_connection.close()
 
 
 def create_app(
@@ -406,15 +477,32 @@ def create_app(
             )
             # The raw evidence exists only on the stack for this call; it is
             # never logged, persisted, or placed on the response. On plugin
-            # failure the exception rolls the transaction back, leaving no
+            # failure the transaction is rolled back, leaving no
             # half-finished state, and only non-sensitive identifiers are
             # logged.
+            #
+            # The plugin is trusted with exactly one piece of output: the
+            # ``accepted`` boolean. Anything else it might return (a detail
+            # string, reason, exception text, extra attributes — any of which
+            # could embed the raw evidence, a key or other private context)
+            # is never read, truncated, transformed, logged, persisted or
+            # returned. A result that is not a VerificationResult carrying a
+            # real boolean is treated as a plugin fault, not a verdict.
             try:
                 result = verifier.verify(verification_context)
+                if not isinstance(result, VerificationResult):
+                    # Force the shared fault path below; never render result.
+                    raise TypeError("verifier returned a non-result object")
+                accepted = result.accepted
+                if not isinstance(accepted, bool):
+                    raise TypeError("verifier accepted flag is not boolean")
             except Exception as exc:
                 # Log only non-sensitive identifiers and the exception type —
                 # never the traceback/message, since a faulty plugin could
-                # embed raw evidence or private context in it.
+                # embed raw evidence or private context in it. The session is
+                # rolled back as the context exits, so the record stays
+                # received and verification can be retried (e.g. after the
+                # plugin is replaced).
                 logger.error(
                     "verifier %s for format %r failed on evidence %s: %s",
                     type(verifier).__name__,
@@ -423,9 +511,12 @@ def create_app(
                     type(exc).__name__,
                 )
                 raise HTTPException(status_code=500, detail="verification failed")
-            new_status = "verified" if result.accepted else "rejected"
+
+            # The persisted code comes solely from the controlled boolean and
+            # belongs to the service's finite result-code set.
+            new_status = "verified" if accepted else "rejected"
+            result_code = VerificationResultCode.from_accepted(accepted)
             verified_at = _utcnow()
-            detail = result.detail[:255] if result.detail else None
 
             # Atomic settlement: exactly one caller can flip
             # received -> a terminal status.
@@ -438,7 +529,7 @@ def create_app(
                 .values(
                     status=new_status,
                     verified_at=verified_at,
-                    verification_detail=detail,
+                    verification_result_code=result_code.value,
                 )
                 .execution_options(synchronize_session=False)
             )
