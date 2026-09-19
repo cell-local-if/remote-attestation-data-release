@@ -16,4 +16,8 @@ pytest -q
 uvicorn proof_release.app:app --reload
 ```
 
-The initial API exposes `GET /health`, which returns a JSON readiness result. It intentionally contains no attestation or data-release workflow yet.
+The API exposes `GET /health`, which returns a JSON readiness result, and a random-challenge flow:
+
+- `POST /v1/challenges` issues a one-time random challenge (nonce) bound to a tenant and workload, with a bounded TTL.
+- `POST /v1/challenges/{challenge_id}/consume` consumes a pending, unexpired challenge by presenting its nonce to prove freshness.
+- `POST /v1/evidence` receives attestation evidence for a pending, unexpired challenge. The JSON body must include `tenant_id`, `workload_id`, `challenge_id`, `nonce` (unpadded base64url), `evidence_format`, and `evidence`. On success it returns `201` with `evidence_id`, `challenge_id`, status `received`, and a UTC RFC3339 `received_at`, and consumes the challenge in the same transaction so it cannot be reused. Only the SHA-256 digest of the evidence is persisted — never the evidence itself. Errors: `404` unknown/mismatched challenge, `401` wrong nonce, `409` already consumed or received, `410` expired, `422` invalid fields.

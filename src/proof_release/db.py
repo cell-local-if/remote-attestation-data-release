@@ -43,3 +43,18 @@ class Challenge(Base):
     issued_at: Mapped[datetime] = mapped_column(UTCDateTime())
     expires_at: Mapped[datetime] = mapped_column(UTCDateTime())
     consumed_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+
+
+class Evidence(Base):
+    __tablename__ = "evidence"
+
+    evidence_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    # At most one evidence record per challenge.
+    challenge_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    evidence_format: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(16), default="received")
+    received_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    # Only the SHA-256 digest of the evidence is persisted, never the evidence itself.
+    evidence_sha256: Mapped[str] = mapped_column(String(64))
