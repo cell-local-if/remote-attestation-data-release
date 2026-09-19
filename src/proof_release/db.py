@@ -58,3 +58,5 @@ class Evidence(Base):
     received_at: Mapped[datetime] = mapped_column(UTCDateTime())
     # Only the SHA-256 digest of the evidence is persisted, never the evidence itself.
     evidence_sha256: Mapped[str] = mapped_column(String(64))
+    # Set exactly once, atomically, when the first verification concludes.
+    verified_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)

@@ -6,6 +6,7 @@ import hmac
 import os
 import re
 import secrets
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -15,6 +16,7 @@ from sqlalchemy import create_engine, update
 from sqlalchemy.orm import sessionmaker
 
 from proof_release.db import Base, Challenge, Evidence
+from proof_release.verifiers import VerificationContext, get_verifier
 
 DEFAULT_DATABASE_URL = "sqlite:///./proof_release.db"
 DATABASE_URL_ENV = "PROOF_RELEASE_DATABASE_URL"
@@ -105,6 +107,23 @@ class EvidenceReceivedResponse(BaseModel):
     received_at: str
 
 
+class VerifyEvidenceRequest(BaseModel):
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    nonce: StrictStr = Field(min_length=1)
+    evidence: StrictStr = Field(min_length=1)
+
+    _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
+    _nonce_valid = field_validator("nonce")(_nonce_format)
+
+
+class EvidenceVerifiedResponse(BaseModel):
+    evidence_id: str
+    challenge_id: str
+    status: str
+    verified_at: str
+
+
 def create_app(database_url: str | None = None) -> FastAPI:
     url = database_url or os.environ.get(DATABASE_URL_ENV, DEFAULT_DATABASE_URL)
     connect_args = (
@@ -117,6 +136,14 @@ def create_app(database_url: str | None = None) -> FastAPI:
     app = FastAPI(title="Remote Attestation Data Release")
     app.state.engine = engine
     app.state.session_factory = session_factory
+
+    # Per-evidence locks serializing the first (state-changing) verification.
+    verify_locks: dict[str, threading.Lock] = {}
+    verify_locks_guard = threading.Lock()
+
+    def _verify_lock(evidence_id: str) -> threading.Lock:
+        with verify_locks_guard:
+            return verify_locks.setdefault(evidence_id, threading.Lock())
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -257,6 +284,108 @@ def create_app(database_url: str | None = None) -> FastAPI:
             status="received",
             received_at=_rfc3339(now),
         )
+
+    @app.post(
+        "/v1/evidence/{evidence_id}/verify",
+        response_model=EvidenceVerifiedResponse,
+    )
+    def verify_evidence(
+        evidence_id: str, body: VerifyEvidenceRequest
+    ) -> EvidenceVerifiedResponse:
+        nonce_digest = _nonce_digest(body.nonce)
+        evidence_digest = hashlib.sha256(body.evidence.encode("utf-8")).hexdigest()
+        with session_factory() as session:
+            record = session.get(Evidence, evidence_id)
+            if (
+                record is None
+                or record.tenant_id != body.tenant_id
+                or record.workload_id != body.workload_id
+            ):
+                raise HTTPException(status_code=404, detail="evidence not found")
+            challenge = session.get(Challenge, record.challenge_id)
+            if challenge is None:
+                raise HTTPException(status_code=404, detail="evidence not found")
+            if not hmac.compare_digest(challenge.nonce_digest, nonce_digest):
+                raise HTTPException(status_code=401, detail="invalid nonce")
+            if not hmac.compare_digest(record.evidence_sha256, evidence_digest):
+                raise HTTPException(
+                    status_code=422, detail="evidence does not match its record"
+                )
+            verifier = get_verifier(record.evidence_format)
+            if verifier is None:
+                raise HTTPException(
+                    status_code=422, detail="unsupported evidence format"
+                )
+            context = VerificationContext(
+                evidence_id=record.evidence_id,
+                challenge_id=record.challenge_id,
+                tenant_id=record.tenant_id,
+                workload_id=record.workload_id,
+                evidence_format=record.evidence_format,
+                challenge_issued_at=challenge.issued_at,
+                challenge_expires_at=challenge.expires_at,
+            )
+            if record.status in ("verified", "rejected"):
+                # Verification is decided exactly once; replays return the
+                # persisted verdict without invoking the plugin again.
+                return EvidenceVerifiedResponse(
+                    evidence_id=record.evidence_id,
+                    challenge_id=record.challenge_id,
+                    status=record.status,
+                    verified_at=_rfc3339(record.verified_at),
+                )
+        # Serialize first-time verification per evidence so concurrent callers
+        # cannot produce contradictory outcomes or invoke the plugin twice.
+        with _verify_lock(evidence_id):
+            with session_factory() as session:
+                record = session.get(Evidence, evidence_id)
+                if record.status in ("verified", "rejected"):
+                    return EvidenceVerifiedResponse(
+                        evidence_id=record.evidence_id,
+                        challenge_id=record.challenge_id,
+                        status=record.status,
+                        verified_at=_rfc3339(record.verified_at),
+                    )
+            try:
+                # The plaintext is passed to the plugin only; it is never
+                # persisted or logged by the service layer.
+                passed = bool(verifier.verify(body.evidence, context))
+            except Exception:
+                # No state is written on plugin failure, so no half-completed
+                # verification can persist, and no context leaks downstream.
+                raise HTTPException(
+                    status_code=500, detail="evidence verification failed"
+                ) from None
+            status = "verified" if passed else "rejected"
+            now = _utcnow()
+            with session_factory() as session:
+                # Atomic settle: only a record still in "received" is updated,
+                # so a racing committer can never be overwritten.
+                result = session.execute(
+                    update(Evidence)
+                    .where(
+                        Evidence.evidence_id == evidence_id,
+                        Evidence.status == "received",
+                    )
+                    .values(status=status, verified_at=now)
+                    .execution_options(synchronize_session=False)
+                )
+                if result.rowcount != 1:
+                    session.rollback()
+                    fresh = session.get(Evidence, evidence_id)
+                    return EvidenceVerifiedResponse(
+                        evidence_id=fresh.evidence_id,
+                        challenge_id=fresh.challenge_id,
+                        status=fresh.status,
+                        verified_at=_rfc3339(fresh.verified_at),
+                    )
+                session.commit()
+            return EvidenceVerifiedResponse(
+                evidence_id=evidence_id,
+                challenge_id=context.challenge_id,
+                status=status,
+                verified_at=_rfc3339(now),
+            )
 
     return app
 
