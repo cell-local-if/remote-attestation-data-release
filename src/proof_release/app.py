@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
 import os
 import re
 import secrets
@@ -11,10 +12,18 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
-from sqlalchemy import create_engine, update
+from sqlalchemy import create_engine, event, select, text, update
 from sqlalchemy.orm import sessionmaker
 
 from proof_release.db import Base, Challenge, Evidence
+from proof_release.verifiers import (
+    ChallengeContext,
+    VerificationContext,
+    VerifierRegistry,
+    default_registry,
+)
+
+logger = logging.getLogger("proof_release")
 
 DEFAULT_DATABASE_URL = "sqlite:///./proof_release.db"
 DATABASE_URL_ENV = "PROOF_RELEASE_DATABASE_URL"
@@ -105,18 +114,78 @@ class EvidenceReceivedResponse(BaseModel):
     received_at: str
 
 
-def create_app(database_url: str | None = None) -> FastAPI:
+class VerifyEvidenceRequest(BaseModel):
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    nonce: StrictStr = Field(min_length=1)
+    evidence: StrictStr = Field(min_length=1)
+
+    _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
+    _nonce_valid = field_validator("nonce")(_nonce_format)
+
+
+class EvidenceVerifiedResponse(BaseModel):
+    evidence_id: str
+    challenge_id: str
+    status: str
+    verified_at: str
+
+
+def _migrate_additive(engine) -> None:
+    """Apply forward-only additive column additions to pre-existing databases."""
+    if engine.dialect.name != "sqlite":
+        # Non-sqlite deployments are created from metadata; nothing to add.
+        return
+    additions = {
+        "evidence": (
+            ("verified_at", "DATETIME"),
+            ("verification_detail", "VARCHAR(256)"),
+        ),
+    }
+    with engine.begin() as conn:
+        for table, columns in additions.items():
+            existing = {
+                row[1]
+                for row in conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
+            }
+            for column, column_type in columns:
+                if column not in existing:
+                    conn.execute(
+                        text(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+                    )
+
+
+def create_app(
+    database_url: str | None = None,
+    verifier_registry: VerifierRegistry | None = None,
+) -> FastAPI:
     url = database_url or os.environ.get(DATABASE_URL_ENV, DEFAULT_DATABASE_URL)
     connect_args = (
         {"check_same_thread": False, "timeout": 30} if url.startswith("sqlite") else {}
     )
     engine = create_engine(url, connect_args=connect_args)
+    if engine.dialect.name == "sqlite":
+        # Take a writer lock at the start of every transaction so that
+        # concurrent requests against the same evidence serialize rather
+        # than racing to settle it. Mirrors the documented pysqlite
+        # recipe: disable the driver's implicit BEGIN and emit our own.
+        @event.listens_for(engine, "connect")
+        def _disable_driver_autobegin(dbapi_connection, connection_record):
+            dbapi_connection.isolation_level = None
+
+        @event.listens_for(engine, "begin")
+        def _begin_immediate(conn):
+            conn.exec_driver_sql("BEGIN IMMEDIATE")
+
     Base.metadata.create_all(engine)
+    _migrate_additive(engine)
     session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    registry = verifier_registry or default_registry
 
     app = FastAPI(title="Remote Attestation Data Release")
     app.state.engine = engine
     app.state.session_factory = session_factory
+    app.state.verifier_registry = registry
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -256,6 +325,143 @@ def create_app(database_url: str | None = None) -> FastAPI:
             challenge_id=body.challenge_id,
             status="received",
             received_at=_rfc3339(now),
+        )
+
+    @app.post(
+        "/v1/evidence/{evidence_id}/verify",
+        response_model=EvidenceVerifiedResponse,
+    )
+    def verify_evidence(
+        evidence_id: str, body: VerifyEvidenceRequest
+    ) -> EvidenceVerifiedResponse:
+        evidence_digest = hashlib.sha256(body.evidence.encode("utf-8")).hexdigest()
+        nonce_digest = _nonce_digest(body.nonce)
+        with session_factory() as session:
+            # Lock the evidence row for the duration of verification. On
+            # locking backends a concurrent verifier blocks here until the
+            # first transaction settles, then observes the terminal status
+            # and never invokes the plugin. SQLite ignores FOR UPDATE but its
+            # transactions already begin as BEGIN IMMEDIATE, serializing all
+            # writers process- and connection-wide.
+            evidence = session.scalar(
+                select(Evidence)
+                .where(Evidence.evidence_id == evidence_id)
+                .with_for_update()
+            )
+            if (
+                evidence is None
+                or evidence.tenant_id != body.tenant_id
+                or evidence.workload_id != body.workload_id
+            ):
+                raise HTTPException(status_code=404, detail="evidence not found")
+
+            challenge = session.get(Challenge, evidence.challenge_id)
+            # The evidence's challenge is always same-tenant/workload; guard
+            # defensively and treat any inconsistency as not-found.
+            if (
+                challenge is None
+                or challenge.tenant_id != body.tenant_id
+                or challenge.workload_id != body.workload_id
+            ):
+                raise HTTPException(status_code=404, detail="evidence not found")
+
+            if not hmac.compare_digest(challenge.nonce_digest, nonce_digest):
+                raise HTTPException(status_code=401, detail="invalid nonce")
+
+            # Already settled: subsequent calls return the stored conclusion
+            # verbatim; the plugin is never invoked again and the freshly
+            # supplied evidence is not inspected.
+            if evidence.status in ("verified", "rejected"):
+                return EvidenceVerifiedResponse(
+                    evidence_id=evidence.evidence_id,
+                    challenge_id=evidence.challenge_id,
+                    status=evidence.status,
+                    verified_at=_rfc3339(evidence.verified_at),
+                )
+
+            if not hmac.compare_digest(evidence.evidence_sha256, evidence_digest):
+                raise HTTPException(
+                    status_code=422, detail="evidence digest mismatch"
+                )
+
+            verifier = registry.get(evidence.evidence_format)
+            if verifier is None:
+                raise HTTPException(
+                    status_code=422, detail="unsupported evidence format"
+                )
+
+            challenge_context = ChallengeContext(
+                challenge_id=challenge.challenge_id,
+                nonce_digest=challenge.nonce_digest,
+                status=challenge.status,
+                issued_at=challenge.issued_at,
+                expires_at=challenge.expires_at,
+                consumed_at=challenge.consumed_at,
+            )
+            verification_context = VerificationContext(
+                evidence=body.evidence,
+                tenant_id=body.tenant_id,
+                workload_id=body.workload_id,
+                challenge=challenge_context,
+            )
+            # The raw evidence exists only on the stack for this call; it is
+            # never logged, persisted, or placed on the response. On plugin
+            # failure the exception rolls the transaction back, leaving no
+            # half-finished state, and only non-sensitive identifiers are
+            # logged.
+            try:
+                result = verifier.verify(verification_context)
+            except Exception as exc:
+                # Log only non-sensitive identifiers and the exception type —
+                # never the traceback/message, since a faulty plugin could
+                # embed raw evidence or private context in it.
+                logger.error(
+                    "verifier %s for format %r failed on evidence %s: %s",
+                    type(verifier).__name__,
+                    evidence.evidence_format,
+                    evidence.evidence_id,
+                    type(exc).__name__,
+                )
+                raise HTTPException(status_code=500, detail="verification failed")
+            new_status = "verified" if result.accepted else "rejected"
+            verified_at = _utcnow()
+            detail = result.detail[:255] if result.detail else None
+
+            # Atomic settlement: exactly one caller can flip
+            # received -> a terminal status.
+            outcome = session.execute(
+                update(Evidence)
+                .where(
+                    Evidence.evidence_id == evidence_id,
+                    Evidence.status == "received",
+                )
+                .values(
+                    status=new_status,
+                    verified_at=verified_at,
+                    verification_detail=detail,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if outcome.rowcount != 1:
+                # A concurrent transaction settled first despite the lock;
+                # read and return its conclusion rather than overwriting it.
+                session.rollback()
+                winner = session.get(Evidence, evidence_id)
+                if winner is not None and winner.status in ("verified", "rejected"):
+                    return EvidenceVerifiedResponse(
+                        evidence_id=winner.evidence_id,
+                        challenge_id=winner.challenge_id,
+                        status=winner.status,
+                        verified_at=_rfc3339(winner.verified_at),
+                    )
+                raise HTTPException(status_code=409, detail="verification conflict")
+            session.commit()
+
+        return EvidenceVerifiedResponse(
+            evidence_id=evidence_id,
+            challenge_id=evidence.challenge_id,
+            status=new_status,
+            verified_at=_rfc3339(verified_at),
         )
 
     return app

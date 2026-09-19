@@ -54,7 +54,15 @@ class Evidence(Base):
     tenant_id: Mapped[str] = mapped_column(String(256), index=True)
     workload_id: Mapped[str] = mapped_column(String(256))
     evidence_format: Mapped[str] = mapped_column(String(128))
+    # received -> verified | rejected, settled atomically on first verify.
     status: Mapped[str] = mapped_column(String(16), default="received")
     received_at: Mapped[datetime] = mapped_column(UTCDateTime())
     # Only the SHA-256 digest of the evidence is persisted, never the evidence itself.
     evidence_sha256: Mapped[str] = mapped_column(String(64))
+    verified_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
+    # Short, non-sensitive verifier outcome note; never raw evidence.
+    verification_detail: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
