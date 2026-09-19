@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import logging
 import os
 import re
@@ -12,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
-from sqlalchemy import create_engine, event, select, text, update
+from sqlalchemy import create_engine, event, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
@@ -20,14 +21,26 @@ from cryptography import x509
 from cryptography.hazmat.primitives.serialization import Encoding
 
 from proof_release.db import (
+    DECISION_STATUS_ALLOWED,
+    DECISION_STATUS_DENIED,
     VERIFICATION_RESULT_ACCEPTED,
     VERIFICATION_RESULT_REJECTED,
     Base,
     Challenge,
+    Decision,
     Evidence,
+    Policy,
     TrustRoot,
 )
+from proof_release.policies import (
+    InvalidRule,
+    canonical_rule_json,
+    evaluate_rule,
+    validate_rule,
+)
 from proof_release.verifiers import (
+    ATTESTED_NONCE_JSON,
+    X509_ATTESTED_NONCE_JSON,
     ChallengeContext,
     VerificationContext,
     VerifierRegistry,
@@ -166,6 +179,59 @@ class TrustRootCreatedResponse(BaseModel):
     workload_id: str
     name: str | None
     created_at: str
+
+
+class CreatePolicyRequest(BaseModel):
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    name: StrictStr = Field(min_length=1)
+    # Validated structurally below; pydantic only enforces that it parses
+    # as a JSON object.
+    rule: dict
+
+    _non_blank = field_validator("tenant_id", "workload_id", "name")(
+        _require_non_blank
+    )
+
+    @field_validator("rule")
+    @classmethod
+    def _validate_rule_shape(cls, value: dict) -> dict:
+        try:
+            return validate_rule(value)
+        except InvalidRule as exc:
+            raise ValueError(str(exc)) from exc
+
+
+class PolicyCreatedResponse(BaseModel):
+    policy_id: str
+    tenant_id: str
+    workload_id: str
+    name: str
+    version: int
+    rule: dict
+    created_at: str
+
+
+class CreateDecisionRequest(BaseModel):
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    nonce: StrictStr = Field(min_length=1)
+    evidence: StrictStr = Field(min_length=1)
+    policy_id: StrictStr = Field(min_length=1)
+
+    _non_blank = field_validator("tenant_id", "workload_id", "policy_id")(
+        _require_non_blank
+    )
+    _nonce_valid = field_validator("nonce")(_nonce_format)
+
+
+class DecisionResponse(BaseModel):
+    decision_id: str
+    evidence_id: str
+    policy_id: str
+    policy_version: int
+    status: str
+    decided_at: str
 
 
 def _migrate_additive(engine) -> None:
@@ -599,6 +665,222 @@ def create_app(
             workload_id=body.workload_id,
             name=body.name,
             created_at=_rfc3339(now),
+        )
+
+    @app.post("/v1/policies", status_code=201, response_model=PolicyCreatedResponse)
+    def create_policy(body: CreatePolicyRequest) -> PolicyCreatedResponse:
+        policy_id = str(uuid.uuid4())
+        now = _utcnow()
+        rule_json = canonical_rule_json(body.rule)
+        # Allocate the next version inside a write transaction. On SQLite
+        # every write transaction begins as BEGIN IMMEDIATE, so competing
+        # creators serialize; on locking backends the unique
+        # (scope, name, version) constraint plus this retry loop guarantees
+        # no two versions ever share a number and no version is skipped.
+        with session_factory() as session:
+            for _ in range(10):
+                highest = session.scalar(
+                    select(func.max(Policy.version)).where(
+                        Policy.tenant_id == body.tenant_id,
+                        Policy.workload_id == body.workload_id,
+                        Policy.name == body.name,
+                    )
+                )
+                version = (highest or 0) + 1
+                session.add(
+                    Policy(
+                        policy_id=policy_id,
+                        tenant_id=body.tenant_id,
+                        workload_id=body.workload_id,
+                        name=body.name,
+                        version=version,
+                        rule_json=rule_json,
+                        created_at=now,
+                    )
+                )
+                try:
+                    session.commit()
+                except IntegrityError:
+                    # A concurrent transaction claimed the same version
+                    # first; re-read the high-water mark and retry.
+                    session.rollback()
+                    continue
+                break
+            else:
+                raise HTTPException(status_code=500, detail="could not allocate version")
+        return PolicyCreatedResponse(
+            policy_id=policy_id,
+            tenant_id=body.tenant_id,
+            workload_id=body.workload_id,
+            name=body.name,
+            version=version,
+            rule=body.rule,
+            created_at=_rfc3339(now),
+        )
+
+    @app.post(
+        "/v1/evidence/{evidence_id}/decisions",
+        response_model=DecisionResponse,
+    )
+    def create_decision(
+        evidence_id: str, body: CreateDecisionRequest
+    ) -> DecisionResponse:
+        evidence_digest = hashlib.sha256(body.evidence.encode("utf-8")).hexdigest()
+        nonce_digest = _nonce_digest(body.nonce)
+        with session_factory() as session:
+            # Serialize concurrent decision makers on the evidence row;
+            # SQLite writers are already serialized process-wide via
+            # BEGIN IMMEDIATE.
+            evidence = session.scalar(
+                select(Evidence)
+                .where(Evidence.evidence_id == evidence_id)
+                .with_for_update()
+            )
+            if (
+                evidence is None
+                or evidence.tenant_id != body.tenant_id
+                or evidence.workload_id != body.workload_id
+            ):
+                raise HTTPException(status_code=404, detail="evidence not found")
+
+            challenge = session.get(Challenge, evidence.challenge_id)
+            if (
+                challenge is None
+                or challenge.tenant_id != body.tenant_id
+                or challenge.workload_id != body.workload_id
+            ):
+                raise HTTPException(status_code=404, detail="evidence not found")
+
+            # The presented nonce must match the evidence's bound challenge.
+            # Only its digest is stored; the plaintext nonce is never kept.
+            if not hmac.compare_digest(challenge.nonce_digest, nonce_digest):
+                raise HTTPException(status_code=422, detail="invalid nonce")
+
+            policy = session.scalar(
+                select(Policy).where(Policy.policy_id == body.policy_id)
+            )
+            if (
+                policy is None
+                or policy.tenant_id != body.tenant_id
+                or policy.workload_id != body.workload_id
+            ):
+                raise HTTPException(status_code=404, detail="policy not found")
+
+            # Exactly one auditable decision per evidence/policy version.
+            # A retry or concurrent request observes and returns the same
+            # row without re-evaluating anything.
+            existing = session.scalar(
+                select(Decision).where(
+                    Decision.evidence_id == evidence_id,
+                    Decision.policy_id == body.policy_id,
+                )
+            )
+            if existing is not None:
+                return DecisionResponse(
+                    decision_id=existing.decision_id,
+                    evidence_id=existing.evidence_id,
+                    policy_id=existing.policy_id,
+                    policy_version=existing.policy_version,
+                    status=existing.status,
+                    decided_at=_rfc3339(existing.decided_at),
+                )
+
+            # Only settled, verified evidence may drive a release decision;
+            # received (unverified) and rejected evidence cannot. This gate
+            # precedes content checks: an unverified record is never
+            # evaluated, regardless of the presented bytes.
+            if evidence.status != "verified":
+                raise HTTPException(
+                    status_code=409, detail="evidence is not verified"
+                )
+
+            # The presented evidence must be byte-identical to what was
+            # received; compare digests only — never persist the bytes.
+            if not hmac.compare_digest(evidence.evidence_sha256, evidence_digest):
+                raise HTTPException(
+                    status_code=422, detail="evidence digest mismatch"
+                )
+
+            # Claims are evaluated only for the built-in JSON evidence
+            # formats, whose document shape the service knows. Other
+            # formats carry no parseable claims and are rejected as a
+            # format error rather than guessed at.
+            if evidence.evidence_format not in (
+                ATTESTED_NONCE_JSON,
+                X509_ATTESTED_NONCE_JSON,
+            ):
+                raise HTTPException(
+                    status_code=422, detail="unsupported evidence format for decision"
+                )
+
+            # Parse the presented (digest-matched) evidence just far enough
+            # to read its claims. The evidence is verified already; the
+            # verifier is not invoked again and neither the document nor
+            # the claims are persisted anywhere.
+            try:
+                document = json.loads(body.evidence)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                raise HTTPException(
+                    status_code=422, detail="evidence is not valid JSON"
+                )
+            if not isinstance(document, dict):
+                raise HTTPException(
+                    status_code=422, detail="evidence is not valid JSON"
+                )
+            claims = document.get("claims", {})
+            if not isinstance(claims, dict):
+                raise HTTPException(
+                    status_code=422, detail="evidence is not valid JSON"
+                )
+
+            rule = json.loads(policy.rule_json)
+            satisfied = evaluate_rule(rule, claims)
+            status = (
+                DECISION_STATUS_ALLOWED if satisfied else DECISION_STATUS_DENIED
+            )
+            decision_id = str(uuid.uuid4())
+            decided_at = _utcnow()
+            decision = Decision(
+                decision_id=decision_id,
+                evidence_id=evidence_id,
+                policy_id=policy.policy_id,
+                policy_version=policy.version,
+                status=status,
+                decided_at=decided_at,
+            )
+            session.add(decision)
+            try:
+                session.commit()
+            except IntegrityError:
+                # A concurrent request created the unique decision first;
+                # return its immutable result.
+                session.rollback()
+                winner = session.scalar(
+                    select(Decision).where(
+                        Decision.evidence_id == evidence_id,
+                        Decision.policy_id == body.policy_id,
+                    )
+                )
+                if winner is None:
+                    raise HTTPException(
+                        status_code=409, detail="decision conflict"
+                    )
+                return DecisionResponse(
+                    decision_id=winner.decision_id,
+                    evidence_id=winner.evidence_id,
+                    policy_id=winner.policy_id,
+                    policy_version=winner.policy_version,
+                    status=winner.status,
+                    decided_at=_rfc3339(winner.decided_at),
+                )
+
+        return DecisionResponse(
+            decision_id=decision_id,
+            evidence_id=evidence_id,
+            policy_id=policy.policy_id,
+            policy_version=policy.version,
+            status=status,
+            decided_at=_rfc3339(decided_at),
         )
 
     return app

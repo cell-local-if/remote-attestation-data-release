@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, String, Text, TypeDecorator, UniqueConstraint
+from sqlalchemy import (
+    DateTime,
+    Integer,
+    String,
+    Text,
+    TypeDecorator,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -18,6 +25,13 @@ VERIFICATION_RESULT_REJECTED = "rejected"
 VERIFICATION_RESULT_CODES = frozenset(
     {VERIFICATION_RESULT_ACCEPTED, VERIFICATION_RESULT_REJECTED}
 )
+
+#: Finite, service-defined set of persisted release-decision statuses. A
+#: decision is allowed exactly when the verified evidence's claims satisfy
+#: the requested policy version; otherwise the release is denied.
+DECISION_STATUS_ALLOWED = "allowed"
+DECISION_STATUS_DENIED = "denied"
+DECISION_STATUS_CODES = frozenset({DECISION_STATUS_ALLOWED, DECISION_STATUS_DENIED})
 
 
 class UTCDateTime(TypeDecorator):
@@ -99,3 +113,67 @@ class TrustRoot(Base):
     # SHA-256 of the DER encoding, used for exact duplicate detection.
     cert_sha256: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class Policy(Base):
+    """A versioned release policy scoped to a tenant and workload.
+
+    Creating a policy with the same (tenant, workload, name) adds a new,
+    higher version; older versions are retained and remain addressable by
+    id and version so that decisions already taken against them stay
+    explainable.
+    """
+
+    __tablename__ = "policies"
+    # One version number per policy name within a scope. The unique
+    # constraint is what makes concurrent version allocation gap-free:
+    # two transactions can never both claim the same version.
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "name",
+            "version",
+            name="uq_policy_scope_name_version",
+        ),
+    )
+
+    policy_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    name: Mapped[str] = mapped_column(String(256))
+    version: Mapped[int] = mapped_column(Integer)
+    # Canonical JSON serialization (sorted keys, compact separators) of the
+    # validated rule tree. Rules contain only claim names and scalar
+    # comparison values — never evidence or claims values.
+    rule_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class Decision(Base):
+    """An auditable release decision for one evidence/policy-version pair.
+
+    Exactly one row may exist per (evidence, policy version); retries and
+    concurrent requests return that same row. The row records only
+    identifiers, the fixed status code and timestamps — never the raw
+    evidence, the nonce, or the evaluated claims.
+    """
+
+    __tablename__ = "decisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "evidence_id",
+            "policy_id",
+            name="uq_decision_evidence_policy",
+        ),
+    )
+
+    decision_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    evidence_id: Mapped[str] = mapped_column(String(36), index=True)
+    policy_id: Mapped[str] = mapped_column(String(36), index=True)
+    # Snapshot of the evaluated policy version; policy_id already identifies
+    # an immutable version, this denormalizes it for audit reads.
+    policy_version: Mapped[int] = mapped_column(Integer)
+    # One of DECISION_STATUS_*; a fixed, service-defined code only.
+    status: Mapped[str] = mapped_column(String(16))
+    decided_at: Mapped[datetime] = mapped_column(UTCDateTime())
