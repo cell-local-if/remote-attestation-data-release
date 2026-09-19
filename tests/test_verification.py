@@ -5,15 +5,17 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import String, create_engine, select, text
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from proof_release.app import create_app
-from proof_release.db import Challenge, Evidence
+from proof_release.db import Challenge, Evidence, UTCDateTime
 from proof_release.verifiers import (
     ATTESTED_NONCE_JSON,
     AttestedNonceJSONVerifier,
@@ -256,7 +258,7 @@ def test_first_verification_is_settled_and_repeated(submitted, client, app):
         record = session.get(Evidence, evidence_id)
         assert record.status == "verified"
         assert record.verified_at is not None
-        assert record.verification_detail == "claims:1"
+        assert record.verification_result == "accepted"
 
 
 def test_repeated_verify_with_different_evidence_returns_stored_conclusion(
@@ -483,7 +485,7 @@ def test_plugin_exception_leaves_no_half_state_and_can_retry(tmp_path):
         record = session.get(Evidence, evidence_id)
         assert record.status == "received"
         assert record.verified_at is None
-        assert record.verification_detail is None
+        assert record.verification_result is None
 
     # Replace the faulty verifier with a working one and retry; settlement
     # is still possible exactly once.
@@ -608,3 +610,370 @@ def test_builtin_verifier_malformed_documents_reject(client, document):
 
     assert response.status_code == 200
     assert response.json()["status"] == "rejected"
+
+
+LEAKED_SECRET = "sk-live-SECRET-key-material-0123456789"
+
+
+def _build_app_with_verifier(tmp_path, verifier, db_name="plugin.db"):
+    registry = VerifierRegistry()
+    registry.register(verifier)
+    application = create_app(
+        f"sqlite:///{tmp_path}/{db_name}", verifier_registry=registry
+    )
+    return application, TestClient(application)
+
+
+def _submit_and_verify(application, client, evidence, evidence_format, **verify_overrides):
+    created = _create(client).json()
+    evidence_id = _submit(
+        client, created, evidence, evidence_format=evidence_format
+    ).json()["evidence_id"]
+    response = _verify(client, evidence_id, created, evidence, **verify_overrides)
+    return created, evidence_id, response
+
+
+def _assert_no_leak_in_record(app, evidence_id, *needles):
+    with app.state.session_factory() as session:
+        record = session.get(Evidence, evidence_id)
+        columns = {c.name: getattr(record, c.name) for c in record.__table__.columns}
+    for name, value in columns.items():
+        for needle in needles:
+            assert needle not in str(value), f"{needle!r} leaked into column {name}"
+
+
+class LeakingVerifier(Verifier):
+    """Malicious plugin that stuffs raw evidence and secrets into its result."""
+
+    format_name = "leaking"
+
+    def __init__(self, accepted=True):
+        self.accepted = accepted
+
+    def verify(self, context: VerificationContext) -> VerificationResult:
+        return VerificationResult(
+            accepted=self.accepted,
+            detail=(
+                f"evidence={context.evidence}; secret={LEAKED_SECRET}; "
+                f"nonce_digest={context.challenge.nonce_digest}"
+            ),
+        )
+
+
+def test_malicious_plugin_result_text_is_never_persisted_or_returned(
+    tmp_path, caplog
+):
+    application, client = _build_app_with_verifier(tmp_path, LeakingVerifier())
+    evidence = "raw-evidence-blob-with-private-context"
+    with caplog.at_level(logging.DEBUG):
+        created, evidence_id, response = _submit_and_verify(
+            application, client, evidence, "leaking"
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "verified"
+    assert evidence not in response.text
+    assert LEAKED_SECRET not in response.text
+    assert evidence not in caplog.text
+    assert LEAKED_SECRET not in caplog.text
+
+    with application.state.session_factory() as session:
+        record = session.get(Evidence, evidence_id)
+        # Only the fixed, service-defined result code is stored.
+        assert record.verification_result == "accepted"
+    _assert_no_leak_in_record(application, evidence_id, evidence, LEAKED_SECRET)
+
+    # The settled conclusion stays clean on repeat calls.
+    repeat = _verify(client, evidence_id, created, evidence)
+    assert repeat.status_code == 200
+    assert repeat.json() == response.json()
+    assert evidence not in repeat.text
+    assert LEAKED_SECRET not in repeat.text
+
+
+def test_malicious_plugin_rejection_text_is_dropped(tmp_path):
+    application, client = _build_app_with_verifier(
+        tmp_path, LeakingVerifier(accepted=False)
+    )
+    evidence = "rejected-evidence-with-secrets"
+    _, evidence_id, response = _submit_and_verify(
+        application, client, evidence, "leaking"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "rejected"
+    assert evidence not in response.text
+    assert LEAKED_SECRET not in response.text
+    with application.state.session_factory() as session:
+        record = session.get(Evidence, evidence_id)
+        assert record.verification_result == "rejected"
+    _assert_no_leak_in_record(application, evidence_id, evidence, LEAKED_SECRET)
+
+
+class DuckTypingVerifier(Verifier):
+    """Returns a foreign result object carrying evidence-laden attributes."""
+
+    format_name = "duck-typing"
+
+    def verify(self, context: VerificationContext):
+        class ForeignResult:
+            accepted = True
+            detail = f"{context.evidence}|{LEAKED_SECRET}"
+            evidence = context.evidence
+
+        return ForeignResult()
+
+
+def test_non_model_result_object_is_reduced_to_verdict_only(tmp_path):
+    application, client = _build_app_with_verifier(tmp_path, DuckTypingVerifier())
+    evidence = "duck-typed-evidence"
+    _, evidence_id, response = _submit_and_verify(
+        application, client, evidence, "duck-typing"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "verified"
+    assert evidence not in response.text
+    assert LEAKED_SECRET not in response.text
+    with application.state.session_factory() as session:
+        record = session.get(Evidence, evidence_id)
+        assert record.verification_result == "accepted"
+    _assert_no_leak_in_record(application, evidence_id, evidence, LEAKED_SECRET)
+
+
+class SecretRaisingVerifier(Verifier):
+    """Faulty plugin whose exception message embeds evidence and secrets."""
+
+    format_name = "secret-raising"
+
+    def verify(self, context: VerificationContext) -> VerificationResult:
+        raise RuntimeError(
+            f"boom on {context.evidence} using {LEAKED_SECRET}"
+        )
+
+
+def test_plugin_exception_with_sensitive_message_leaks_nothing(tmp_path, caplog):
+    application, client = _build_app_with_verifier(tmp_path, SecretRaisingVerifier())
+    evidence = "exception-path-evidence"
+    with caplog.at_level(logging.DEBUG):
+        _, evidence_id, response = _submit_and_verify(
+            application, client, evidence, "secret-raising"
+        )
+
+    assert response.status_code == 500
+    assert evidence not in response.text
+    assert LEAKED_SECRET not in response.text
+    assert evidence not in caplog.text
+    assert LEAKED_SECRET not in caplog.text
+
+    # The exception rolled back: the record is still received and unsettled.
+    with application.state.session_factory() as session:
+        record = session.get(Evidence, evidence_id)
+        assert record.status == "received"
+        assert record.verified_at is None
+        assert record.verification_result is None
+    _assert_no_leak_in_record(application, evidence_id, evidence, LEAKED_SECRET)
+
+
+def test_concurrent_verify_with_leaking_plugin_settles_once_cleanly(tmp_path):
+    verifier = LeakingVerifier()
+    application, client = _build_app_with_verifier(tmp_path, verifier)
+    created = _create(client).json()
+    evidence = "concurrent-leak-attempt"
+    evidence_id = _submit(client, created, evidence, evidence_format="leaking").json()[
+        "evidence_id"
+    ]
+
+    def verify():
+        return TestClient(application).post(
+            f"/v1/evidence/{evidence_id}/verify",
+            json={
+                "tenant_id": TENANT,
+                "workload_id": WORKLOAD,
+                "nonce": created["nonce"],
+                "evidence": evidence,
+            },
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        responses = list(pool.map(lambda _: verify(), range(16)))
+
+    assert all(r.status_code == 200 for r in responses)
+    assert {r.json()["status"] for r in responses} == {"verified"}
+    assert len({r.json()["verified_at"] for r in responses}) == 1
+    for r in responses:
+        assert evidence not in r.text
+        assert LEAKED_SECRET not in r.text
+    with application.state.session_factory() as session:
+        record = session.get(Evidence, evidence_id)
+        assert record.status == "verified"
+        assert record.verification_result == "accepted"
+    _assert_no_leak_in_record(application, evidence_id, evidence, LEAKED_SECRET)
+
+
+class LegacyBase(DeclarativeBase):
+    """Schema of the previous release: free-form verification_detail, no
+    verification_result column."""
+
+
+class LegacyChallenge(LegacyBase):
+    __tablename__ = "challenges"
+
+    challenge_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    nonce_digest: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    issued_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    consumed_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+
+
+class LegacyEvidence(LegacyBase):
+    __tablename__ = "evidence"
+
+    evidence_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    challenge_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    evidence_format: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(16), default="received")
+    received_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    evidence_sha256: Mapped[str] = mapped_column(String(64))
+    verified_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    verification_detail: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
+
+
+def _legacy_challenge(challenge_id, nonce, **overrides):
+    now = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    values = dict(
+        challenge_id=challenge_id,
+        tenant_id=TENANT,
+        workload_id=WORKLOAD,
+        nonce_digest=hashlib.sha256(nonce.encode("ascii")).hexdigest(),
+        status="consumed",
+        issued_at=now - timedelta(minutes=5),
+        expires_at=now + timedelta(minutes=5),
+        consumed_at=now - timedelta(minutes=4),
+    )
+    values.update(overrides)
+    return LegacyChallenge(**values)
+
+
+def test_legacy_database_migrates_without_leaking_stored_detail(tmp_path, monkeypatch):
+    monkeypatch.setenv("PROOF_RELEASE_ATTESTED_NONCE_SECRET", SECRET)
+    db_path = tmp_path / "legacy.db"
+    url = f"sqlite:///{db_path}"
+
+    settled_nonce = "settled-challenge-nonce"
+    pending_nonce = "pending-challenge-nonce"
+    legacy_detail = f"legacy note with evidence and {LEAKED_SECRET}"
+    settled_verified_at = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    fresh_evidence = _attested_evidence(pending_nonce, {"measurement": "xyz"})
+
+    engine = create_engine(url)
+    LegacyBase.metadata.create_all(engine)
+    legacy_sessions = sessionmaker(bind=engine)
+    with legacy_sessions() as session:
+        session.add(_legacy_challenge("challenge-settled", settled_nonce))
+        session.add(_legacy_challenge("challenge-pending", pending_nonce))
+        session.add(
+            LegacyEvidence(
+                evidence_id="evidence-settled",
+                challenge_id="challenge-settled",
+                tenant_id=TENANT,
+                workload_id=WORKLOAD,
+                evidence_format=ATTESTED_NONCE_JSON,
+                status="verified",
+                received_at=settled_verified_at - timedelta(minutes=3),
+                evidence_sha256=hashlib.sha256(b"old-evidence").hexdigest(),
+                verified_at=settled_verified_at,
+                verification_detail=legacy_detail,
+            )
+        )
+        session.add(
+            LegacyEvidence(
+                evidence_id="evidence-pending",
+                challenge_id="challenge-pending",
+                tenant_id=TENANT,
+                workload_id=WORKLOAD,
+                evidence_format=ATTESTED_NONCE_JSON,
+                status="received",
+                received_at=settled_verified_at - timedelta(minutes=2),
+                evidence_sha256=hashlib.sha256(
+                    fresh_evidence.encode("utf-8")
+                ).hexdigest(),
+                verified_at=None,
+                verification_detail=None,
+            )
+        )
+        session.commit()
+    engine.dispose()
+
+    # The current service boots on the legacy database without failure.
+    application = create_app(url)
+    client = TestClient(application)
+
+    # The migration scrubbed the legacy free-form detail and added the
+    # fixed-code column.
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT verification_detail FROM evidence")).fetchall()
+        assert rows and all(row[0] is None for row in rows)
+        columns = {
+            row[1] for row in conn.execute(text("PRAGMA table_info(evidence)"))
+        }
+        assert "verification_result" in columns
+    engine.dispose()
+
+    # The previously settled record still returns its stored conclusion,
+    # and the legacy detail never appears in the response.
+    response = client.post(
+        "/v1/evidence/evidence-settled/verify",
+        json={
+            "tenant_id": TENANT,
+            "workload_id": WORKLOAD,
+            "nonce": settled_nonce,
+            "evidence": "whatever-was-settled",
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "verified"
+    assert data["verified_at"] == settled_verified_at.isoformat()
+    assert legacy_detail not in response.text
+    assert LEAKED_SECRET not in response.text
+
+    # A record still in received state verifies normally after migration.
+    response = client.post(
+        "/v1/evidence/evidence-pending/verify",
+        json={
+            "tenant_id": TENANT,
+            "workload_id": WORKLOAD,
+            "nonce": pending_nonce,
+            "evidence": fresh_evidence,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "verified"
+    with application.state.session_factory() as session:
+        record = session.get(Evidence, "evidence-pending")
+        assert record.verification_result == "accepted"
+    application.state.engine.dispose()
+
+    # Migration is idempotent: a second boot on the migrated file works.
+    application2 = create_app(url)
+    client2 = TestClient(application2)
+    response = client2.post(
+        "/v1/evidence/evidence-pending/verify",
+        json={
+            "tenant_id": TENANT,
+            "workload_id": WORKLOAD,
+            "nonce": pending_nonce,
+            "evidence": fresh_evidence,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "verified"
+    application2.state.engine.dispose()

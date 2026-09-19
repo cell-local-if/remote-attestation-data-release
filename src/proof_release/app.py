@@ -15,7 +15,13 @@ from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
 from sqlalchemy import create_engine, event, select, text, update
 from sqlalchemy.orm import sessionmaker
 
-from proof_release.db import Base, Challenge, Evidence
+from proof_release.db import (
+    VERIFICATION_RESULT_ACCEPTED,
+    VERIFICATION_RESULT_REJECTED,
+    Base,
+    Challenge,
+    Evidence,
+)
 from proof_release.verifiers import (
     ChallengeContext,
     VerificationContext,
@@ -139,7 +145,7 @@ def _migrate_additive(engine) -> None:
     additions = {
         "evidence": (
             ("verified_at", "DATETIME"),
-            ("verification_detail", "VARCHAR(256)"),
+            ("verification_result", "VARCHAR(16)"),
         ),
     }
     with engine.begin() as conn:
@@ -153,6 +159,15 @@ def _migrate_additive(engine) -> None:
                     conn.execute(
                         text(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
                     )
+            # Legacy databases may carry a free-form verification_detail
+            # column written by older versions, which can hold arbitrary
+            # plugin-supplied text (potentially raw evidence or secrets).
+            # It is no longer part of the model; scrub any leftover values
+            # so they can never be read back, returned, or logged.
+            if "verification_detail" in existing:
+                conn.execute(
+                    text(f"UPDATE {table} SET verification_detail = NULL")
+                )
 
 
 def create_app(
@@ -411,6 +426,7 @@ def create_app(
             # logged.
             try:
                 result = verifier.verify(verification_context)
+                accepted = bool(result.accepted)
             except Exception as exc:
                 # Log only non-sensitive identifiers and the exception type —
                 # never the traceback/message, since a faulty plugin could
@@ -423,9 +439,17 @@ def create_app(
                     type(exc).__name__,
                 )
                 raise HTTPException(status_code=500, detail="verification failed")
-            new_status = "verified" if result.accepted else "rejected"
+            # The persisted outcome is a fixed, service-defined result code
+            # derived solely from the accept/reject verdict. Any free-form
+            # text the plugin attached to its result is discarded here and
+            # never persisted, logged, or returned.
+            new_status = "verified" if accepted else "rejected"
+            result_code = (
+                VERIFICATION_RESULT_ACCEPTED
+                if accepted
+                else VERIFICATION_RESULT_REJECTED
+            )
             verified_at = _utcnow()
-            detail = result.detail[:255] if result.detail else None
 
             # Atomic settlement: exactly one caller can flip
             # received -> a terminal status.
@@ -438,7 +462,7 @@ def create_app(
                 .values(
                     status=new_status,
                     verified_at=verified_at,
-                    verification_detail=detail,
+                    verification_result=result_code,
                 )
                 .execution_options(synchronize_session=False)
             )

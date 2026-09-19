@@ -84,10 +84,13 @@ class VerificationContext:
 class VerificationResult:
     """Outcome of a verifier invocation.
 
-    ``accepted`` is the only field that decides verified/rejected. The
-    optional ``detail`` is non-sensitive information safe to persist and
-    return (e.g. a short reason code); it must never contain raw evidence
-    or private key material.
+    ``accepted`` is the only field the service acts on: it alone decides
+    the verified/rejected settlement and the fixed, service-defined result
+    code that is persisted. ``detail`` is ignored and discarded at the
+    service boundary — plugin-supplied text is never persisted, logged, or
+    returned, so plugins must not place raw evidence, key material, or
+    other private context here (or in raised exceptions) expecting it to
+    be retained or propagated.
     """
 
     accepted: bool
@@ -136,8 +139,8 @@ class VerifierRegistry:
         return format_name in self._verifiers
 
 
-def _reject(detail: str) -> VerificationResult:
-    return VerificationResult(accepted=False, detail=detail)
+def _reject() -> VerificationResult:
+    return VerificationResult(accepted=False)
 
 
 def _is_unpadded_base64url(value: str) -> bool:
@@ -171,8 +174,9 @@ class AttestedNonceJSONVerifier(Verifier):
 
     Verification checks, in order: well-formed JSON object, unpadded
     base64url nonce equal to the challenge nonce (compared through stored
-    digest), and valid MAC. Any failure yields a rejected result with a
-    short non-sensitive reason; no raw evidence is included in the reason.
+    digest), and valid MAC. Any failure yields a plain rejected result;
+    no reasons or evidence content are attached, since the service
+    discards plugin-supplied text anyway.
     """
 
     format_name = ATTESTED_NONCE_JSON
@@ -209,29 +213,29 @@ class AttestedNonceJSONVerifier(Verifier):
         try:
             document = json.loads(context.evidence)
         except (json.JSONDecodeError, UnicodeDecodeError):
-            return _reject("evidence is not valid JSON")
+            return _reject()
         if not isinstance(document, dict):
-            return _reject("evidence document must be a JSON object")
+            return _reject()
 
         nonce = document.get("nonce")
         claims = document.get("claims", {})
         mac_hex = document.get("mac")
         if not isinstance(nonce, str) or not nonce:
-            return _reject("missing or invalid nonce claim")
+            return _reject()
         if "claims" in document and not isinstance(claims, dict):
-            return _reject("claims must be a JSON object")
+            return _reject()
         if not isinstance(mac_hex, str) or not mac_hex:
-            return _reject("missing or invalid mac")
+            return _reject()
 
         if not _is_unpadded_base64url(nonce):
-            return _reject("attested nonce is not unpadded base64url")
+            return _reject()
 
         # The attested nonce must be exactly the nonce of the bound challenge.
         if not hmac.compare_digest(
             hashlib.sha256(nonce.encode("ascii")).hexdigest(),
             context.challenge.nonce_digest,
         ):
-            return _reject("attested nonce does not match the challenge")
+            return _reject()
 
         signed_payload = json.dumps(
             {"claims": claims, "nonce": nonce},
@@ -246,11 +250,11 @@ class AttestedNonceJSONVerifier(Verifier):
         try:
             binascii.unhexlify(mac_hex.lower())
         except (binascii.Error, ValueError):
-            return _reject("mac is not hexadecimal")
+            return _reject()
         if not hmac.compare_digest(expected_mac, mac_hex.lower()):
-            return _reject("mac verification failed")
+            return _reject()
 
-        return VerificationResult(accepted=True, detail=f"claims:{len(claims)}")
+        return VerificationResult(accepted=True)
 
 
 #: Process-wide registry used by the service unless one is supplied.

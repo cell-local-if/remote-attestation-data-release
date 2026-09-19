@@ -10,6 +10,16 @@ class Base(DeclarativeBase):
     pass
 
 
+#: Finite, service-defined set of persisted verification outcome codes.
+#: The stored code is derived solely from the verifier's accept/reject
+#: verdict; plugin-supplied text is never persisted in any form.
+VERIFICATION_RESULT_ACCEPTED = "accepted"
+VERIFICATION_RESULT_REJECTED = "rejected"
+VERIFICATION_RESULT_CODES = frozenset(
+    {VERIFICATION_RESULT_ACCEPTED, VERIFICATION_RESULT_REJECTED}
+)
+
+
 class UTCDateTime(TypeDecorator):
     """Store datetimes as UTC and always return timezone-aware UTC values."""
 
@@ -62,7 +72,9 @@ class Evidence(Base):
     verified_at: Mapped[datetime | None] = mapped_column(
         UTCDateTime(), nullable=True
     )
-    # Short, non-sensitive verifier outcome note; never raw evidence.
-    verification_detail: Mapped[str | None] = mapped_column(
-        String(256), nullable=True
+    # Service-defined outcome code (one of VERIFICATION_RESULT_*), derived
+    # only from the accept/reject verdict. Plugin-supplied text is never
+    # persisted, so no free-form detail column exists here.
+    verification_result: Mapped[str | None] = mapped_column(
+        String(16), nullable=True
     )
