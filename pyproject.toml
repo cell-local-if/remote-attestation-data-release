@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Policy-driven backend for releasing data after remote attestation"
 requires-python = ">=3.12"
 dependencies = [
+  "cryptography>=42",
   "fastapi>=0.116,<1",
   "sqlalchemy>=2.0,<3",
   "uvicorn>=0.35,<1",

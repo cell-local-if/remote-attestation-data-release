@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, String, TypeDecorator
+from sqlalchemy import DateTime, String, Text, TypeDecorator, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -78,3 +78,24 @@ class Evidence(Base):
     verification_result: Mapped[str | None] = mapped_column(
         String(16), nullable=True
     )
+
+
+class TrustRoot(Base):
+    __tablename__ = "trust_roots"
+    # A certificate is configured at most once per tenant and workload.
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "workload_id", "cert_sha256", name="uq_trust_root_cert"
+        ),
+    )
+
+    root_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # PEM of the X.509 CA certificate. This is public material only; private
+    # keys are rejected at the API boundary and never stored here.
+    root_pem: Mapped[str] = mapped_column(Text)
+    # SHA-256 of the DER encoding, used for exact duplicate detection.
+    cert_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())

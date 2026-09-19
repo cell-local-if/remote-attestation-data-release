@@ -13,7 +13,11 @@ from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
 from sqlalchemy import create_engine, event, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
+
+from cryptography import x509
+from cryptography.hazmat.primitives.serialization import Encoding
 
 from proof_release.db import (
     VERIFICATION_RESULT_ACCEPTED,
@@ -21,6 +25,7 @@ from proof_release.db import (
     Base,
     Challenge,
     Evidence,
+    TrustRoot,
 )
 from proof_release.verifiers import (
     ChallengeContext,
@@ -64,6 +69,12 @@ def _nonce_format(value: str) -> str:
     if not _NONCE_RE.fullmatch(value):
         raise ValueError("nonce must be unpadded base64url")
     return value
+
+
+def _optional_non_blank(value: str | None) -> str | None:
+    if value is None:
+        return value
+    return _require_non_blank(value)
 
 
 class CreateChallengeRequest(BaseModel):
@@ -135,6 +146,26 @@ class EvidenceVerifiedResponse(BaseModel):
     challenge_id: str
     status: str
     verified_at: str
+
+
+class CreateTrustRootRequest(BaseModel):
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    root_pem: StrictStr = Field(min_length=1)
+    name: StrictStr | None = Field(default=None, min_length=1)
+
+    _non_blank = field_validator("tenant_id", "workload_id", "root_pem")(
+        _require_non_blank
+    )
+    _name_non_blank = field_validator("name")(_optional_non_blank)
+
+
+class TrustRootCreatedResponse(BaseModel):
+    root_id: str
+    tenant_id: str
+    workload_id: str
+    name: str | None
+    created_at: str
 
 
 def _migrate_additive(engine) -> None:
@@ -413,11 +444,23 @@ def create_app(
                 expires_at=challenge.expires_at,
                 consumed_at=challenge.consumed_at,
             )
+            # Trust roots configured for exactly this tenant and workload
+            # (public certificate material only) are made available to
+            # verifiers that anchor evidence to them.
+            trust_roots = tuple(
+                session.scalars(
+                    select(TrustRoot.root_pem).where(
+                        TrustRoot.tenant_id == body.tenant_id,
+                        TrustRoot.workload_id == body.workload_id,
+                    )
+                )
+            )
             verification_context = VerificationContext(
                 evidence=body.evidence,
                 tenant_id=body.tenant_id,
                 workload_id=body.workload_id,
                 challenge=challenge_context,
+                trust_roots=trust_roots,
             )
             # The raw evidence exists only on the stack for this call; it is
             # never logged, persisted, or placed on the response. On plugin
@@ -486,6 +529,76 @@ def create_app(
             challenge_id=evidence.challenge_id,
             status=new_status,
             verified_at=_rfc3339(verified_at),
+        )
+
+    @app.post(
+        "/v1/trust-roots", status_code=201, response_model=TrustRootCreatedResponse
+    )
+    def create_trust_root(body: CreateTrustRootRequest) -> TrustRootCreatedResponse:
+        # Only X.509 CA certificates are accepted. A PEM private key (or any
+        # other non-certificate material) fails to parse here, so private
+        # key material is never persisted — only the public certificate.
+        try:
+            certificate = x509.load_pem_x509_certificate(
+                body.root_pem.encode("utf-8")
+            )
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=422, detail="root_pem is not a valid X.509 certificate"
+            )
+        try:
+            basic = certificate.extensions.get_extension_for_class(
+                x509.BasicConstraints
+            )
+        except x509.ExtensionNotFound:
+            basic = None
+        if basic is None or not basic.value.ca:
+            raise HTTPException(
+                status_code=422, detail="root_pem must be a CA certificate"
+            )
+        der = certificate.public_bytes(Encoding.DER)
+        cert_digest = hashlib.sha256(der).hexdigest()
+        # Persist the normalized PEM serialization of the public certificate.
+        pem = certificate.public_bytes(Encoding.PEM).decode("ascii")
+        now = _utcnow()
+        root_id = str(uuid.uuid4())
+        with session_factory() as session:
+            duplicate = session.scalar(
+                select(TrustRoot).where(
+                    TrustRoot.tenant_id == body.tenant_id,
+                    TrustRoot.workload_id == body.workload_id,
+                    TrustRoot.cert_sha256 == cert_digest,
+                )
+            )
+            if duplicate is not None:
+                raise HTTPException(
+                    status_code=409, detail="trust root already configured"
+                )
+            session.add(
+                TrustRoot(
+                    root_id=root_id,
+                    tenant_id=body.tenant_id,
+                    workload_id=body.workload_id,
+                    name=body.name,
+                    root_pem=pem,
+                    cert_sha256=cert_digest,
+                    created_at=now,
+                )
+            )
+            try:
+                session.commit()
+            except IntegrityError:
+                # A concurrent request configured the same certificate first.
+                session.rollback()
+                raise HTTPException(
+                    status_code=409, detail="trust root already configured"
+                )
+        return TrustRootCreatedResponse(
+            root_id=root_id,
+            tenant_id=body.tenant_id,
+            workload_id=body.workload_id,
+            name=body.name,
+            created_at=_rfc3339(now),
         )
 
     return app
