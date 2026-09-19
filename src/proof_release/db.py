@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, String, TypeDecorator
+from sqlalchemy import DateTime, String, Text, TypeDecorator, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -78,3 +78,32 @@ class Evidence(Base):
     verification_result: Mapped[str | None] = mapped_column(
         String(16), nullable=True
     )
+
+
+class TrustRoot(Base):
+    """A configured X.509 trust root owned by exactly one tenant/workload.
+
+    Only public certificate material is stored here — never private keys.
+    """
+
+    __tablename__ = "trust_roots"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "fingerprint_sha256",
+            name="uq_trust_root_certificate",
+        ),
+    )
+
+    root_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # Optional human-readable label; never trusted for authorization.
+    name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # PEM-encoded X.509 CA certificate (public material only).
+    root_pem: Mapped[str] = mapped_column(Text)
+    # SHA-256 of the DER encoding; identifies the exact certificate for
+    # duplicate detection regardless of PEM formatting differences.
+    fingerprint_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())

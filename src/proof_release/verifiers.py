@@ -16,9 +16,13 @@ import hmac
 import json
 import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Callable, Dict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Callable, Dict, Tuple
+
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa
 
 __all__ = [
     "ChallengeContext",
@@ -27,6 +31,7 @@ __all__ = [
     "Verifier",
     "VerifierRegistry",
     "AttestedNonceJSONVerifier",
+    "X509AttestedNonceJSONVerifier",
     "default_registry",
     "register_verifier",
     "unregister_verifier",
@@ -35,6 +40,9 @@ __all__ = [
 
 #: Built-in format identifier for the reference verifier.
 ATTESTED_NONCE_JSON = "attested-nonce-json"
+
+#: Built-in format identifier for the X.509 certificate-chain verifier.
+X509_ATTESTED_NONCE_JSON = "x509-attested-nonce-json"
 
 #: Environment variable holding the MAC secret for the built-in verifier.
 ATTESTED_NONCE_SECRET_ENV = "PROOF_RELEASE_ATTESTED_NONCE_SECRET"
@@ -72,12 +80,17 @@ class VerificationContext:
     ``evidence`` is the raw evidence supplied in the verify request. It must
     not be retained by the verifier beyond the call or written to shared
     state; the service discards it as soon as the verifier returns.
+
+    ``trust_roots`` carries the PEM-encoded X.509 trust roots configured
+    for this tenant and workload (public certificate material only). It is
+    empty when no roots are configured.
     """
 
     evidence: str
     tenant_id: str
     workload_id: str
     challenge: ChallengeContext
+    trust_roots: Tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -257,9 +270,212 @@ class AttestedNonceJSONVerifier(Verifier):
         return VerificationResult(accepted=True)
 
 
+def _load_pem_certificate(pem: object) -> x509.Certificate | None:
+    if not isinstance(pem, str) or not pem.strip():
+        return None
+    try:
+        return x509.load_pem_x509_certificate(pem.encode("utf-8"))
+    except (ValueError, UnicodeEncodeError):
+        return None
+
+
+def _is_ca_certificate(cert: x509.Certificate) -> bool:
+    try:
+        basic = cert.extensions.get_extension_for_class(x509.BasicConstraints)
+    except x509.ExtensionNotFound:
+        return False
+    return bool(basic.value.ca)
+
+
+def _certificate_validity_bounds(cert: x509.Certificate) -> tuple[datetime, datetime]:
+    # cryptography >= 42 exposes timezone-aware UTC properties; fall back to
+    # the naive variants (which are UTC by definition) on older releases.
+    not_before = getattr(cert, "not_valid_before_utc", None)
+    not_after = getattr(cert, "not_valid_after_utc", None)
+    if not_before is None:
+        not_before = cert.not_valid_before.replace(tzinfo=timezone.utc)
+    if not_after is None:
+        not_after = cert.not_valid_after.replace(tzinfo=timezone.utc)
+    return not_before, not_after
+
+
+def _verify_cert_signature(
+    child: x509.Certificate, issuer: x509.Certificate
+) -> bool:
+    """Verify ``child``'s signature with ``issuer``'s public key."""
+    public_key = issuer.public_key()
+    try:
+        if isinstance(public_key, rsa.RSAPublicKey):
+            public_key.verify(
+                child.signature,
+                child.tbs_certificate_bytes,
+                padding.PKCS1v15(),
+                child.signature_hash_algorithm,
+            )
+        elif isinstance(public_key, ec.EllipticCurvePublicKey):
+            public_key.verify(
+                child.signature,
+                child.tbs_certificate_bytes,
+                ec.ECDSA(child.signature_hash_algorithm),
+            )
+        elif isinstance(public_key, ed25519.Ed25519PublicKey):
+            public_key.verify(child.signature, child.tbs_certificate_bytes)
+        else:
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _verify_payload_signature(
+    public_key: object, signature: bytes, payload: bytes
+) -> bool:
+    """Verify a SHA-256 (or Ed25519) signature over the canonical payload."""
+    try:
+        if isinstance(public_key, rsa.RSAPublicKey):
+            public_key.verify(
+                signature, payload, padding.PKCS1v15(), hashes.SHA256()
+            )
+        elif isinstance(public_key, ec.EllipticCurvePublicKey):
+            public_key.verify(signature, payload, ec.ECDSA(hashes.SHA256()))
+        elif isinstance(public_key, ed25519.Ed25519PublicKey):
+            public_key.verify(signature, payload)
+        else:
+            return False
+    except Exception:
+        return False
+    return True
+
+
+class X509AttestedNonceJSONVerifier(Verifier):
+    """Built-in verifier for the ``x509-attested-nonce-json`` format.
+
+    The evidence is a JSON object cryptographically bound to the challenge
+    nonce and to a configured trust root::
+
+        {
+          "nonce": "<unpadded base64url>",
+          "claims": {...},
+          "certificate_chain": ["<leaf PEM>", ..., "<root PEM>"],
+          "signature": "<base64>"
+        }
+
+    ``certificate_chain`` is a non-empty list of PEM certificates ordered
+    from leaf to root. ``signature`` is the base64-encoded signature, made
+    by the leaf private key, over the canonical JSON serialization (sorted
+    keys, compact separators) of ``{"claims": ..., "nonce": ...}``.
+
+    Verification checks, in order: well-formed document; unpadded base64url
+    nonce equal to the challenge nonce (compared through its stored digest);
+    every chain certificate parses, is within its validity period, and
+    (except the leaf) carries a CA basic-constraints usage; each certificate
+    is signed by the next; the chain root is byte-identical to a trust root
+    configured for this exact tenant and workload; and the payload signature
+    verifies against the leaf public key. Any failure — format, chain,
+    trust, validity, or signature — yields a plain rejected result; no
+    reasons, certificate contents, or evidence are attached, persisted, or
+    logged.
+    """
+
+    format_name = X509_ATTESTED_NONCE_JSON
+
+    def verify(self, context: VerificationContext) -> VerificationResult:
+        try:
+            document = json.loads(context.evidence)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return _reject()
+        if not isinstance(document, dict):
+            return _reject()
+
+        nonce = document.get("nonce")
+        claims = document.get("claims", {})
+        chain_pems = document.get("certificate_chain")
+        signature_b64 = document.get("signature")
+        if not isinstance(nonce, str) or not nonce:
+            return _reject()
+        if "claims" in document and not isinstance(claims, dict):
+            return _reject()
+        if (
+            not isinstance(chain_pems, list)
+            or not chain_pems
+            or any(not isinstance(pem, str) or not pem.strip() for pem in chain_pems)
+        ):
+            return _reject()
+        if not isinstance(signature_b64, str) or not signature_b64:
+            return _reject()
+
+        if not _is_unpadded_base64url(nonce):
+            return _reject()
+
+        # The attested nonce must be exactly the nonce of the bound challenge.
+        if not hmac.compare_digest(
+            hashlib.sha256(nonce.encode("ascii")).hexdigest(),
+            context.challenge.nonce_digest,
+        ):
+            return _reject()
+
+        try:
+            signature = base64.b64decode(signature_b64, validate=True)
+        except (binascii.Error, ValueError):
+            return _reject()
+        if not signature:
+            return _reject()
+
+        chain: list[x509.Certificate] = []
+        for pem in chain_pems:
+            cert = _load_pem_certificate(pem)
+            if cert is None:
+                return _reject()
+            chain.append(cert)
+
+        # Trust: the chain root must be byte-identical to a trust root
+        # configured for this exact tenant and workload.
+        configured = [
+            _load_pem_certificate(pem) for pem in context.trust_roots
+        ]
+        root_der = chain[-1].public_bytes(encoding=serialization.Encoding.DER)
+        if not any(
+            anchor is not None
+            and hmac.compare_digest(
+                anchor.public_bytes(encoding=serialization.Encoding.DER), root_der
+            )
+            for anchor in configured
+        ):
+            return _reject()
+
+        now = datetime.now(timezone.utc)
+        for index, cert in enumerate(chain):
+            not_before, not_after = _certificate_validity_bounds(cert)
+            if not (not_before <= now <= not_after):
+                return _reject()
+            # Every certificate above the leaf must be a CA.
+            if index > 0 and not _is_ca_certificate(cert):
+                return _reject()
+
+        # Each certificate must be issued and signed by the next one.
+        for child, issuer in zip(chain, chain[1:]):
+            if child.issuer != issuer.subject:
+                return _reject()
+            if not _verify_cert_signature(child, issuer):
+                return _reject()
+
+        signed_payload = json.dumps(
+            {"claims": claims, "nonce": nonce},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if not _verify_payload_signature(
+            chain[0].public_key(), signature, signed_payload
+        ):
+            return _reject()
+
+        return VerificationResult(accepted=True)
+
+
 #: Process-wide registry used by the service unless one is supplied.
 default_registry = VerifierRegistry()
 default_registry.register(AttestedNonceJSONVerifier())
+default_registry.register(X509AttestedNonceJSONVerifier())
 
 
 def register_verifier(verifier: Verifier) -> None:
