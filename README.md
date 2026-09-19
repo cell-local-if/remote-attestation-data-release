@@ -16,4 +16,9 @@ pytest -q
 uvicorn proof_release.app:app --reload
 ```
 
-The initial API exposes `GET /health`, which returns a JSON readiness result. It intentionally contains no attestation or data-release workflow yet.
+The API exposes `GET /health`, which returns a JSON readiness result, plus a one-time random-challenge flow used to prove workload freshness:
+
+- `POST /v1/challenges` — issues a challenge (`tenant_id`, `workload_id`, optional `ttl_seconds` of 30–900, default 300). Returns `201` with `challenge_id`, `nonce`, `issued_at`, `expires_at`, and `status` (`pending`). The nonce is generated from a cryptographically secure source (32 bytes, unpadded base64url) and appears only in this response; the database stores its SHA-256 digest.
+- `POST /v1/challenges/{challenge_id}/consume` — consumes a challenge (`tenant_id`, `workload_id`, `nonce`). Returns `200` with `consumed_at` on success, `404` for unknown/foreign challenges, `401` for a wrong nonce, `409` if already consumed, `410` if expired, and `422` for invalid fields. The pending→consumed transition is atomic, so concurrent consumes have exactly one winner.
+
+Challenges persist in SQLite (`proof_release.db` by default, override with `PROOF_RELEASE_DATABASE_URL`) and survive process restarts; tables are created at startup.
