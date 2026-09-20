@@ -11,7 +11,7 @@ import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
 from sqlalchemy import create_engine, event, func, select, text, update
 from sqlalchemy.exc import IntegrityError
@@ -27,11 +27,19 @@ from proof_release.db import (
     VERIFICATION_RESULT_REJECTED,
     Base,
     Challenge,
+    DataEnvelope,
     Decision,
     Evidence,
     Policy,
     ReleaseGrant,
     TrustRoot,
+)
+from proof_release.envelopes import (
+    KEY_VERSION,
+    MasterKeyError,
+    b64url_encode,
+    encrypt_payload,
+    load_master_key,
 )
 from proof_release.policies import (
     InvalidRule,
@@ -283,6 +291,39 @@ class ReleaseGrantConsumedResponse(BaseModel):
     data_id: str
     consumed: bool
     consumed_at: str
+
+
+class CreateDataEnvelopeRequest(BaseModel):
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    data_id: StrictStr = Field(min_length=1)
+    # Arbitrary non-empty payload content; whitespace-only is permitted
+    # (it is data, not an identifier), so only emptiness is rejected.
+    payload: StrictStr = Field(min_length=1)
+
+    _non_blank = field_validator("tenant_id", "workload_id", "data_id")(
+        _require_non_blank
+    )
+
+
+class DataEnvelopeCreatedResponse(BaseModel):
+    data_id: str
+    tenant_id: str
+    workload_id: str
+    key_version: int
+    created_at: str
+
+
+class DataEnvelopeResponse(BaseModel):
+    data_id: str
+    tenant_id: str
+    workload_id: str
+    key_version: int
+    created_at: str
+    ciphertext: str
+    iv: str
+    tag: str
+    wrapped_key: str
 
 
 def _migrate_additive(engine) -> None:
@@ -1053,6 +1094,116 @@ def create_app(
             consumed=True,
             consumed_at=_rfc3339(now),
         )
+
+    @app.post(
+        "/v1/data-envelopes",
+        status_code=201,
+        response_model=DataEnvelopeCreatedResponse,
+    )
+    def create_data_envelope(body: CreateDataEnvelopeRequest) -> DataEnvelopeCreatedResponse:
+        # The master key is required for this operation; its absence or
+        # malformed value is a server configuration failure, never a client
+        # error. Only the failure kind is logged — never the variable value.
+        try:
+            master_key = load_master_key()
+        except MasterKeyError as exc:
+            logger.error("master key unavailable: %s", exc)
+            raise HTTPException(status_code=500, detail="encryption unavailable")
+
+        with session_factory() as session:
+            # Same-scope data_id uniqueness is enforced by the primary key;
+            # the pre-check yields the documented 409 for plain retries, the
+            # IntegrityError below covers the concurrent race.
+            existing = session.get(
+                DataEnvelope, (body.tenant_id, body.workload_id, body.data_id)
+            )
+            if existing is not None:
+                raise HTTPException(
+                    status_code=409, detail="data_id already exists in this scope"
+                )
+
+            # Encrypt outside any durable state: the plaintext payload and
+            # plaintext data key live only in local variables, are encoded
+            # into the row, and are never logged or placed on a response.
+            # encrypt_payload self-verifies unwrap + authenticated decrypt,
+            # so a failure here leaves no record at all.
+            try:
+                sealed = encrypt_payload(master_key, body.payload.encode("utf-8"))
+            except Exception:
+                session.rollback()
+                logger.error("payload encryption failed for data envelope")
+                raise HTTPException(status_code=500, detail="encryption failed")
+
+            now = _utcnow()
+            envelope = DataEnvelope(
+                tenant_id=body.tenant_id,
+                workload_id=body.workload_id,
+                data_id=body.data_id,
+                key_version=KEY_VERSION,
+                ciphertext=sealed.ciphertext,
+                iv=sealed.iv,
+                tag=sealed.tag,
+                wrapped_key=sealed.wrapped_key,
+                created_at=now,
+            )
+            session.add(envelope)
+            try:
+                # All material columns are NOT NULL in one row, so this
+                # commit is the single atomic write of the full envelope.
+                session.commit()
+            except IntegrityError:
+                # A concurrent request inserted the same (scope, data_id).
+                session.rollback()
+                raise HTTPException(
+                    status_code=409, detail="data_id already exists in this scope"
+                )
+            except Exception:
+                session.rollback()
+                logger.error("data envelope write failed")
+                raise HTTPException(status_code=500, detail="encryption failed")
+
+        return DataEnvelopeCreatedResponse(
+            data_id=body.data_id,
+            tenant_id=body.tenant_id,
+            workload_id=body.workload_id,
+            key_version=KEY_VERSION,
+            created_at=_rfc3339(now),
+        )
+
+    @app.get(
+        "/v1/data-envelopes/{data_id}",
+        response_model=DataEnvelopeResponse,
+    )
+    def get_data_envelope(
+        data_id: str,
+        tenant_id: str = Query(..., min_length=1),
+        workload_id: str = Query(..., min_length=1),
+    ) -> DataEnvelopeResponse:
+        if not data_id.strip() or not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+        with session_factory() as session:
+            # The composite key binds the row to exactly this scope: an
+            # unknown data_id and a data_id belonging to another tenant or
+            # workload are indistinguishable and both return 404.
+            envelope = session.get(
+                DataEnvelope, (tenant_id, workload_id, data_id)
+            )
+            if envelope is None:
+                raise HTTPException(status_code=404, detail="data envelope not found")
+            # Read-only path: the stored material is returned encoded as
+            # received and is never unwrapped, decrypted, or logged, so the
+            # plaintext never exists on this path at all.
+            return DataEnvelopeResponse(
+                data_id=envelope.data_id,
+                tenant_id=envelope.tenant_id,
+                workload_id=envelope.workload_id,
+                key_version=envelope.key_version,
+                created_at=_rfc3339(envelope.created_at),
+                ciphertext=b64url_encode(envelope.ciphertext),
+                iv=b64url_encode(envelope.iv),
+                tag=b64url_encode(envelope.tag),
+                wrapped_key=b64url_encode(envelope.wrapped_key),
+            )
 
     return app
 

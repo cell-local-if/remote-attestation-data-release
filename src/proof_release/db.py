@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from sqlalchemy import (
     DateTime,
     Integer,
+    LargeBinary,
     String,
     Text,
     TypeDecorator,
@@ -187,6 +188,38 @@ class Decision(Base):
     # One of DECISION_STATUS_*; a fixed, service-defined code only.
     status: Mapped[str] = mapped_column(String(16))
     decided_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class DataEnvelope(Base):
+    """An envelope-encrypted data item scoped to a tenant and workload.
+
+    The row stores only ciphertext and key material, never the plaintext
+    payload or the plaintext data key:
+
+    * ``ciphertext`` — AES-256-GCM ciphertext (tag stored separately),
+    * ``iv`` — the 12-byte GCM nonce,
+    * ``tag`` — the 16-byte GCM authentication tag,
+    * ``wrapped_key`` — the 32-byte data key wrapped with AES-KW under the
+      master key version recorded in ``key_version``.
+
+    All four material columns are NOT NULL so a successful insert is a
+    single atomic write: there is no observable state in which part of the
+    envelope exists. The plaintext is never recoverable from any column.
+    """
+
+    __tablename__ = "data_envelopes"
+    # A data_id is unique within a tenant/workload scope; the composite
+    # primary key is also the lookup key for the GET endpoint.
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    data_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # Master key version under which wrapped_key was produced.
+    key_version: Mapped[int] = mapped_column(Integer)
+    ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    iv: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    tag: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    wrapped_key: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
 class ReleaseGrant(Base):
