@@ -33,6 +33,13 @@ DECISION_STATUS_ALLOWED = "allowed"
 DECISION_STATUS_DENIED = "denied"
 DECISION_STATUS_CODES = frozenset({DECISION_STATUS_ALLOWED, DECISION_STATUS_DENIED})
 
+#: Finite, service-defined set of release-grant statuses. A grant is
+#: pending until its capability is presented exactly once, after which it
+#: is consumed and can never be used again.
+GRANT_STATUS_PENDING = "pending"
+GRANT_STATUS_CONSUMED = "consumed"
+GRANT_STATUS_CODES = frozenset({GRANT_STATUS_PENDING, GRANT_STATUS_CONSUMED})
+
 
 class UTCDateTime(TypeDecorator):
     """Store datetimes as UTC and always return timezone-aware UTC values."""
@@ -177,3 +184,31 @@ class Decision(Base):
     # One of DECISION_STATUS_*; a fixed, service-defined code only.
     status: Mapped[str] = mapped_column(String(16))
     decided_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class ReleaseGrant(Base):
+    """A one-time release grant minted from an allowed decision.
+
+    The row records only identifiers (grant, decision, scope, data), the
+    fixed status code, timestamps, and the SHA-256 digest of the
+    capability. The plaintext capability is returned exactly once, in the
+    creation response, and is never persisted, logged, or returned again;
+    no evidence, claims, or payload are ever stored here.
+    """
+
+    __tablename__ = "release_grants"
+
+    grant_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    decision_id: Mapped[str] = mapped_column(String(36), index=True)
+    # Identifier of the protected data this grant authorizes releasing.
+    data_id: Mapped[str] = mapped_column(String(256))
+    # Only the SHA-256 digest of the capability is persisted, never the
+    # capability itself.
+    capability_digest: Mapped[str] = mapped_column(String(64))
+    # One of GRANT_STATUS_*; pending -> consumed, settled atomically.
+    status: Mapped[str] = mapped_column(String(16), default=GRANT_STATUS_PENDING)
+    issued_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    consumed_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)

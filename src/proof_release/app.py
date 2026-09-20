@@ -23,6 +23,8 @@ from cryptography.hazmat.primitives.serialization import Encoding
 from proof_release.db import (
     DECISION_STATUS_ALLOWED,
     DECISION_STATUS_DENIED,
+    GRANT_STATUS_CONSUMED,
+    GRANT_STATUS_PENDING,
     VERIFICATION_RESULT_ACCEPTED,
     VERIFICATION_RESULT_REJECTED,
     Base,
@@ -30,6 +32,7 @@ from proof_release.db import (
     Decision,
     Evidence,
     Policy,
+    ReleaseGrant,
     TrustRoot,
 )
 from proof_release.policies import (
@@ -70,6 +73,10 @@ def _rfc3339(value: datetime) -> str:
 
 def _nonce_digest(nonce: str) -> str:
     return hashlib.sha256(nonce.encode("ascii")).hexdigest()
+
+
+def _capability_digest(capability: str) -> str:
+    return hashlib.sha256(capability.encode("ascii")).hexdigest()
 
 
 def _require_non_blank(value: str) -> str:
@@ -232,6 +239,47 @@ class DecisionResponse(BaseModel):
     policy_version: int
     status: str
     decided_at: str
+
+
+class CreateReleaseGrantRequest(BaseModel):
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    decision_id: StrictStr = Field(min_length=1)
+    data_id: StrictStr = Field(min_length=1)
+    ttl_seconds: StrictInt = Field(
+        default=DEFAULT_TTL_SECONDS, ge=MIN_TTL_SECONDS, le=MAX_TTL_SECONDS
+    )
+
+    _non_blank = field_validator(
+        "tenant_id", "workload_id", "decision_id", "data_id"
+    )(_require_non_blank)
+
+
+class ConsumeReleaseGrantRequest(BaseModel):
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    capability: StrictStr = Field(min_length=1)
+
+    _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
+    _capability_valid = field_validator("capability")(_nonce_format)
+
+
+class ReleaseGrantCreatedResponse(BaseModel):
+    grant_id: str
+    decision_id: str
+    data_id: str
+    capability: str
+    status: str
+    issued_at: str
+    expires_at: str
+
+
+class ReleaseGrantConsumedResponse(BaseModel):
+    grant_id: str
+    decision_id: str
+    data_id: str
+    status: str
+    consumed_at: str
 
 
 def _migrate_additive(engine) -> None:
@@ -881,6 +929,125 @@ def create_app(
             policy_version=policy.version,
             status=status,
             decided_at=_rfc3339(decided_at),
+        )
+
+    @app.post(
+        "/v1/release-grants",
+        status_code=201,
+        response_model=ReleaseGrantCreatedResponse,
+    )
+    def create_release_grant(
+        body: CreateReleaseGrantRequest,
+    ) -> ReleaseGrantCreatedResponse:
+        now = _utcnow()
+        expires_at = now + timedelta(seconds=body.ttl_seconds)
+        # Cryptographically secure random capability; only its SHA-256
+        # digest is persisted. The plaintext is returned exactly once, in
+        # this response, and never logged or stored anywhere.
+        capability = base64.urlsafe_b64encode(
+            secrets.token_bytes(NONCE_BYTES)
+        ).rstrip(b"=").decode("ascii")
+        grant_id = str(uuid.uuid4())
+        with session_factory() as session:
+            decision = session.get(Decision, body.decision_id)
+            # Decisions carry no scope of their own; the scope lives on the
+            # evidence the decision was taken from. Unknown or cross-scope
+            # decisions are indistinguishable: both are not-found.
+            evidence = (
+                session.get(Evidence, decision.evidence_id)
+                if decision is not None
+                else None
+            )
+            if (
+                decision is None
+                or evidence is None
+                or evidence.tenant_id != body.tenant_id
+                or evidence.workload_id != body.workload_id
+            ):
+                raise HTTPException(status_code=404, detail="decision not found")
+            # Only an allowed decision may mint a release grant.
+            if decision.status != DECISION_STATUS_ALLOWED:
+                raise HTTPException(
+                    status_code=409, detail="decision does not allow release"
+                )
+            session.add(
+                ReleaseGrant(
+                    grant_id=grant_id,
+                    tenant_id=body.tenant_id,
+                    workload_id=body.workload_id,
+                    decision_id=body.decision_id,
+                    data_id=body.data_id,
+                    capability_digest=_capability_digest(capability),
+                    status=GRANT_STATUS_PENDING,
+                    issued_at=now,
+                    expires_at=expires_at,
+                    consumed_at=None,
+                )
+            )
+            session.commit()
+        return ReleaseGrantCreatedResponse(
+            grant_id=grant_id,
+            decision_id=body.decision_id,
+            data_id=body.data_id,
+            capability=capability,
+            status=GRANT_STATUS_PENDING,
+            issued_at=_rfc3339(now),
+            expires_at=_rfc3339(expires_at),
+        )
+
+    @app.post(
+        "/v1/release-grants/{grant_id}/consume",
+        response_model=ReleaseGrantConsumedResponse,
+    )
+    def consume_release_grant(
+        grant_id: str, body: ConsumeReleaseGrantRequest
+    ) -> ReleaseGrantConsumedResponse:
+        digest = _capability_digest(body.capability)
+        now = _utcnow()
+        with session_factory() as session:
+            grant = session.get(ReleaseGrant, grant_id)
+            if (
+                grant is None
+                or grant.tenant_id != body.tenant_id
+                or grant.workload_id != body.workload_id
+            ):
+                raise HTTPException(status_code=404, detail="release grant not found")
+            if not hmac.compare_digest(grant.capability_digest, digest):
+                raise HTTPException(status_code=401, detail="invalid capability")
+            if grant.status == GRANT_STATUS_CONSUMED:
+                raise HTTPException(
+                    status_code=409, detail="release grant already consumed"
+                )
+            if grant.expires_at <= now:
+                raise HTTPException(status_code=410, detail="release grant expired")
+            # Atomic claim: only one concurrent consumer can flip
+            # pending -> consumed. Consuming updates the grant row in place;
+            # no additional audit rows are written.
+            result = session.execute(
+                update(ReleaseGrant)
+                .where(
+                    ReleaseGrant.grant_id == grant_id,
+                    ReleaseGrant.status == GRANT_STATUS_PENDING,
+                    ReleaseGrant.expires_at > now,
+                )
+                .values(status=GRANT_STATUS_CONSUMED, consumed_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            if result.rowcount != 1:
+                session.rollback()
+                fresh = session.get(ReleaseGrant, grant_id)
+                if fresh is not None and fresh.status == GRANT_STATUS_CONSUMED:
+                    raise HTTPException(
+                        status_code=409, detail="release grant already consumed"
+                    )
+                raise HTTPException(status_code=410, detail="release grant expired")
+            session.commit()
+        return ReleaseGrantConsumedResponse(
+            grant_id=grant_id,
+            decision_id=grant.decision_id,
+            data_id=grant.data_id,
+            status=GRANT_STATUS_CONSUMED,
+            consumed_at=_rfc3339(now),
         )
 
     return app
