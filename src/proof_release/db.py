@@ -189,6 +189,42 @@ class Decision(Base):
     decided_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
+class DataEnvelope(Base):
+    """An encrypted data envelope scoped to a tenant and workload.
+
+    Each row is one sealed payload addressed by ``(tenant_id, workload_id,
+    data_id)``. The plaintext payload and the plaintext data key never touch
+    this table: only the AES-256-GCM ciphertext, IV and authentication tag,
+    and the AES key-wrapped data key are persisted, each as unpadded
+    base64url text, together with the version of the master key that wrapped
+    the data key. All five sealed fields are written in one transaction, so a
+    stored envelope is always complete and can be unwrapped and
+    authenticated against that master key version.
+    """
+
+    __tablename__ = "data_envelopes"
+    # The composite primary key is the address of an envelope: a data_id is
+    # unique only within a (tenant, workload) scope, and the same data_id may
+    # exist independently in other scopes. It also makes the scoped lookup a
+    # primary-key access and guarantees the duplicate constraint.
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # Caller-supplied identifier of the sealed payload. Unique only within
+    # the (tenant, workload) scope; the same data_id may exist in two scopes.
+    data_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # AES-256-GCM sealed material, unpadded base64url. Never the plaintext.
+    ciphertext: Mapped[str] = mapped_column(Text)
+    iv: Mapped[str] = mapped_column(String(64))
+    tag: Mapped[str] = mapped_column(String(64))
+    # The 32-byte data key wrapped under the master key with AES-KW (RFC 3394),
+    # unpadded base64url. The plaintext data key is never persisted.
+    wrapped_key: Mapped[str] = mapped_column(Text)
+    # Version of the master key used to wrap the data key.
+    key_version: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class ReleaseGrant(Base):
     """A one-time, TTL-bounded capability that releases one data item.
 

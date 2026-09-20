@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -11,13 +12,15 @@ import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
 from sqlalchemy import create_engine, event, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from cryptography import x509
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.keywrap import aes_key_wrap
 from cryptography.hazmat.primitives.serialization import Encoding
 
 from proof_release.db import (
@@ -27,6 +30,7 @@ from proof_release.db import (
     VERIFICATION_RESULT_REJECTED,
     Base,
     Challenge,
+    DataEnvelope,
     Decision,
     Evidence,
     Policy,
@@ -59,7 +63,55 @@ MAX_TTL_SECONDS = 900
 NONCE_BYTES = 32
 CAPABILITY_BYTES = 32
 
+#: Envelope encryption parameters. Every envelope uses a fresh 32-byte data
+#: key with AES-256-GCM (96-bit IV, 128-bit tag); the data key is wrapped
+#: under the configured 256-bit master key with AES-KW (RFC 3394).
+MASTER_KEY_ENV = "PROOF_RELEASE_MASTER_KEY"
+MASTER_KEY_BYTES = 32
+#: Unpadded base64url is always 43 characters for 32 bytes.
+MASTER_KEY_ENCODED_LEN = 43
+DATA_KEY_BYTES = 32
+GCM_IV_BYTES = 12
+GCM_TAG_BYTES = 16
+ENVELOPE_KEY_VERSION = 1
+
 _NONCE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+#: Query parameters that identify a scope must contain a non-whitespace
+#: character (pydantic's Rust regex has no look-around, hence .*\S.*).
+_NON_BLANK_QUERY_RE = r".*\S.*"
+
+
+class MasterKeyError(RuntimeError):
+    """The configured master key is missing or not a valid 32-byte key."""
+
+
+def _load_master_key() -> bytes:
+    """Return the 32-byte master key from ``PROOF_RELEASE_MASTER_KEY``.
+
+    The value must be exactly 32 bytes encoded as unpadded base64url
+    (43 characters from the base64url alphabet). Any missing, malformed,
+    or wrong-length value raises :class:`MasterKeyError`; callers map that
+    to HTTP 500. The key is read on every request so a misconfigured
+    process reports 500 rather than serving with a stale or absent key.
+    """
+    encoded = os.environ.get(MASTER_KEY_ENV)
+    if (
+        not encoded
+        or len(encoded) != MASTER_KEY_ENCODED_LEN
+        or _NONCE_RE.fullmatch(encoded) is None
+    ):
+        raise MasterKeyError("master key is missing or not unpadded base64url")
+    try:
+        raw = base64.urlsafe_b64decode(encoded + "=")
+    except (binascii.Error, ValueError) as exc:
+        raise MasterKeyError("master key is not valid base64url") from exc
+    if len(raw) != MASTER_KEY_BYTES:
+        raise MasterKeyError("master key must decode to exactly 32 bytes")
+    return raw
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
 def _utcnow() -> datetime:
@@ -283,6 +335,41 @@ class ReleaseGrantConsumedResponse(BaseModel):
     data_id: str
     consumed: bool
     consumed_at: str
+
+
+class CreateDataEnvelopeRequest(BaseModel):
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    data_id: StrictStr = Field(min_length=1)
+    #: The plaintext is sealed on this stack frame and is never persisted,
+    #: logged, or echoed back on any response.
+    payload: StrictStr = Field(min_length=1)
+
+    _non_blank = field_validator(
+        "tenant_id", "workload_id", "data_id", "payload"
+    )(_require_non_blank)
+
+
+class DataEnvelopeCreatedResponse(BaseModel):
+    data_id: str
+    tenant_id: str
+    workload_id: str
+    key_version: int
+    created_at: str
+
+
+class DataEnvelopeResponse(BaseModel):
+    data_id: str
+    tenant_id: str
+    workload_id: str
+    key_version: int
+    created_at: str
+    #: Sealed material only; all unpadded base64url. No plaintext is ever
+    #: present on this or any other response.
+    ciphertext: str
+    iv: str
+    tag: str
+    wrapped_key: str
 
 
 def _migrate_additive(engine) -> None:
@@ -1053,6 +1140,137 @@ def create_app(
             consumed=True,
             consumed_at=_rfc3339(now),
         )
+
+    @app.post(
+        "/v1/data-envelopes",
+        status_code=201,
+        response_model=DataEnvelopeCreatedResponse,
+    )
+    def create_data_envelope(
+        body: CreateDataEnvelopeRequest,
+    ) -> DataEnvelopeCreatedResponse:
+        # A missing or malformed master key is a server configuration
+        # failure, never a client error: 500 regardless of the request.
+        try:
+            master_key = _load_master_key()
+        except MasterKeyError:
+            logger.error(
+                "master key %s is missing or invalid; refusing to seal envelope",
+                MASTER_KEY_ENV,
+            )
+            raise HTTPException(status_code=500, detail="master key misconfigured")
+
+        # Envelope encryption happens entirely before any database state is
+        # touched, so a crypto failure leaves no record behind:
+        #   data key = 32 CSPRNG bytes, fresh per envelope
+        #   iv       = 96 CSPRNG bits
+        #   sealed   = AES-256-GCM(data key, iv, payload), split into
+        #              ciphertext and the 128-bit authentication tag
+        #   wrapped  = AES-KW(master key, data key)  (RFC 3394)
+        # The plaintext payload and the plaintext data key live only in this
+        # frame and are never persisted, logged, or returned.
+        try:
+            data_key = secrets.token_bytes(DATA_KEY_BYTES)
+            iv = secrets.token_bytes(GCM_IV_BYTES)
+            sealed = AESGCM(data_key).encrypt(
+                iv, body.payload.encode("utf-8"), None
+            )
+            ciphertext, tag = sealed[:-GCM_TAG_BYTES], sealed[-GCM_TAG_BYTES:]
+            wrapped_key = aes_key_wrap(master_key, data_key)
+        except Exception:
+            # Log no details: a faulty crypto backend could embed key or
+            # payload material in the exception.
+            logger.error("envelope encryption failed for data item %r", body.data_id)
+            raise HTTPException(status_code=500, detail="encryption failed")
+
+        now = _utcnow()
+        with session_factory() as session:
+            duplicate = session.scalar(
+                select(DataEnvelope.data_id).where(
+                    DataEnvelope.tenant_id == body.tenant_id,
+                    DataEnvelope.workload_id == body.workload_id,
+                    DataEnvelope.data_id == body.data_id,
+                )
+            )
+            if duplicate is not None:
+                raise HTTPException(
+                    status_code=409, detail="data envelope already exists"
+                )
+            # ciphertext, iv, tag and wrapped_key are columns of one row in
+            # one transaction: either the complete envelope is durable or
+            # nothing is, never a partial set.
+            session.add(
+                DataEnvelope(
+                    tenant_id=body.tenant_id,
+                    workload_id=body.workload_id,
+                    data_id=body.data_id,
+                    ciphertext=_b64url(ciphertext),
+                    iv=_b64url(iv),
+                    tag=_b64url(tag),
+                    wrapped_key=_b64url(wrapped_key),
+                    key_version=ENVELOPE_KEY_VERSION,
+                    created_at=now,
+                )
+            )
+            try:
+                session.commit()
+            except IntegrityError:
+                # A concurrent request sealed the same scoped data_id first.
+                session.rollback()
+                raise HTTPException(
+                    status_code=409, detail="data envelope already exists"
+                )
+            except Exception:
+                session.rollback()
+                logger.error(
+                    "envelope write failed for data item %r", body.data_id
+                )
+                raise HTTPException(status_code=500, detail="envelope write failed")
+        return DataEnvelopeCreatedResponse(
+            data_id=body.data_id,
+            tenant_id=body.tenant_id,
+            workload_id=body.workload_id,
+            key_version=ENVELOPE_KEY_VERSION,
+            created_at=_rfc3339(now),
+        )
+
+    @app.get(
+        "/v1/data-envelopes/{data_id}",
+        response_model=DataEnvelopeResponse,
+    )
+    def get_data_envelope(
+        data_id: str,
+        tenant_id: str = Query(
+            ..., min_length=1, pattern=_NON_BLANK_QUERY_RE
+        ),
+        workload_id: str = Query(
+            ..., min_length=1, pattern=_NON_BLANK_QUERY_RE
+        ),
+    ) -> DataEnvelopeResponse:
+        with session_factory() as session:
+            envelope = session.scalar(
+                select(DataEnvelope).where(
+                    DataEnvelope.tenant_id == tenant_id,
+                    DataEnvelope.workload_id == workload_id,
+                    DataEnvelope.data_id == data_id,
+                )
+            )
+            if envelope is None:
+                # Do not reveal whether a data_id exists in another scope.
+                raise HTTPException(status_code=404, detail="data envelope not found")
+            # Only sealed material is ever read back; the service never
+            # decrypts an envelope and holds no plaintext at this layer.
+            return DataEnvelopeResponse(
+                data_id=envelope.data_id,
+                tenant_id=envelope.tenant_id,
+                workload_id=envelope.workload_id,
+                key_version=envelope.key_version,
+                created_at=_rfc3339(envelope.created_at),
+                ciphertext=envelope.ciphertext,
+                iv=envelope.iv,
+                tag=envelope.tag,
+                wrapped_key=envelope.wrapped_key,
+            )
 
     return app
 
