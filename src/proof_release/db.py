@@ -33,6 +33,16 @@ DECISION_STATUS_ALLOWED = "allowed"
 DECISION_STATUS_DENIED = "denied"
 DECISION_STATUS_CODES = frozenset({DECISION_STATUS_ALLOWED, DECISION_STATUS_DENIED})
 
+#: Finite, service-defined set of persisted release-grant statuses. A grant
+#: is born pending and settles atomically to consumed on its first (and
+#: only) successful presentation; expiry is derived from expires_at rather
+#: than stored as a status.
+RELEASE_GRANT_STATUS_PENDING = "pending"
+RELEASE_GRANT_STATUS_CONSUMED = "consumed"
+RELEASE_GRANT_STATUS_CODES = frozenset(
+    {RELEASE_GRANT_STATUS_PENDING, RELEASE_GRANT_STATUS_CONSUMED}
+)
+
 
 class UTCDateTime(TypeDecorator):
     """Store datetimes as UTC and always return timezone-aware UTC values."""
@@ -177,3 +187,37 @@ class Decision(Base):
     # One of DECISION_STATUS_*; a fixed, service-defined code only.
     status: Mapped[str] = mapped_column(String(16))
     decided_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class ReleaseGrant(Base):
+    """A one-time, TTL-bounded capability that releases one data item.
+
+    A grant can only be minted for an ``allowed`` decision in the same
+    tenant/workload scope. Exactly one consume may ever succeed: the first
+    caller that presents the correct capability while the grant is pending
+    and unexpired atomically settles it to ``consumed``.
+
+    The plaintext capability is never stored — only its SHA-256 digest —
+    and it is returned exactly once, on the create response. The row stores
+    only identifiers, the scope, the digest, the fixed status code and
+    timestamps: never the capability, evidence, claims, or any payload.
+    """
+
+    __tablename__ = "release_grants"
+
+    grant_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    decision_id: Mapped[str] = mapped_column(String(36), index=True)
+    # Caller-supplied identifier of the protected data item this grant
+    # authorizes release of. The service never sees the data itself.
+    data_id: Mapped[str] = mapped_column(String(256))
+    # Only the SHA-256 digest of the capability is persisted.
+    capability_digest: Mapped[str] = mapped_column(String(64))
+    # pending -> consumed, settled atomically on the first valid consume.
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    issued_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    consumed_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
