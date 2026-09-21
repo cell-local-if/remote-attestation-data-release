@@ -35,11 +35,11 @@ from proof_release.db import (
     TrustRoot,
 )
 from proof_release.envelopes import (
-    KEY_VERSION,
     MasterKeyError,
     b64url_encode,
     encrypt_payload,
-    load_master_key,
+    load_keyring,
+    rewrap_data_key,
 )
 from proof_release.policies import (
     InvalidRule,
@@ -324,6 +324,21 @@ class DataEnvelopeResponse(BaseModel):
     iv: str
     tag: str
     wrapped_key: str
+
+
+class RewrapDataEnvelopeRequest(BaseModel):
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+
+    _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
+
+
+class DataEnvelopeRewrappedResponse(BaseModel):
+    data_id: str
+    tenant_id: str
+    workload_id: str
+    key_version: int
+    rotated_at: str
 
 
 def _migrate_additive(engine) -> None:
@@ -1101,13 +1116,14 @@ def create_app(
         response_model=DataEnvelopeCreatedResponse,
     )
     def create_data_envelope(body: CreateDataEnvelopeRequest) -> DataEnvelopeCreatedResponse:
-        # The master key is required for this operation; its absence or
+        # The master keyring is required for this operation; its absence or
         # malformed value is a server configuration failure, never a client
-        # error. Only the failure kind is logged — never the variable value.
+        # error. Only the failure kind is logged — never the configured
+        # values or any key material.
         try:
-            master_key = load_master_key()
+            keyring = load_keyring()
         except MasterKeyError as exc:
-            logger.error("master key unavailable: %s", exc)
+            logger.error("master key configuration unavailable: %s", exc)
             raise HTTPException(status_code=500, detail="encryption unavailable")
 
         with session_factory() as session:
@@ -1128,7 +1144,9 @@ def create_app(
             # encrypt_payload self-verifies unwrap + authenticated decrypt,
             # so a failure here leaves no record at all.
             try:
-                sealed = encrypt_payload(master_key, body.payload.encode("utf-8"))
+                sealed = encrypt_payload(
+                    keyring.current_key(), body.payload.encode("utf-8")
+                )
             except Exception:
                 session.rollback()
                 logger.error("payload encryption failed for data envelope")
@@ -1139,7 +1157,7 @@ def create_app(
                 tenant_id=body.tenant_id,
                 workload_id=body.workload_id,
                 data_id=body.data_id,
-                key_version=KEY_VERSION,
+                key_version=keyring.current_version,
                 ciphertext=sealed.ciphertext,
                 iv=sealed.iv,
                 tag=sealed.tag,
@@ -1166,7 +1184,7 @@ def create_app(
             data_id=body.data_id,
             tenant_id=body.tenant_id,
             workload_id=body.workload_id,
-            key_version=KEY_VERSION,
+            key_version=keyring.current_version,
             created_at=_rfc3339(now),
         )
 
@@ -1204,6 +1222,118 @@ def create_app(
                 tag=b64url_encode(envelope.tag),
                 wrapped_key=b64url_encode(envelope.wrapped_key),
             )
+
+    @app.post(
+        "/v1/data-envelopes/{data_id}/rewrap",
+        response_model=DataEnvelopeRewrappedResponse,
+    )
+    def rewrap_data_envelope(
+        data_id: str, body: RewrapDataEnvelopeRequest
+    ) -> DataEnvelopeRewrappedResponse:
+        if not data_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+        # The keyring must name both the envelope's stored version (to
+        # unwrap) and the current version (to re-wrap). Any configuration
+        # problem is a server failure; only the failure kind is logged,
+        # never configured values or key material.
+        try:
+            keyring = load_keyring()
+        except MasterKeyError as exc:
+            logger.error("master key configuration unavailable: %s", exc)
+            raise HTTPException(status_code=500, detail="encryption unavailable")
+
+        rotated_at = _utcnow()
+        with session_factory() as session:
+            # The composite key binds the row to exactly this scope; unknown
+            # and cross-scope data_ids are indistinguishable. On SQLite the
+            # transaction already holds the write lock (BEGIN IMMEDIATE);
+            # on locking backends the guarded update below serializes
+            # concurrent rotations of the same row.
+            envelope = session.get(
+                DataEnvelope, (body.tenant_id, body.workload_id, data_id)
+            )
+            if envelope is None:
+                raise HTTPException(status_code=404, detail="data envelope not found")
+
+            stored_version = envelope.key_version
+            if stored_version != keyring.current_version:
+                try:
+                    unwrapping_key = keyring.key_for(stored_version)
+                except MasterKeyError:
+                    # The historical key needed to unwrap is gone; the row
+                    # must stay exactly as it is.
+                    logger.error(
+                        "master key version %s unavailable for rewrap",
+                        stored_version,
+                    )
+                    raise HTTPException(
+                        status_code=500, detail="encryption unavailable"
+                    )
+                # Unwrap under the stored version and re-wrap under the
+                # current one. The plaintext data key lives only in local
+                # variables; ciphertext, iv, tag, created_at and data_id
+                # are untouched. On any failure the transaction is rolled
+                # back and the stored row is unchanged.
+                to_version = keyring.current_version
+                try:
+                    new_wrapped_key = rewrap_data_key(
+                        unwrapping_key, keyring.current_key(), envelope.wrapped_key
+                    )
+                except Exception:
+                    session.rollback()
+                    logger.error("data envelope rewrap failed")
+                    raise HTTPException(status_code=500, detail="encryption failed")
+                # Guarded update: rotate only if the row still holds the
+                # version we unwrapped. A concurrent rotation that settled
+                # first leaves current-version material, which is retained.
+                result = session.execute(
+                    update(DataEnvelope)
+                    .where(
+                        DataEnvelope.tenant_id == body.tenant_id,
+                        DataEnvelope.workload_id == body.workload_id,
+                        DataEnvelope.data_id == data_id,
+                        DataEnvelope.key_version == stored_version,
+                    )
+                    .values(
+                        key_version=to_version, wrapped_key=new_wrapped_key
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                if result.rowcount != 1:
+                    session.rollback()
+                    fresh = session.get(
+                        DataEnvelope, (body.tenant_id, body.workload_id, data_id)
+                    )
+                    if fresh is None:
+                        raise HTTPException(
+                            status_code=404, detail="data envelope not found"
+                        )
+                    return DataEnvelopeRewrappedResponse(
+                        data_id=fresh.data_id,
+                        tenant_id=fresh.tenant_id,
+                        workload_id=fresh.workload_id,
+                        key_version=fresh.key_version,
+                        rotated_at=_rfc3339(rotated_at),
+                    )
+                try:
+                    session.commit()
+                except Exception:
+                    session.rollback()
+                    logger.error("data envelope rewrap write failed")
+                    raise HTTPException(status_code=500, detail="encryption failed")
+                final_version = to_version
+            else:
+                # Already wrapped under the current version: a retry changes
+                # no material and simply reports the stored state.
+                final_version = stored_version
+
+        return DataEnvelopeRewrappedResponse(
+            data_id=data_id,
+            tenant_id=body.tenant_id,
+            workload_id=body.workload_id,
+            key_version=final_version,
+            rotated_at=_rfc3339(rotated_at),
+        )
 
     return app
 
