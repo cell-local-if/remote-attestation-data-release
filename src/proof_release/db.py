@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
+    ForeignKey,
     Integer,
     LargeBinary,
     String,
@@ -42,6 +44,26 @@ RELEASE_GRANT_STATUS_PENDING = "pending"
 RELEASE_GRANT_STATUS_CONSUMED = "consumed"
 RELEASE_GRANT_STATUS_CODES = frozenset(
     {RELEASE_GRANT_STATUS_PENDING, RELEASE_GRANT_STATUS_CONSUMED}
+)
+
+#: Per-envelope outcome codes recorded by a rewrap batch. ``rewrapped``
+#: means the wrapping key was replaced by the current master key version;
+#: ``skipped`` means the envelope was already wrapped under the current
+#: version and no material changed; the remaining codes mark where a page
+#: stopped and are never followed by later items in the same batch.
+REWRAP_RESULT_REWRAPPED = "rewrapped"
+REWRAP_RESULT_SKIPPED = "skipped"
+REWRAP_RESULT_KEYRING = "keyring"
+REWRAP_RESULT_MISSING_KEY = "missing-key"
+REWRAP_RESULT_REWRAP_FAILED = "rewrap"
+REWRAP_RESULT_CODES = frozenset(
+    {
+        REWRAP_RESULT_REWRAPPED,
+        REWRAP_RESULT_SKIPPED,
+        REWRAP_RESULT_KEYRING,
+        REWRAP_RESULT_MISSING_KEY,
+        REWRAP_RESULT_REWRAP_FAILED,
+    }
 )
 
 
@@ -254,3 +276,67 @@ class ReleaseGrant(Base):
     consumed_at: Mapped[datetime | None] = mapped_column(
         UTCDateTime(), nullable=True
     )
+
+
+class RewrapBatch(Base):
+    """One page of a scoped, cursor-driven envelope rewrap batch.
+
+    Each POST creates one batch bound to exactly one tenant/workload
+    scope and the exclusive data_id cursor it started from. The batch is
+    persisted before any envelope is touched, so a failed keyring check
+    leaves no batch behind while a page that stops mid-way (a missing
+    historical key or a failed rewrap) stays queryable after restart with
+    all of its per-envelope audit rows.
+    """
+
+    __tablename__ = "rewrap_batches"
+
+    batch_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # Requested page size (1..200); informational for audit reads.
+    limit: Mapped[int] = mapped_column(Integer)
+    # Exclusive data_id boundary the page started after; empty string for
+    # the beginning of the scope. Never NULL.
+    cursor: Mapped[str] = mapped_column(String(256))
+    # Exclusive boundary to resume from; empty string when the scope has
+    # been fully scanned and complete is true.
+    next_cursor: Mapped[str] = mapped_column(String(256))
+    complete: Mapped[bool] = mapped_column(Boolean)
+    processed: Mapped[int] = mapped_column(Integer, default=0)
+    rewrapped: Mapped[int] = mapped_column(Integer, default=0)
+    skipped: Mapped[int] = mapped_column(Integer, default=0)
+    failed: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class RewrapBatchItem(Base):
+    """One per-envelope audit row within a rewrap batch.
+
+    A row is committed independently for every envelope the page reaches,
+    including the envelope that stopped the page. It records only the
+    scope, the envelope identifier, the old and new master key versions
+    (the new version equals the old one for skips and failures), the
+    fixed result code and a UTC timestamp — never the wrapped key, the
+    data key, or any payload material.
+    """
+
+    __tablename__ = "rewrap_batch_items"
+
+    item_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    batch_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("rewrap_batches.batch_id"), index=True
+    )
+    # Zero-based position of the item within its batch, giving the audit
+    # a stable order even when per-item commits land in the same second.
+    seq: Mapped[int] = mapped_column(Integer)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    data_id: Mapped[str] = mapped_column(String(256))
+    # Master key version recorded on the envelope before this page touched
+    # it; identical to new_key_version for skips/failures.
+    old_key_version: Mapped[int] = mapped_column(Integer)
+    new_key_version: Mapped[int] = mapped_column(Integer)
+    # One of REWRAP_RESULT_*; a fixed, service-defined code only.
+    result: Mapped[str] = mapped_column(String(16))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())

@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import Response
 from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
 from sqlalchemy import create_engine, event, func, select, text, update
 from sqlalchemy.exc import IntegrityError
@@ -23,6 +24,11 @@ from cryptography.hazmat.primitives.serialization import Encoding
 from proof_release.db import (
     DECISION_STATUS_ALLOWED,
     DECISION_STATUS_DENIED,
+    REWRAP_RESULT_KEYRING,
+    REWRAP_RESULT_MISSING_KEY,
+    REWRAP_RESULT_REWRAP_FAILED,
+    REWRAP_RESULT_REWRAPPED,
+    REWRAP_RESULT_SKIPPED,
     VERIFICATION_RESULT_ACCEPTED,
     VERIFICATION_RESULT_REJECTED,
     Base,
@@ -32,10 +38,13 @@ from proof_release.db import (
     Evidence,
     Policy,
     ReleaseGrant,
+    RewrapBatch,
+    RewrapBatchItem,
     TrustRoot,
 )
 from proof_release.envelopes import (
     MasterKeyError,
+    b64url_decode,
     b64url_encode,
     encrypt_payload,
     load_keyring,
@@ -67,7 +76,28 @@ MAX_TTL_SECONDS = 900
 NONCE_BYTES = 32
 CAPABILITY_BYTES = 32
 
+#: Bounds and default for a rewrap batch page size.
+REWRAP_BATCH_DEFAULT_LIMIT = 50
+REWRAP_BATCH_MIN_LIMIT = 1
+REWRAP_BATCH_MAX_LIMIT = 200
+
+#: Environment variable naming the secret used to authenticate rewrap
+#: cursors. Cursors are opaque outside the service: each one carries the
+#: scope and exclusive data_id boundary it was issued for plus an HMAC, so
+#: a forged or cross-scope cursor cannot move a batch outside its range.
+#: Unset in local development only; provision through a secrets manager
+#: elsewhere.
+CURSOR_SECRET_ENV = "PROOF_RELEASE_CURSOR_SECRET"
+_DEMO_CURSOR_SECRET = "dev-only-rewrap-cursor-secret"
+
 _NONCE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+#: Cursors are strict unpadded base64url tokens; empty string is reserved
+#: for the beginning-of-scope cursor and never travels through this pattern.
+_CURSOR_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+#: UUID syntax accepted on the batch lookup path before hitting storage.
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 
 
 def _utcnow() -> datetime:
@@ -98,6 +128,67 @@ def _optional_non_blank(value: str | None) -> str | None:
     if value is None:
         return value
     return _require_non_blank(value)
+
+
+def _cursor_secret() -> bytes:
+    return os.environ.get(CURSOR_SECRET_ENV, _DEMO_CURSOR_SECRET).encode("utf-8")
+
+
+def _encode_cursor(tenant_id: str, workload_id: str, data_id: str) -> str:
+    """Build an opaque, scope-bound exclusive cursor for ``data_id``.
+
+    The token is unpadded base64url of a JSON payload naming the scope
+    and boundary, authenticated with HMAC-SHA256. Nothing about the
+    boundary is secret, but the MAC makes a forged or tampered cursor
+    (including one replayed against a different tenant/workload)
+    unrecognizable.
+    """
+    payload = json.dumps(
+        {"t": tenant_id, "w": workload_id, "d": data_id},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    mac = hmac.new(_cursor_secret(), payload, hashlib.sha256).digest()
+    return b64url_encode(payload + mac)
+
+
+def _decode_cursor(
+    token: str, tenant_id: str, workload_id: str
+) -> str | None:
+    """Validate a cursor and return its exclusive data_id boundary.
+
+    Returns ``None`` for a malformed/forged token or one minted for any
+    other scope. ``""`` (the beginning-of-scope marker) yields ``""``.
+    """
+    if token == "":
+        return ""
+    if not _CURSOR_RE.fullmatch(token):
+        return None
+    try:
+        raw = b64url_decode(token)
+    except ValueError:
+        return None
+    # The MAC is a fixed 32-byte suffix; the JSON payload precedes it.
+    if len(raw) <= 32:
+        return None
+    payload, mac = raw[:-32], raw[-32:]
+    expected = hmac.new(_cursor_secret(), payload, hashlib.sha256).digest()
+    if not hmac.compare_digest(mac, expected):
+        return None
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    if not hmac.compare_digest(str(decoded.get("t", "")), tenant_id):
+        return None
+    if not hmac.compare_digest(str(decoded.get("w", "")), workload_id):
+        return None
+    boundary = decoded.get("d")
+    if not isinstance(boundary, str):
+        return None
+    return boundary
 
 
 class CreateChallengeRequest(BaseModel):
@@ -339,6 +430,35 @@ class DataEnvelopeRewrappedResponse(BaseModel):
     workload_id: str
     key_version: int
     rotated_at: str
+
+
+class CreateRewrapBatchRequest(BaseModel):
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    # 1..200 inclusive, defaulting to 50. Booleans are rejected by
+    # StrictInt even though Python treats them as ints.
+    limit: StrictInt = Field(
+        default=REWRAP_BATCH_DEFAULT_LIMIT,
+        ge=REWRAP_BATCH_MIN_LIMIT,
+        le=REWRAP_BATCH_MAX_LIMIT,
+    )
+    # Opaque scope-bound token from a previous batch; absent or empty
+    # means the beginning of the scope.
+    cursor: StrictStr | None = None
+
+    _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
+
+    @field_validator("cursor")
+    @classmethod
+    def _cursor_shape(cls, value: str | None) -> str | None:
+        # Only the wire shape is checked here; scope binding and the MAC
+        # are verified against the request's tenant/workload in the
+        # endpoint, where failures are indistinguishable 422s.
+        if value is None or value == "":
+            return None
+        if not value.strip() or not _CURSOR_RE.fullmatch(value):
+            raise ValueError("cursor is not a valid rewrap cursor")
+        return value
 
 
 def _migrate_additive(engine) -> None:
@@ -1334,6 +1454,383 @@ def create_app(
             key_version=final_version,
             rotated_at=_rfc3339(rotated_at),
         )
+
+    def _compact_json(payload: dict) -> Response:
+        # Compact JSON, no trailing newline. Counts and key versions are
+        # Python ints (never floats, so no -0.0 or non-finite values) and
+        # allow_nan=False makes that invariant explicit.
+        body = json.dumps(
+            payload, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+        return Response(content=body, media_type="application/json")
+
+    @app.post("/v1/rewrap-batches")
+    def create_rewrap_batch(body: CreateRewrapBatchRequest) -> Response:
+        # Authenticate the cursor against this exact scope before touching
+        # the keyring or storage: a forged, tampered or cross-scope cursor
+        # is a client error indistinguishable from any other bad field.
+        boundary = (
+            _decode_cursor(body.cursor, body.tenant_id, body.workload_id)
+            if body.cursor
+            else ""
+        )
+        if boundary is None:
+            raise HTTPException(status_code=422, detail="invalid cursor")
+
+        # A wholly unusable keyring is a server configuration failure:
+        # no batch row and no envelope may exist as evidence of the call.
+        try:
+            load_keyring()
+        except MasterKeyError as exc:
+            logger.error("master key configuration unavailable: %s", exc)
+            raise HTTPException(status_code=500, detail="encryption unavailable")
+
+        batch_id = str(uuid.uuid4())
+        batch_created_at = _utcnow()
+        counts = {"processed": 0, "rewrapped": 0, "skipped": 0, "failed": 0}
+        last_processed_data_id = boundary
+        failure_code: str | None = None
+
+        with session_factory() as session:
+            # Persist the batch before processing any envelope so the page
+            # is queryable even if it stops on the first item.
+            batch = RewrapBatch(
+                batch_id=batch_id,
+                tenant_id=body.tenant_id,
+                workload_id=body.workload_id,
+                limit=body.limit,
+                cursor=boundary,
+                next_cursor="",
+                complete=False,
+                processed=0,
+                rewrapped=0,
+                skipped=0,
+                failed=0,
+                created_at=batch_created_at,
+            )
+            session.add(batch)
+            try:
+                session.commit()
+            except Exception:
+                session.rollback()
+                logger.error("rewrap batch write failed")
+                raise HTTPException(status_code=500, detail="batch unavailable")
+
+            # Stable per-page snapshot of the scope, ordered by data_id,
+            # starting strictly after the exclusive cursor boundary. One
+            # extra row is fetched as a "more follows" probe, so a page
+            # that fills the limit exactly at the scope end still reports
+            # completion rather than another full-looking page.
+            try:
+                rows = list(
+                    session.scalars(
+                        select(DataEnvelope)
+                        .where(
+                            DataEnvelope.tenant_id == body.tenant_id,
+                            DataEnvelope.workload_id == body.workload_id,
+                            DataEnvelope.data_id > boundary,
+                        )
+                        .order_by(DataEnvelope.data_id.asc())
+                        .limit(body.limit + 1)
+                    )
+                )
+            except Exception:
+                session.rollback()
+                logger.error("rewrap batch scan failed")
+                raise HTTPException(status_code=500, detail="rewrap batch failed")
+            has_more = len(rows) > body.limit
+            page = rows[: body.limit]
+
+            def _record_stop(
+                code: str, data_id: str, key_version: int
+            ) -> None:
+                # The failed envelope is left exactly as it was: undo the
+                # attempted update, then commit only its audit row. The
+                # resume cursor stays before the failed item.
+                session.rollback()
+                nonlocal failure_code
+                failure_code = code
+                session.add(
+                    RewrapBatchItem(
+                        item_id=str(uuid.uuid4()),
+                        batch_id=batch_id,
+                        tenant_id=body.tenant_id,
+                        workload_id=body.workload_id,
+                        data_id=data_id,
+                        old_key_version=key_version,
+                        new_key_version=key_version,
+                        result=code,
+                        seq=counts["processed"],
+                        created_at=_utcnow(),
+                    )
+                )
+                counts["processed"] += 1
+                counts["failed"] += 1
+                stored = session.get(RewrapBatch, batch_id)
+                stored.processed = counts["processed"]
+                stored.failed = counts["failed"]
+                stored.next_cursor = (
+                    _encode_cursor(
+                        body.tenant_id, body.workload_id, last_processed_data_id
+                    )
+                    if last_processed_data_id
+                    else ""
+                )
+                stored.complete = False
+                session.commit()
+
+            for envelope in page:
+                data_id = envelope.data_id
+                stored_version = envelope.key_version
+
+                # Re-resolve the keyring per envelope: a keyring that
+                # becomes unusable mid-page stops the page with a keyring
+                # result on the envelope that could not be handled.
+                try:
+                    keyring = load_keyring()
+                except MasterKeyError:
+                    logger.error("master keyring became unavailable mid-batch")
+                    _record_stop(REWRAP_RESULT_KEYRING, data_id, stored_version)
+                    break
+
+                current_version = keyring.current_version
+                # Version pair recorded on the audit; the concurrent-loser
+                # path below reports both sides as the current version.
+                audit_old_version = stored_version
+                if stored_version == current_version:
+                    result = REWRAP_RESULT_SKIPPED
+                    new_version = stored_version
+                else:
+                    try:
+                        unwrapping_key = keyring.key_for(stored_version)
+                        new_wrapped_key = rewrap_data_key(
+                            unwrapping_key,
+                            keyring.current_key(),
+                            envelope.wrapped_key,
+                        )
+                    except MasterKeyError:
+                        # The historical key needed to unwrap is gone; the
+                        # envelope is not modified.
+                        logger.error(
+                            "master key version %s unavailable during batch",
+                            stored_version,
+                        )
+                        _record_stop(
+                            REWRAP_RESULT_MISSING_KEY, data_id, stored_version
+                        )
+                        break
+                    except Exception:
+                        # Any crypto/rewrap failure: roll the material
+                        # change back and stop with the row untouched.
+                        logger.error("data envelope batch rewrap failed")
+                        _record_stop(
+                            REWRAP_RESULT_REWRAP_FAILED,
+                            data_id,
+                            stored_version,
+                        )
+                        break
+
+                    # Guarded update, mirroring the single-envelope path:
+                    # only a row still at the version we unwrapped can be
+                    # rotated. A concurrent winner leaves current-version
+                    # material, which this page records as a skip.
+                    outcome = session.execute(
+                        update(DataEnvelope)
+                        .where(
+                            DataEnvelope.tenant_id == body.tenant_id,
+                            DataEnvelope.workload_id == body.workload_id,
+                            DataEnvelope.data_id == data_id,
+                            DataEnvelope.key_version == stored_version,
+                        )
+                        .values(
+                            key_version=current_version,
+                            wrapped_key=new_wrapped_key,
+                        )
+                        .execution_options(synchronize_session=False)
+                    )
+                    if outcome.rowcount != 1:
+                        session.rollback()
+                        fresh = session.scalar(
+                            select(DataEnvelope)
+                            .where(
+                                DataEnvelope.tenant_id == body.tenant_id,
+                                DataEnvelope.workload_id == body.workload_id,
+                                DataEnvelope.data_id == data_id,
+                            )
+                            .execution_options(populate_existing=True)
+                        )
+                        if fresh is not None and fresh.key_version == current_version:
+                            # A concurrent rewrap advanced it first; the
+                            # envelope is now current and is never
+                            # re-wrapped by this page. Record the skip as
+                            # observed: already at the current version.
+                            result = REWRAP_RESULT_SKIPPED
+                            new_version = current_version
+                            audit_old_version = current_version
+                        else:
+                            _record_stop(
+                                REWRAP_RESULT_REWRAP_FAILED,
+                                data_id,
+                                stored_version,
+                            )
+                            break
+                    else:
+                        result = REWRAP_RESULT_REWRAPPED
+                        new_version = current_version
+
+                # Independent per-envelope commit: one audit row each,
+                # durable before the next envelope is attempted.
+                session.add(
+                    RewrapBatchItem(
+                        item_id=str(uuid.uuid4()),
+                        batch_id=batch_id,
+                        tenant_id=body.tenant_id,
+                        workload_id=body.workload_id,
+                        data_id=data_id,
+                        old_key_version=audit_old_version,
+                        new_key_version=new_version,
+                        result=result,
+                        seq=counts["processed"],
+                        created_at=_utcnow(),
+                    )
+                )
+                counts["processed"] += 1
+                if result == REWRAP_RESULT_REWRAPPED:
+                    counts["rewrapped"] += 1
+                else:
+                    counts["skipped"] += 1
+                last_processed_data_id = data_id
+                stored_batch = session.get(RewrapBatch, batch_id)
+                stored_batch.processed = counts["processed"]
+                stored_batch.rewrapped = counts["rewrapped"]
+                stored_batch.skipped = counts["skipped"]
+                stored_batch.failed = counts["failed"]
+                try:
+                    session.commit()
+                except Exception:
+                    session.rollback()
+                    logger.error("rewrap batch audit write failed")
+                    raise HTTPException(status_code=500, detail="rewrap batch failed")
+            else:
+                # Every envelope in the page was reached without a stop.
+                final_batch = session.get(RewrapBatch, batch_id)
+                if not has_more:
+                    # The limit+1 probe found nothing beyond this page, so
+                    # the scope has been fully scanned.
+                    final_batch.next_cursor = ""
+                    final_batch.complete = True
+                    next_cursor = ""
+                    complete = True
+                else:
+                    # A full page: there may be more. The cursor is the
+                    # last processed data_id; retrying it skips envelopes
+                    # already at the current version instead of rewrapping.
+                    next_cursor = _encode_cursor(
+                        body.tenant_id,
+                        body.workload_id,
+                        last_processed_data_id,
+                    )
+                    final_batch.next_cursor = next_cursor
+                    final_batch.complete = False
+                    complete = False
+                final_batch.processed = counts["processed"]
+                final_batch.rewrapped = counts["rewrapped"]
+                final_batch.skipped = counts["skipped"]
+                final_batch.failed = counts["failed"]
+                session.commit()
+
+        if failure_code is not None:
+            # Stopped mid-page: the resume cursor was finalized inside
+            # _record_stop (it points before the failed envelope).
+            with session_factory() as session:
+                stored_batch = session.get(RewrapBatch, batch_id)
+                next_cursor = stored_batch.next_cursor
+                complete = False
+                counts = {
+                    "processed": stored_batch.processed,
+                    "rewrapped": stored_batch.rewrapped,
+                    "skipped": stored_batch.skipped,
+                    "failed": stored_batch.failed,
+                }
+
+        return _compact_json(
+            {
+                "batch_id": batch_id,
+                "processed": counts["processed"],
+                "rewrapped": counts["rewrapped"],
+                "skipped": counts["skipped"],
+                "failed": counts["failed"],
+                "next_cursor": next_cursor,
+                "complete": complete,
+            }
+        )
+
+    @app.get("/v1/rewrap-batches/")
+    def rewrap_batch_identifier_required() -> Response:
+        # An empty path segment is a missing batch identifier: a 422
+        # client error rather than a routing-level 404.
+        raise HTTPException(status_code=422, detail="invalid batch identifier")
+
+    @app.get("/v1/rewrap-batches/{batch_id}")
+    def get_rewrap_batch(
+        batch_id: str,
+        tenant_id: str = Query(..., min_length=1),
+        workload_id: str = Query(..., min_length=1),
+    ) -> Response:
+        # The path identifier must be a syntactically valid batch id;
+        # missing/blank scope query parameters are the same 422 class.
+        # Batch ids are canonical lowercase UUIDs.
+        if not batch_id.strip() or not _UUID_RE.fullmatch(batch_id.lower()):
+            raise HTTPException(status_code=422, detail="invalid batch identifier")
+        batch_id = batch_id.strip().lower()
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        try:
+            with session_factory() as session:
+                batch = session.get(RewrapBatch, batch_id)
+                if (
+                    batch is None
+                    or batch.tenant_id != tenant_id
+                    or batch.workload_id != workload_id
+                ):
+                    # Unknown and cross-scope batches are indistinguishable.
+                    raise HTTPException(status_code=404, detail="rewrap batch not found")
+                items = session.scalars(
+                    select(RewrapBatchItem)
+                    .where(RewrapBatchItem.batch_id == batch_id)
+                    .order_by(RewrapBatchItem.seq.asc())
+                ).all()
+                payload = {
+                    "batch_id": batch.batch_id,
+                    "tenant_id": batch.tenant_id,
+                    "workload_id": batch.workload_id,
+                    "limit": batch.limit,
+                    "processed": batch.processed,
+                    "rewrapped": batch.rewrapped,
+                    "skipped": batch.skipped,
+                    "failed": batch.failed,
+                    "next_cursor": batch.next_cursor,
+                    "complete": batch.complete,
+                    "created_at": _rfc3339(batch.created_at),
+                    "audits": [
+                        {
+                            "data_id": item.data_id,
+                            "old_key_version": item.old_key_version,
+                            "new_key_version": item.new_key_version,
+                            "result": item.result,
+                            "audited_at": _rfc3339(item.created_at),
+                        }
+                        for item in items
+                    ],
+                }
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("rewrap batch lookup failed")
+            raise HTTPException(status_code=500, detail="rewrap batch unavailable")
+
+        return _compact_json(payload)
 
     return app
 
