@@ -132,6 +132,23 @@ _UUID_RE = re.compile(
 )
 
 
+def _validate_grant_path_id(grant_id: str) -> str:
+    """Validate and normalize a release-grant id taken from a URL path.
+
+    The one-time grant actions (consume, revoke, release) all key off a
+    path grant id that must be a canonical-shaped UUID. A missing or empty
+    segment, surrounding whitespace, or any other non-UUID spelling is a
+    422 client error indistinguishable from any other bad field, and is
+    rejected *before* storage is touched — so such a request can never
+    create a row, settle a grant, write an audit event or trigger any
+    decryption. Uppercase hex is accepted and normalized to lowercase on
+    every one of the three actions, matching the batch-identifier path.
+    """
+    if not grant_id.strip() or not _UUID_RE.fullmatch(grant_id.lower()):
+        raise HTTPException(status_code=422, detail="invalid grant identifier")
+    return grant_id.strip().lower()
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -2061,6 +2078,12 @@ def create_app(
         )
         return Response(content=body, media_type="application/json")
 
+    @app.post("/v1/release-grants//consume")
+    def consume_release_grant_identifier_required() -> Response:
+        # An empty path segment is a missing grant identifier: a 422
+        # client error rather than a routing-level 404.
+        raise HTTPException(status_code=422, detail="invalid grant identifier")
+
     @app.post(
         "/v1/release-grants/{grant_id}/consume",
         response_model=ReleaseGrantConsumedResponse,
@@ -2068,6 +2091,10 @@ def create_app(
     def consume_release_grant(
         grant_id: str, body: ConsumeReleaseGrantRequest
     ) -> ReleaseGrantConsumedResponse:
+        # Grant ids are canonical-shaped UUIDs; a syntactically illegal
+        # path identifier is a 422 field error indistinguishable from any
+        # other bad input, never a lookup. No storage is touched past it.
+        grant_id = _validate_grant_path_id(grant_id)
         digest = _nonce_digest(body.capability)
         now = _utcnow()
         with session_factory() as session:
@@ -2157,12 +2184,10 @@ def create_app(
     def revoke_release_grant(
         grant_id: str, body: RevokeReleaseGrantRequest
     ) -> ReleaseGrantRevokedResponse:
-        # Grant ids are canonical lowercase UUIDs; a syntactically illegal
-        # path identifier is a 422 field error indistinguishable from any
-        # other bad input, never a lookup.
-        if not grant_id.strip() or not _UUID_RE.fullmatch(grant_id.lower()):
-            raise HTTPException(status_code=422, detail="invalid grant identifier")
-        grant_id = grant_id.strip().lower()
+        # The same canonical-UUID path gate as the consume and release
+        # actions: a syntactically illegal identifier is a 422, never a
+        # lookup, and writes no state.
+        grant_id = _validate_grant_path_id(grant_id)
 
         digest = _nonce_digest(body.capability)
         now = _utcnow()
@@ -2253,21 +2278,31 @@ def create_app(
             revoked_at=_rfc3339(now),
         )
 
+    @app.post("/v1/release/")
+    def release_payload_identifier_required() -> Response:
+        # An empty path segment is a missing grant identifier: a 422
+        # client error rather than a routing-level 404.
+        raise HTTPException(status_code=422, detail="invalid grant identifier")
+
     @app.post("/v1/release/{grant_id}")
     def release_payload(grant_id: str, body: ReleasePayloadRequest) -> Response:
         """Release one protected payload against a one-time grant.
 
-        Judgement order is fixed: unknown/cross-scope grant or data item
-        (404), capability mismatch (401), expiry (410), already consumed or
-        revoked (409). Field/format problems are rejected with 422 by the
-        request model before this handler runs. The one-time state is the
-        very same release_grants row used by the consume and revoke
-        endpoints: the data key is unwrapped and the payload
-        authenticated-decrypted *before* the pending -> consumed transition
-        is committed, so any keyring or decryption failure leaves the grant
-        pending and writes no consumption audit, and a revocation that
-        settles first makes this path observe 409 without releasing.
+        The path grant id is gated to a canonical UUID shape before any
+        storage access: an illegal identifier is a 422 that can never
+        create a record, settle the grant, write an audit row or trigger
+        decryption. Judgement order for a well-formed id is fixed:
+        unknown/cross-scope grant or data item (404), capability mismatch
+        (401), expiry (410), already consumed or revoked (409). The
+        one-time state is the very same release_grants row used by the
+        consume and revoke endpoints: the data key is unwrapped and the
+        payload authenticated-decrypted *before* the pending -> consumed
+        transition is committed, so any keyring or decryption failure
+        leaves the grant pending and writes no consumption audit, and a
+        revocation that settles first makes this path observe 409 without
+        releasing.
         """
+        grant_id = _validate_grant_path_id(grant_id)
         digest = _nonce_digest(body.capability)
         now = _utcnow()
         with session_factory() as session:

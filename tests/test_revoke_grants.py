@@ -573,6 +573,8 @@ def test_revoke_rejects_non_object_body(client):
         "gggggggg-gggg-gggg-gggg-gggggggggggg",
         "00000000-0000-0000-0000-00000000000",
         "000000000-0000-0000-0000-000000000000",
+        " 00000000-0000-0000-0000-000000000000",
+        "00000000-0000-0000-0000-000000000000 ",
     ],
 )
 def test_revoke_invalid_path_identifier_returns_422(client, grant_id):

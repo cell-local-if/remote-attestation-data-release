@@ -397,6 +397,61 @@ def test_consume_rejects_invalid_fields(client, overrides):
     )
 
 
+@pytest.mark.parametrize(
+    "grant_id",
+    [
+        "not-a-uuid",
+        "12345",
+        "00000000000000000000000000000000",
+        "gggggggg-gggg-gggg-gggg-gggggggggggg",
+        "00000000-0000-0000-0000-00000000000",
+        "000000000-0000-0000-0000-000000000000",
+        " 00000000-0000-0000-0000-000000000000",
+        "00000000-0000-0000-0000-000000000000 ",
+    ],
+)
+def test_consume_invalid_path_identifier_returns_422(client, app, grant_id):
+    decision, _ = _decision(client)
+    grant = _grant(client, decision["decision_id"]).json()
+    body = {
+        "tenant_id": TENANT,
+        "workload_id": WORKLOAD,
+        "capability": grant["capability"],
+    }
+    response = client.post(
+        f"/v1/release-grants/{grant_id}/consume", json=body
+    )
+    assert response.status_code == 422
+    assert "capability" not in response.text
+    # A malformed path id touches no state: the real grant stays pending.
+    with app.state.session_factory() as session:
+        row = session.get(ReleaseGrant, grant["grant_id"])
+        assert row.status == "pending"
+        assert row.consumed_at is None
+
+
+def test_consume_empty_path_segment_returns_422(client, app):
+    decision, _ = _decision(client)
+    grant = _grant(client, decision["decision_id"]).json()
+    body = {
+        "tenant_id": TENANT,
+        "workload_id": WORKLOAD,
+        "capability": grant["capability"],
+    }
+    response = client.post("/v1/release-grants//consume", json=body)
+    assert response.status_code == 422
+    with app.state.session_factory() as session:
+        assert session.get(ReleaseGrant, grant["grant_id"]).status == "pending"
+
+
+def test_consume_accepts_uppercase_path_uuid(client):
+    decision, _ = _decision(client)
+    grant = _grant(client, decision["decision_id"]).json()
+    response = _consume(client, grant["grant_id"].upper(), grant["capability"])
+    assert response.status_code == 200
+    assert response.json()["grant_id"] == grant["grant_id"]
+
+
 def test_grant_survives_restart(tmp_path, monkeypatch):
     monkeypatch.setenv("PROOF_RELEASE_ATTESTED_NONCE_SECRET", SECRET)
     url = f"sqlite:///{tmp_path}/restart.db"

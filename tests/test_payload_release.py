@@ -451,6 +451,65 @@ def test_release_rejects_non_object_body(client):
     ).status_code == 422
 
 
+@pytest.mark.parametrize(
+    "grant_id",
+    [
+        "not-a-uuid",
+        "12345",
+        "00000000000000000000000000000000",
+        "gggggggg-gggg-gggg-gggg-gggggggggggg",
+        "00000000-0000-0000-0000-00000000000",
+        "000000000-0000-0000-0000-000000000000",
+        " 00000000-0000-0000-0000-000000000000",
+        "00000000-0000-0000-0000-000000000000 ",
+    ],
+)
+def test_release_invalid_path_identifier_returns_422(client, app, grant_id):
+    grant = _setup(client)
+    response = _release(client, grant_id, grant["capability"])
+    assert response.status_code == 422
+    assert "payload" not in response.text
+    assert PAYLOAD not in response.text
+    # A malformed path id creates no state change and never consumes.
+    with app.state.session_factory() as session:
+        row = session.get(ReleaseGrant, grant["grant_id"])
+        assert row.status == "pending"
+        assert row.consumed_at is None
+
+
+def test_release_empty_path_segment_returns_422(client, app):
+    grant = _setup(client)
+    response = _release(client, "", grant["capability"])
+    assert response.status_code == 422
+    with app.state.session_factory() as session:
+        assert session.get(ReleaseGrant, grant["grant_id"]).status == "pending"
+
+
+def test_release_invalid_path_does_not_trigger_decryption(app, client):
+    # Even with damaged envelope material, an illegal path id is rejected
+    # at the format boundary (422) before any keyring/decrypt work, so the
+    # failure can never masquerade as a 500 or consume the grant.
+    grant = _setup(client)
+    with app.state.session_factory() as session:
+        envelope = session.get(DataEnvelope, (TENANT, WORKLOAD, DATA_ID))
+        tampered = bytearray(envelope.tag)
+        tampered[0] ^= 0x01
+        envelope.tag = bytes(tampered)
+        session.commit()
+
+    response = _release(client, "not-a-uuid", grant["capability"])
+    assert response.status_code == 422
+    with app.state.session_factory() as session:
+        assert session.get(ReleaseGrant, grant["grant_id"]).status == "pending"
+
+
+def test_release_accepts_uppercase_path_uuid(client):
+    grant = _setup(client)
+    response = _release(client, grant["grant_id"].upper(), grant["capability"])
+    assert response.status_code == 200
+    assert response.json()["payload"] == PAYLOAD
+
+
 def test_concurrent_releases_only_one_succeeds(app):
     client = TestClient(app)
     grant = _setup(client)
