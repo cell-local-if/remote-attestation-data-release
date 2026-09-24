@@ -24,6 +24,7 @@ from cryptography.hazmat.primitives.serialization import Encoding
 from proof_release.db import (
     DECISION_STATUS_ALLOWED,
     DECISION_STATUS_DENIED,
+    RELEASE_GRANT_STATUS_CODES,
     RELEASE_GRANT_STATUS_REVOKED,
     REWRAP_RESULT_KEYRING,
     REWRAP_RESULT_MISSING_KEY,
@@ -82,6 +83,11 @@ CAPABILITY_BYTES = 32
 REWRAP_BATCH_DEFAULT_LIMIT = 50
 REWRAP_BATCH_MIN_LIMIT = 1
 REWRAP_BATCH_MAX_LIMIT = 200
+
+#: Bounds and default for a release-grant audit query page size.
+GRANT_AUDIT_DEFAULT_LIMIT = 50
+GRANT_AUDIT_MIN_LIMIT = 1
+GRANT_AUDIT_MAX_LIMIT = 200
 
 #: Environment variable naming the secret used to authenticate rewrap
 #: cursors. Cursors are opaque outside the service: each one carries the
@@ -188,6 +194,92 @@ def _decode_cursor(
     if not hmac.compare_digest(str(decoded.get("w", "")), workload_id):
         return None
     boundary = decoded.get("d")
+    if not isinstance(boundary, str):
+        return None
+    return boundary
+
+
+def _grant_cursor_filters(
+    tenant_id: str,
+    workload_id: str,
+    grant_id: str,
+    decision_id: str,
+    data_id: str,
+    status: str,
+    issued_after: datetime | None,
+    issued_before: datetime | None,
+) -> dict[str, str]:
+    """Canonical, string-only view of the filters a grant cursor is bound to.
+
+    Every page request normalizes its filters through this exact shape
+    before a cursor is minted or verified, so a cursor replayed against a
+    different scope or any different filter (including a dropped or added
+    optional filter) fails verification rather than silently moving across
+    result sets.
+    """
+    return {
+        "t": tenant_id,
+        "w": workload_id,
+        "g": grant_id,
+        "e": decision_id,
+        "d": data_id,
+        "s": status,
+        "a": _rfc3339(issued_after) if issued_after is not None else "",
+        "b": _rfc3339(issued_before) if issued_before is not None else "",
+    }
+
+
+def _encode_grant_cursor(filters: dict[str, str], grant_id: str) -> str:
+    """Build an opaque, filter-bound exclusive cursor for ``grant_id``.
+
+    Mirrors :func:`_encode_cursor`: compact JSON naming the full filter set
+    and the exclusive grant boundary, authenticated with HMAC-SHA256. The
+    boundary is not secret, but the MAC makes a forged, tampered or
+    cross-filter token unrecognizable.
+    """
+    payload = json.dumps(
+        {**filters, "id": grant_id},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    mac = hmac.new(_cursor_secret(), payload, hashlib.sha256).digest()
+    return b64url_encode(payload + mac)
+
+
+def _decode_grant_cursor(token: str, filters: dict[str, str]) -> str | None:
+    """Validate a grant audit cursor against its expected filter set.
+
+    Returns the exclusive grant_id boundary, ``""`` for the explicit
+    beginning marker, or ``None`` for a malformed, forged, tampered or
+    cross-filter token.
+    """
+    if token == "":
+        return ""
+    if not _CURSOR_RE.fullmatch(token):
+        return None
+    try:
+        raw = b64url_decode(token)
+    except ValueError:
+        return None
+    # The MAC is a fixed 32-byte suffix; the JSON payload precedes it.
+    if len(raw) <= 32:
+        return None
+    payload, mac = raw[:-32], raw[-32:]
+    expected = hmac.new(_cursor_secret(), payload, hashlib.sha256).digest()
+    if not hmac.compare_digest(mac, expected):
+        return None
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    for key, value in filters.items():
+        if not isinstance(decoded.get(key), str) or not hmac.compare_digest(
+            decoded[key], value
+        ):
+            return None
+    boundary = decoded.get("id")
     if not isinstance(boundary, str):
         return None
     return boundary
@@ -1214,6 +1306,244 @@ def create_app(
             pending=True,
             issued_at=_rfc3339(now),
             expires_at=_rfc3339(expires_at),
+        )
+
+    def _parse_audit_time(name: str, raw: str | None) -> datetime | None:
+        """Parse an explicit-offset RFC3339 query timestamp to UTC.
+
+        Naive timestamps are rejected: the bounds must explicitly state
+        their UTC offset. Any aware value is normalized to UTC so that
+        equivalent encodings (``Z`` / ``+00:00``) share one filter shape.
+        """
+        if raw is None:
+            return None
+        try:
+            value = datetime.fromisoformat(raw)
+        except ValueError:
+            raise HTTPException(
+                status_code=422, detail=f"{name} is not a valid UTC RFC3339 timestamp"
+            )
+        if value.tzinfo is None:
+            raise HTTPException(
+                status_code=422, detail=f"{name} is not a valid UTC RFC3339 timestamp"
+            )
+        return value.astimezone(timezone.utc)
+
+    @app.get("/v1/release-grants")
+    def list_release_grants(
+        tenant_id: str = Query(..., min_length=1),
+        workload_id: str = Query(..., min_length=1),
+        grant_id: str | None = Query(default=None, min_length=1),
+        decision_id: str | None = Query(default=None, min_length=1),
+        data_id: str | None = Query(default=None, min_length=1),
+        status: str | None = Query(default=None),
+        issued_after: str | None = Query(default=None),
+        issued_before: str | None = Query(default=None),
+        limit: StrictInt = Query(
+            default=GRANT_AUDIT_DEFAULT_LIMIT,
+            ge=GRANT_AUDIT_MIN_LIMIT,
+            le=GRANT_AUDIT_MAX_LIMIT,
+        ),
+        cursor: str | None = Query(default=None),
+    ) -> Response:
+        """Audit release grants within one scope via stable keyset paging.
+
+        The query is strictly read-only: it never writes status, audit or
+        any other state, and a storage failure surfaces as 500 rather than
+        a half page. Pages are ordered by the immutable grant_id primary
+        key, so replaying a cursor preserves order with no duplicates or
+        gaps; concurrent consume/revoke transitions only change which
+        committed status a status-filtered page observes, never its order.
+        """
+        # Field validation (all 422) precedes every lookup: blank scope or
+        # identifiers, malformed identifier syntax, illegal status, bad
+        # timestamps, reversed bounds and unverifiable cursors.
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+        if grant_id is not None and not grant_id.strip():
+            raise HTTPException(status_code=422, detail="invalid grant identifier")
+        if decision_id is not None and not decision_id.strip():
+            raise HTTPException(status_code=422, detail="invalid decision identifier")
+        if data_id is not None and not data_id.strip():
+            raise HTTPException(status_code=422, detail="invalid data identifier")
+        # Grant and decision identifiers are canonical lowercase UUIDs;
+        # data identifiers have no service-defined syntax.
+        if grant_id is not None:
+            if not _UUID_RE.fullmatch(grant_id.strip().lower()):
+                raise HTTPException(status_code=422, detail="invalid grant identifier")
+            grant_id = grant_id.strip().lower()
+        if decision_id is not None:
+            if not _UUID_RE.fullmatch(decision_id.strip().lower()):
+                raise HTTPException(
+                    status_code=422, detail="invalid decision identifier"
+                )
+            decision_id = decision_id.strip().lower()
+        if status is not None and (
+            not status.strip() or status not in RELEASE_GRANT_STATUS_CODES
+        ):
+            # Unlike the cursor, an empty status is a field error, not a
+            # default.
+            raise HTTPException(status_code=422, detail="invalid status")
+        after = _parse_audit_time("issued_after", issued_after)
+        before = _parse_audit_time("issued_before", issued_before)
+        if after is not None and before is not None and after > before:
+            raise HTTPException(
+                status_code=422,
+                detail="issued_after must not be later than issued_before",
+            )
+        status_filter = status if status is not None else ""
+
+        filters = _grant_cursor_filters(
+            tenant_id,
+            workload_id,
+            grant_id or "",
+            decision_id or "",
+            data_id or "",
+            status_filter,
+            after,
+            before,
+        )
+        # Absent or explicitly empty cursor starts before the smallest
+        # grant id; a blank (whitespace) value is an error.
+        if cursor is not None and cursor != "" and not cursor.strip():
+            raise HTTPException(status_code=422, detail="invalid cursor")
+        token = cursor if cursor is not None else ""
+        boundary = _decode_grant_cursor(token, filters)
+        if boundary is None:
+            # Forged, tampered, malformed or cross-filter cursors are
+            # indistinguishable from any other bad field.
+            raise HTTPException(status_code=422, detail="invalid cursor")
+
+        try:
+            with session_factory() as session:
+                # Explicitly named identifiers must reference an existing
+                # record in exactly this scope: an unknown or cross-scope
+                # grant, decision or data item is a 404 even though the
+                # same page without the filter would simply be empty.
+                if grant_id is not None:
+                    in_scope = session.scalar(
+                        select(ReleaseGrant.grant_id).where(
+                            ReleaseGrant.grant_id == grant_id,
+                            ReleaseGrant.tenant_id == tenant_id,
+                            ReleaseGrant.workload_id == workload_id,
+                        )
+                    )
+                    if in_scope is None:
+                        raise HTTPException(
+                            status_code=404, detail="grant not found"
+                        )
+                if decision_id is not None:
+                    # Decisions carry no scope columns; their scope is the
+                    # scope of the evidence they were taken against.
+                    decision = session.get(Decision, decision_id)
+                    evidence = (
+                        session.get(Evidence, decision.evidence_id)
+                        if decision is not None
+                        else None
+                    )
+                    if (
+                        decision is None
+                        or evidence is None
+                        or evidence.tenant_id != tenant_id
+                        or evidence.workload_id != workload_id
+                    ):
+                        raise HTTPException(
+                            status_code=404, detail="decision not found"
+                        )
+                if data_id is not None:
+                    # A data identifier is known to the grant audit when at
+                    # least one grant in this scope names it: grant creation
+                    # accepts caller-supplied data ids without requiring an
+                    # envelope, so existence is judged on the audited rows
+                    # themselves. An id used only by another tenant/workload
+                    # is indistinguishable from an unknown one.
+                    in_scope = session.scalar(
+                        select(ReleaseGrant.grant_id).where(
+                            ReleaseGrant.tenant_id == tenant_id,
+                            ReleaseGrant.workload_id == workload_id,
+                            ReleaseGrant.data_id == data_id,
+                        )
+                    )
+                    if in_scope is None:
+                        raise HTTPException(
+                            status_code=404, detail="data identifier not found"
+                        )
+
+                statement = select(ReleaseGrant).where(
+                    ReleaseGrant.tenant_id == tenant_id,
+                    ReleaseGrant.workload_id == workload_id,
+                    ReleaseGrant.grant_id > boundary,
+                )
+                if grant_id is not None:
+                    statement = statement.where(ReleaseGrant.grant_id == grant_id)
+                if decision_id is not None:
+                    statement = statement.where(
+                        ReleaseGrant.decision_id == decision_id
+                    )
+                if data_id is not None:
+                    statement = statement.where(ReleaseGrant.data_id == data_id)
+                if status is not None:
+                    statement = statement.where(ReleaseGrant.status == status)
+                if after is not None:
+                    statement = statement.where(ReleaseGrant.issued_at >= after)
+                if before is not None:
+                    statement = statement.where(ReleaseGrant.issued_at <= before)
+                statement = statement.order_by(
+                    ReleaseGrant.grant_id.asc()
+                ).limit(limit + 1)
+
+                try:
+                    rows = list(session.scalars(statement))
+                except Exception:
+                    session.rollback()
+                    logger.error("release grant audit scan failed")
+                    raise HTTPException(
+                        status_code=500, detail="release grant audit unavailable"
+                    )
+
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("release grant audit lookup failed")
+            raise HTTPException(
+                status_code=500, detail="release grant audit unavailable"
+            )
+
+        has_more = len(rows) > limit
+        page = rows[:limit]
+        complete = not has_more
+        if complete:
+            next_cursor = ""
+        else:
+            next_cursor = _encode_grant_cursor(filters, page[-1].grant_id)
+
+        records = [
+            {
+                "grant_id": grant.grant_id,
+                "decision_id": grant.decision_id,
+                "data_id": grant.data_id,
+                "status": grant.status,
+                # Only the SHA-256 digest of the capability is ever
+                # exposed; the plaintext lives solely on the create
+                # response and is not stored.
+                "capability_sha256": grant.capability_digest,
+                "issued_at": _rfc3339(grant.issued_at),
+                "expires_at": _rfc3339(grant.expires_at),
+                "consumed_at": (
+                    _rfc3339(grant.consumed_at)
+                    if grant.consumed_at is not None
+                    else None
+                ),
+                "revoked_at": (
+                    _rfc3339(grant.revoked_at)
+                    if grant.revoked_at is not None
+                    else None
+                ),
+            }
+            for grant in page
+        ]
+        return _compact_json(
+            {"grants": records, "next_cursor": next_cursor, "complete": complete}
         )
 
     @app.post(
