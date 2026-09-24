@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Integer,
     LargeBinary,
@@ -42,6 +43,25 @@ RELEASE_GRANT_STATUS_PENDING = "pending"
 RELEASE_GRANT_STATUS_CONSUMED = "consumed"
 RELEASE_GRANT_STATUS_CODES = frozenset(
     {RELEASE_GRANT_STATUS_PENDING, RELEASE_GRANT_STATUS_CONSUMED}
+)
+
+#: Per-envelope outcome codes recorded by a rewrap batch. ``rewrapped`` and
+#: ``skipped`` are successful outcomes (a historical-version envelope got a
+#: new wrapping key; a current-version envelope needed none); the remaining
+#: codes stop the page with the failing envelope left untouched.
+REWRAP_RESULT_REWRAPPED = "rewrapped"
+REWRAP_RESULT_SKIPPED = "skipped"
+REWRAP_RESULT_KEYRING = "keyring"
+REWRAP_RESULT_MISSING_KEY = "missing-key"
+REWRAP_RESULT_REWRAP = "rewrap"
+REWRAP_RESULT_CODES = frozenset(
+    {
+        REWRAP_RESULT_REWRAPPED,
+        REWRAP_RESULT_SKIPPED,
+        REWRAP_RESULT_KEYRING,
+        REWRAP_RESULT_MISSING_KEY,
+        REWRAP_RESULT_REWRAP,
+    }
 )
 
 
@@ -254,3 +274,95 @@ class ReleaseGrant(Base):
     consumed_at: Mapped[datetime | None] = mapped_column(
         UTCDateTime(), nullable=True
     )
+
+
+class RewrapCursor(Base):
+    """An opaque, scope-bound keyset cursor for rewrap batch pagination.
+
+    The token is an unguessable random string; it maps to the exclusive
+    ``data_id`` boundary within one tenant/workload ordering. A NULL
+    boundary means "before the smallest data_id" (the start position).
+    Cursors are immutable and reusable: retrying a page with the same
+    cursor never re-selects an earlier envelope. A forged token (no row)
+    or one presented from another scope is rejected.
+    """
+
+    __tablename__ = "rewrap_cursors"
+
+    cursor_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    #: Exclusive data_id boundary; NULL represents the start position.
+    boundary_data_id: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class RewrapBatch(Base):
+    """One auditable page of a scoped envelope rewrap batch.
+
+    A batch covers at most the requested ``limit`` envelopes of one
+    tenant/workload, selected in stable ``data_id`` order after the
+    supplied cursor. The summary counters are the per-envelope audit
+    outcomes; ``next_cursor`` (an opaque RewrapCursor token) resumes after
+    the last handled envelope and is empty when ``done`` is true. Rows are
+    written before processing begins, so a batch stays queryable across a
+    restart even if a page stops early on a failure.
+    """
+
+    __tablename__ = "rewrap_batches"
+
+    batch_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    #: The cursor token presented on the request (NULL for the start
+    #: position), retained for traceability.
+    request_cursor: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    limit_value: Mapped[int] = mapped_column(Integer)
+    processed_count: Mapped[int] = mapped_column(Integer, default=0)
+    rewrapped_count: Mapped[int] = mapped_column(Integer, default=0)
+    skipped_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    #: Issued continuation token (RewrapCursor.cursor_id); NULL together
+    #: with done=True marks the end of the range.
+    next_cursor: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    done: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    completed_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
+
+
+class RewrapBatchAudit(Base):
+    """The per-envelope audit row of a rewrap batch.
+
+    Exactly one row is written per envelope the batch reaches, committed
+    independently of every other envelope. It records only the scope, the
+    envelope identifier, the old/new wrapping key versions, a fixed
+    service-defined result code (one of REWRAP_RESULT_*) and the UTC time
+    — never payload, data key, or wrapped-key material. The target (new)
+    version is the keyring's current version established by the batch
+    preflight, so it is always known even if the keyring becomes
+    unavailable while the page is being processed.
+    """
+
+    __tablename__ = "rewrap_batch_audits"
+    __table_args__ = (
+        UniqueConstraint(
+            "batch_id", "data_id", name="uq_rewrap_batch_audit_envelope"
+        ),
+    )
+
+    audit_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    batch_id: Mapped[str] = mapped_column(String(36), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    data_id: Mapped[str] = mapped_column(String(256))
+    #: Position within the batch, giving audits a stable order.
+    seq: Mapped[int] = mapped_column(Integer)
+    old_key_version: Mapped[int] = mapped_column(Integer)
+    new_key_version: Mapped[int] = mapped_column(Integer)
+    # One of REWRAP_RESULT_*; a fixed service-defined code only.
+    result: Mapped[str] = mapped_column(String(16))
+    occurred_at: Mapped[datetime] = mapped_column(UTCDateTime())

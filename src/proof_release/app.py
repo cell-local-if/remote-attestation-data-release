@@ -23,6 +23,11 @@ from cryptography.hazmat.primitives.serialization import Encoding
 from proof_release.db import (
     DECISION_STATUS_ALLOWED,
     DECISION_STATUS_DENIED,
+    REWRAP_RESULT_KEYRING,
+    REWRAP_RESULT_MISSING_KEY,
+    REWRAP_RESULT_REWRAP,
+    REWRAP_RESULT_REWRAPPED,
+    REWRAP_RESULT_SKIPPED,
     VERIFICATION_RESULT_ACCEPTED,
     VERIFICATION_RESULT_REJECTED,
     Base,
@@ -32,6 +37,9 @@ from proof_release.db import (
     Evidence,
     Policy,
     ReleaseGrant,
+    RewrapBatch,
+    RewrapBatchAudit,
+    RewrapCursor,
     TrustRoot,
 )
 from proof_release.envelopes import (
@@ -67,6 +75,13 @@ MAX_TTL_SECONDS = 900
 NONCE_BYTES = 32
 CAPABILITY_BYTES = 32
 
+#: Bounds and default for a rewrap batch page size.
+MIN_REWRAP_BATCH_LIMIT = 1
+MAX_REWRAP_BATCH_LIMIT = 200
+DEFAULT_REWRAP_BATCH_LIMIT = 50
+#: Opaque cursor tokens carry this many CSPRNG bytes.
+CURSOR_BYTES = 24
+
 _NONCE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
@@ -98,6 +113,150 @@ def _optional_non_blank(value: str | None) -> str | None:
     if value is None:
         return value
     return _require_non_blank(value)
+
+
+def _batch_rewrap_one(
+    session_factory,
+    *,
+    batch_id: str,
+    tenant_id: str,
+    workload_id: str,
+    data_id: str,
+    seq: int,
+    target_version: int,
+) -> tuple[str, int, int]:
+    """Process exactly one envelope of a batch and commit one audit row.
+
+    The envelope update (if any) and its audit commit together in a single
+    transaction independent of every other envelope, so a failure on one
+    envelope leaves every previously handled envelope and audit durable.
+
+    ``target_version`` is the keyring current version established by the
+    batch preflight; the audit's new-key version is always that integer
+    even if the keyring becomes unavailable while the page is processed.
+
+    Returns ``(result_code, old_key_version, new_key_version)`` where the
+    result is one of ``rewrapped``, ``skipped``, ``keyring``,
+    ``missing-key`` or ``rewrap``. The plaintext data key exists only in a
+    local variable and is never audited or returned.
+    """
+    occurred_at = _utcnow()
+    with session_factory() as session:
+        # On SQLite this write transaction already holds BEGIN IMMEDIATE;
+        # on locking backends the guarded UPDATE serializes concurrent
+        # rewraps of the same row.
+        envelope = session.get(DataEnvelope, (tenant_id, workload_id, data_id))
+        if envelope is None:
+            # The snapshot was taken in this same request, so a missing row
+            # here means concurrent deletion through a non-API path; treat
+            # it as a service failure rather than silently skipping.
+            raise HTTPException(status_code=500, detail="rewrap batch failed")
+
+        result: str
+        old_version = envelope.key_version
+        new_version: int
+
+        # Reload the keyring for every envelope: the configuration may be
+        # rotated (or removed) while a long page is being processed.
+        try:
+            keyring = load_keyring()
+        except MasterKeyError as exc:
+            logger.error("master key configuration unavailable: %s", exc)
+            result = REWRAP_RESULT_KEYRING
+            # The target version was validated before processing started.
+            new_version = target_version
+        else:
+            new_version = keyring.current_version
+            if old_version == new_version:
+                # Already wrapped under the current version — including an
+                # envelope a concurrent batch or request advanced moments
+                # ago. No material changes; this batch simply records it.
+                result = REWRAP_RESULT_SKIPPED
+            else:
+                try:
+                    unwrapping_key = keyring.key_for(old_version)
+                except MasterKeyError:
+                    logger.error(
+                        "master key version %s unavailable for batch rewrap",
+                        old_version,
+                    )
+                    result = REWRAP_RESULT_MISSING_KEY
+                else:
+                    try:
+                        new_wrapped_key = rewrap_data_key(
+                            unwrapping_key,
+                            keyring.current_key(),
+                            envelope.wrapped_key,
+                        )
+                    except Exception:
+                        logger.error(
+                            "batch envelope %s rewrap failed", data_id
+                        )
+                        result = REWRAP_RESULT_REWRAP
+                    else:
+                        # Guarded update: advance only if the row still holds
+                        # the version we unwrapped. A concurrent winner that
+                        # settled first leaves current-version material,
+                        # which this request records as an already-current
+                        # result — each envelope advances at most once.
+                        outcome = session.execute(
+                            update(DataEnvelope)
+                            .where(
+                                DataEnvelope.tenant_id == tenant_id,
+                                DataEnvelope.workload_id == workload_id,
+                                DataEnvelope.data_id == data_id,
+                                DataEnvelope.key_version == old_version,
+                            )
+                            .values(
+                                key_version=new_version,
+                                wrapped_key=new_wrapped_key,
+                            )
+                            .execution_options(synchronize_session=False)
+                        )
+                        if outcome.rowcount != 1:
+                            session.rollback()
+                            fresh = session.get(
+                                DataEnvelope, (tenant_id, workload_id, data_id)
+                            )
+                            if fresh is None:
+                                raise HTTPException(
+                                    status_code=500, detail="rewrap batch failed"
+                                )
+                            # Lost the race; the envelope is now settled at
+                            # another version. Re-enter this helper's
+                            # bookkeeping by reporting the stored state.
+                            old_version = fresh.key_version
+                            new_version = fresh.key_version
+                            result = REWRAP_RESULT_SKIPPED
+                        else:
+                            result = REWRAP_RESULT_REWRAPPED
+
+        session.add(
+            RewrapBatchAudit(
+                audit_id=str(uuid.uuid4()),
+                batch_id=batch_id,
+                tenant_id=tenant_id,
+                workload_id=workload_id,
+                data_id=data_id,
+                seq=seq,
+                old_key_version=old_version,
+                new_key_version=new_version,
+                result=result,
+                occurred_at=occurred_at,
+            )
+        )
+        try:
+            session.commit()
+        except Exception:
+            # A write failure after the envelope changed must not strand a
+            # rotated row without its audit; the rollback undoes both, and
+            # the failure surfaces as a service error. Retrying the page
+            # (same cursor) reprocesses the envelope exactly once.
+            session.rollback()
+            logger.error("batch envelope %s audit write failed", data_id)
+            raise HTTPException(status_code=500, detail="rewrap batch failed")
+
+    return result, old_version, new_version
 
 
 class CreateChallengeRequest(BaseModel):
@@ -339,6 +498,58 @@ class DataEnvelopeRewrappedResponse(BaseModel):
     workload_id: str
     key_version: int
     rotated_at: str
+
+
+class CreateRewrapBatchRequest(BaseModel):
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    # A JSON integer in [1, 200]; booleans, floats and numeric strings are
+    # rejected by StrictInt. Absent means 50.
+    limit: StrictInt = Field(default=DEFAULT_REWRAP_BATCH_LIMIT, ge=1, le=200)
+    # Opaque token from a previous batch for the same scope; None starts at
+    # the smallest data_id. Its existence and scope are checked in the
+    # handler so forgery/cross-scope use is a 422 like any bad field.
+    cursor: StrictStr | None = Field(default=None, min_length=1)
+
+    _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
+    _cursor_non_blank = field_validator("cursor")(_optional_non_blank)
+
+
+class RewrapBatchAuditEntry(BaseModel):
+    tenant_id: str
+    workload_id: str
+    data_id: str
+    old_key_version: int
+    new_key_version: int
+    result: str
+    occurred_at: str
+
+
+class RewrapBatchResponse(BaseModel):
+    batch_id: str
+    processed: int
+    rewrapped: int
+    skipped: int
+    failed: int
+    next_cursor: str
+    done: bool
+
+
+class RewrapBatchDetailResponse(BaseModel):
+    batch_id: str
+    tenant_id: str
+    workload_id: str
+    request_cursor: str | None
+    limit: int
+    processed: int
+    rewrapped: int
+    skipped: int
+    failed: int
+    next_cursor: str
+    done: bool
+    created_at: str
+    completed_at: str | None
+    audits: list[RewrapBatchAuditEntry]
 
 
 def _migrate_additive(engine) -> None:
@@ -1334,6 +1545,229 @@ def create_app(
             key_version=final_version,
             rotated_at=_rfc3339(rotated_at),
         )
+
+    @app.post("/v1/rewrap-batches", response_model=RewrapBatchResponse)
+    def create_rewrap_batch(body: CreateRewrapBatchRequest) -> RewrapBatchResponse:
+        # Preflight the keyring before anything is persisted. An invalid
+        # overall configuration is a server failure: no batch row, no cursor
+        # and no audit or envelope change is produced. Only the failure kind
+        # is logged, never configured values or key material.
+        try:
+            keyring = load_keyring()
+        except MasterKeyError as exc:
+            logger.error("master key configuration unavailable: %s", exc)
+            raise HTTPException(status_code=500, detail="encryption unavailable")
+
+        batch_id = str(uuid.uuid4())
+        created_at = _utcnow()
+
+        with session_factory() as session:
+            # Validate the presented cursor inside the write transaction.
+            # A forged token (no row) and one belonging to another scope are
+            # both malformed-request failures (422); the token's mere
+            # existence is never revealed. The boundary is the exclusive
+            # data_id position in this scope's stable ordering; NULL means
+            # the start position (before the smallest data_id).
+            boundary: str | None = None
+            if body.cursor is not None:
+                cursor_row = session.get(RewrapCursor, body.cursor)
+                if (
+                    cursor_row is None
+                    or cursor_row.tenant_id != body.tenant_id
+                    or cursor_row.workload_id != body.workload_id
+                ):
+                    raise HTTPException(status_code=422, detail="invalid cursor")
+                boundary = cursor_row.boundary_data_id
+
+            # Reserve the batch row before touching any envelope, so the
+            # batch and its audits remain queryable if the page stops early
+            # or the process restarts mid-page.
+            batch = RewrapBatch(
+                batch_id=batch_id,
+                tenant_id=body.tenant_id,
+                workload_id=body.workload_id,
+                request_cursor=body.cursor,
+                limit_value=body.limit,
+                processed_count=0,
+                rewrapped_count=0,
+                skipped_count=0,
+                failed_count=0,
+                next_cursor=None,
+                done=False,
+                created_at=created_at,
+                completed_at=None,
+            )
+            session.add(batch)
+            session.commit()
+
+        # Snapshot the page in stable data_id order. Fetching limit + 1 ids
+        # reveals whether another envelope exists past the page without a
+        # separate count query. The read transaction closes (releasing the
+        # SQLite write lock) before per-envelope write transactions begin.
+        with session_factory() as session:
+            page_stmt = (
+                select(DataEnvelope)
+                .where(
+                    DataEnvelope.tenant_id == body.tenant_id,
+                    DataEnvelope.workload_id == body.workload_id,
+                )
+                .order_by(DataEnvelope.data_id.asc())
+                .limit(body.limit + 1)
+            )
+            if boundary is not None:
+                page_stmt = page_stmt.where(DataEnvelope.data_id > boundary)
+            selected = list(session.scalars(page_stmt))
+        has_more = len(selected) > body.limit
+        page = selected[: body.limit]
+
+        rewrapped = 0
+        skipped = 0
+        failure_code: str | None = None
+        handled_ids: list[str] = []
+        for seq, item in enumerate(page):
+            result, _old_version, _new_version = _batch_rewrap_one(
+                session_factory,
+                batch_id=batch_id,
+                tenant_id=body.tenant_id,
+                workload_id=body.workload_id,
+                data_id=item.data_id,
+                seq=seq,
+                target_version=keyring.current_version,
+            )
+            if result == REWRAP_RESULT_REWRAPPED:
+                rewrapped += 1
+                handled_ids.append(item.data_id)
+            elif result == REWRAP_RESULT_SKIPPED:
+                skipped += 1
+                handled_ids.append(item.data_id)
+            else:
+                # keyring / missing-key / rewrap: the failing envelope is
+                # unchanged; stop the page here with its audit already
+                # independently committed.
+                failure_code = result
+                break
+
+        processed = rewrapped + skipped
+        completed_at = _utcnow()
+
+        with session_factory() as session:
+            next_token: str | None = None
+            done = False
+            if failure_code is None and not has_more:
+                # Every envelope of the range has been handled: the end
+                # position is reported as an empty cursor with done=true.
+                done = True
+                next_boundary = None
+            else:
+                # More work remains, or the page stopped on a failure. The
+                # continuation cursor sits on the last handled envelope
+                # (exclusive), i.e. immediately before an unhandled/failed
+                # one; a start-position token (NULL boundary) is issued when
+                # the first envelope of the range failed.
+                done = False
+                next_boundary = handled_ids[-1] if handled_ids else boundary
+                next_token = b64url_encode(secrets.token_bytes(CURSOR_BYTES))
+                session.add(
+                    RewrapCursor(
+                        cursor_id=next_token,
+                        tenant_id=body.tenant_id,
+                        workload_id=body.workload_id,
+                        boundary_data_id=next_boundary,
+                        created_at=completed_at,
+                    )
+                )
+
+            session.execute(
+                update(RewrapBatch)
+                .where(RewrapBatch.batch_id == batch_id)
+                .values(
+                    processed_count=processed,
+                    rewrapped_count=rewrapped,
+                    skipped_count=skipped,
+                    failed_count=0 if failure_code is None else 1,
+                    next_cursor=next_token,
+                    done=done,
+                    completed_at=completed_at,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            session.commit()
+
+        return RewrapBatchResponse(
+            batch_id=batch_id,
+            processed=processed,
+            rewrapped=rewrapped,
+            skipped=skipped,
+            failed=0 if failure_code is None else 1,
+            next_cursor="" if next_token is None else next_token,
+            done=done,
+        )
+
+    @app.get("/v1/rewrap-batches/{batch_id}", response_model=RewrapBatchDetailResponse)
+    def get_rewrap_batch(
+        batch_id: str,
+        tenant_id: str = Query(..., min_length=1),
+        workload_id: str = Query(..., min_length=1),
+    ) -> RewrapBatchDetailResponse:
+        # Identifier/scope parameter shape is validated before any lookup:
+        # missing, blank or malformed values are 422.
+        if not batch_id.strip() or not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid batch parameters")
+        try:
+            uuid.UUID(batch_id)
+        except (ValueError, AttributeError, TypeError):
+            raise HTTPException(status_code=422, detail="invalid batch identifier")
+
+        with session_factory() as session:
+            # Unknown and cross-scope batches are indistinguishable: 404.
+            batch = session.get(RewrapBatch, batch_id)
+            if (
+                batch is None
+                or batch.tenant_id != tenant_id
+                or batch.workload_id != workload_id
+            ):
+                raise HTTPException(status_code=404, detail="rewrap batch not found")
+            audits = list(
+                session.scalars(
+                    select(RewrapBatchAudit)
+                    .where(RewrapBatchAudit.batch_id == batch_id)
+                    .order_by(
+                        RewrapBatchAudit.seq.asc(), RewrapBatchAudit.audit_id.asc()
+                    )
+                )
+            )
+            audit_entries = [
+                RewrapBatchAuditEntry(
+                    tenant_id=audit.tenant_id,
+                    workload_id=audit.workload_id,
+                    data_id=audit.data_id,
+                    old_key_version=audit.old_key_version,
+                    new_key_version=audit.new_key_version,
+                    result=audit.result,
+                    occurred_at=_rfc3339(audit.occurred_at),
+                )
+                for audit in audits
+            ]
+            return RewrapBatchDetailResponse(
+                batch_id=batch.batch_id,
+                tenant_id=batch.tenant_id,
+                workload_id=batch.workload_id,
+                request_cursor=batch.request_cursor,
+                limit=batch.limit_value,
+                processed=batch.processed_count,
+                rewrapped=batch.rewrapped_count,
+                skipped=batch.skipped_count,
+                failed=batch.failed_count,
+                next_cursor=batch.next_cursor or "",
+                done=batch.done,
+                created_at=_rfc3339(batch.created_at),
+                completed_at=(
+                    _rfc3339(batch.completed_at)
+                    if batch.completed_at is not None
+                    else None
+                ),
+                audits=audit_entries,
+            )
 
     return app
 
