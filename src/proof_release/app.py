@@ -24,6 +24,7 @@ from cryptography.hazmat.primitives.serialization import Encoding
 from proof_release.db import (
     DECISION_STATUS_ALLOWED,
     DECISION_STATUS_DENIED,
+    RELEASE_GRANT_STATUS_CODES,
     RELEASE_GRANT_STATUS_REVOKED,
     REWRAP_RESULT_KEYRING,
     REWRAP_RESULT_MISSING_KEY,
@@ -82,6 +83,16 @@ CAPABILITY_BYTES = 32
 REWRAP_BATCH_DEFAULT_LIMIT = 50
 REWRAP_BATCH_MIN_LIMIT = 1
 REWRAP_BATCH_MAX_LIMIT = 200
+
+#: Fixed page size for the read-only release-grant audit listing. The
+#: listing is cursor-driven; the page size is an internal constant and is
+#: never part of the request or response contract.
+RELEASE_GRANT_AUDIT_PAGE_SIZE = 100
+
+#: Discriminator embedded in release-grant audit cursors so a rewrap-batch
+#: cursor (authenticated with the same secret) can never be replayed here
+#: and vice versa.
+_GRANT_AUDIT_CURSOR_KIND = "release-grant-audit-v1"
 
 #: Environment variable naming the secret used to authenticate rewrap
 #: cursors. Cursors are opaque outside the service: each one carries the
@@ -190,6 +201,167 @@ def _decode_cursor(
     boundary = decoded.get("d")
     if not isinstance(boundary, str):
         return None
+    return boundary
+
+
+def _parse_utc_rfc3339(value: str) -> datetime:
+    """Parse a timestamp that explicitly denotes UTC (zero offset).
+
+    Accepts RFC3339 forms, including a trailing ``Z``. A naive timestamp
+    (no offset) or a non-UTC offset is rejected rather than silently
+    assumed or converted, so audit-window bounds are always unambiguous.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("timestamp must be UTC RFC3339") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ValueError("timestamp must be UTC RFC3339")
+    return parsed.astimezone(timezone.utc)
+
+
+def _grant_audit_cursor_payload(
+    tenant_id: str,
+    workload_id: str,
+    boundary: str,
+    *,
+    grant_id: str,
+    decision_id: str,
+    data_id: str,
+    status: str,
+    issued_after: str,
+    issued_before: str,
+) -> bytes:
+    """Canonical byte payload authenticated inside a grant-audit cursor.
+
+    Every active filter is part of the payload, so a cursor minted for one
+    filter set cannot be replayed against another. The embedded kind tag
+    distinguishes these cursors from rewrap-batch cursors even though both
+    are HMAC-authenticated with the same secret.
+    """
+    return json.dumps(
+        {
+            "k": _GRANT_AUDIT_CURSOR_KIND,
+            "t": tenant_id,
+            "w": workload_id,
+            "g": boundary,
+            "gi": grant_id,
+            "di": decision_id,
+            "da": data_id,
+            "s": status,
+            "a": issued_after,
+            "b": issued_before,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _encode_grant_audit_cursor(
+    tenant_id: str,
+    workload_id: str,
+    boundary: str,
+    *,
+    grant_id: str,
+    decision_id: str,
+    data_id: str,
+    status: str,
+    issued_after: str,
+    issued_before: str,
+) -> str:
+    """Build an opaque, scope- and filter-bound exclusive grant cursor."""
+    payload = _grant_audit_cursor_payload(
+        tenant_id,
+        workload_id,
+        boundary,
+        grant_id=grant_id,
+        decision_id=decision_id,
+        data_id=data_id,
+        status=status,
+        issued_after=issued_after,
+        issued_before=issued_before,
+    )
+    mac = hmac.new(_cursor_secret(), payload, hashlib.sha256).digest()
+    return b64url_encode(payload + mac)
+
+
+def _decode_grant_audit_cursor(
+    token: str,
+    tenant_id: str,
+    workload_id: str,
+    *,
+    grant_id: str,
+    decision_id: str,
+    data_id: str,
+    status: str,
+    issued_after: str,
+    issued_before: str,
+) -> str | None:
+    """Validate a grant-audit cursor and return its exclusive grant boundary.
+
+    Returns ``None`` for a malformed/forged token, a cursor of another
+    kind (e.g. a rewrap-batch cursor), or one minted for any other scope
+    or filter combination. The beginning-of-scope marker (``""``) never
+    reaches this function: it is handled by the caller.
+    """
+    if not _CURSOR_RE.fullmatch(token):
+        return None
+    try:
+        raw = b64url_decode(token)
+    except ValueError:
+        return None
+    # The MAC is a fixed 32-byte suffix; the JSON payload precedes it.
+    if len(raw) <= 32:
+        return None
+    payload, mac = raw[:-32], raw[-32:]
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    if decoded.get("k") != _GRANT_AUDIT_CURSOR_KIND:
+        return None
+    boundary = decoded.get("g")
+    if not isinstance(boundary, str) or boundary == "":
+        # A resume cursor always names the last returned grant; an empty
+        # boundary is only valid as the implicit start, which is not encoded.
+        return None
+    # Recompute the expected MAC over the decoded payload exactly as it
+    # was signed, then verify it in constant time.
+    expected_mac = hmac.new(
+        _cursor_secret(),
+        _grant_audit_cursor_payload(
+            tenant_id,
+            workload_id,
+            boundary,
+            grant_id=grant_id,
+            decision_id=decision_id,
+            data_id=data_id,
+            status=status,
+            issued_after=issued_after,
+            issued_before=issued_before,
+        ),
+        hashlib.sha256,
+    ).digest()
+    if not hmac.compare_digest(mac, expected_mac):
+        return None
+    # Defense in depth: the MAC already covers every field, but confirm
+    # the scope and each active filter explicitly.
+    if not hmac.compare_digest(str(decoded.get("t", "")), tenant_id):
+        return None
+    if not hmac.compare_digest(str(decoded.get("w", "")), workload_id):
+        return None
+    for key, expected in (
+        ("gi", grant_id),
+        ("di", decision_id),
+        ("da", data_id),
+        ("s", status),
+        ("a", issued_after),
+        ("b", issued_before),
+    ):
+        if not hmac.compare_digest(str(decoded.get(key, "")), expected):
+            return None
     return boundary
 
 
@@ -1214,6 +1386,258 @@ def create_app(
             pending=True,
             issued_at=_rfc3339(now),
             expires_at=_rfc3339(expires_at),
+        )
+
+    @app.get("/v1/release-grants")
+    def list_release_grants(
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        grant_id: str | None = Query(default=None),
+        decision_id: str | None = Query(default=None),
+        data_id: str | None = Query(default=None),
+        status: str | None = Query(default=None),
+        issued_after: str | None = Query(default=None),
+        issued_before: str | None = Query(default=None),
+        cursor: str | None = Query(default=None),
+    ) -> Response:
+        """Return a read-only, cursor-stable audit page of release grants.
+
+        The page is scoped by the mandatory tenant/workload and may be
+        narrowed by grant/decision/data identifiers, status and an
+        inclusive issued-at window. Ordering is grant_id ascending with
+        an exclusive keyset cursor; the cursor is HMAC-authenticated and
+        bound to the scope *and* every active filter, so it cannot be
+        forged or replayed against different filter values. The handler
+        only ever issues SELECTs: it never settles, writes or otherwise
+        mutates a grant, so concurrent consume/revoke transitions remain
+        the sole writers and queries observe only committed state.
+        """
+        # --- field validation (all 422, no storage touched) -------------
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        def _identifier(value: str | None, *, uuid_shaped: bool) -> str | None:
+            if value is None:
+                return None
+            if not value.strip():
+                raise HTTPException(
+                    status_code=422, detail="filter must be a non-empty string"
+                )
+            if uuid_shaped:
+                # Canonical lowercase-UUID shape; uppercase is accepted and
+                # normalized, but surrounding whitespace is a format error
+                # (mirrors the grant/batch path-identifier handling).
+                if not _UUID_RE.fullmatch(value.lower()):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="invalid grant or decision identifier",
+                    )
+                return value.lower()
+            return value
+
+        grant_filter = _identifier(grant_id, uuid_shaped=True)
+        decision_filter = _identifier(decision_id, uuid_shaped=True)
+        # data_id is a caller-chosen identifier: any non-blank string is a
+        # legal format; existence in the scope is checked below.
+        data_filter = _identifier(data_id, uuid_shaped=False)
+
+        if status is not None:
+            if not status.strip() or status not in RELEASE_GRANT_STATUS_CODES:
+                raise HTTPException(status_code=422, detail="invalid status")
+
+        # Timestamp filters: absent means unbounded; an explicit empty or
+        # whitespace value is an illegal format (422), not "unbounded".
+        # Parsed bounds are embedded into the cursor in normalized
+        # RFC3339/UTC form so equivalent spellings cannot mint two
+        # different cursor domains.
+        def _time_bound(value: str | None, name: str) -> tuple[str, datetime | None]:
+            if value is None:
+                return "", None
+            if not value.strip():
+                raise HTTPException(
+                    status_code=422, detail=f"{name} must be UTC RFC3339"
+                )
+            try:
+                parsed = _parse_utc_rfc3339(value)
+            except ValueError:
+                raise HTTPException(
+                    status_code=422, detail=f"{name} must be UTC RFC3339"
+                )
+            return _rfc3339(parsed), parsed
+
+        after_raw, after_dt = _time_bound(issued_after, "issued_after")
+        before_raw, before_dt = _time_bound(issued_before, "issued_before")
+        # The lower bound must not be later than the upper bound. Equality
+        # is a valid (single-instant) window.
+        if after_dt is not None and before_dt is not None and after_dt > before_dt:
+            raise HTTPException(
+                status_code=422, detail="issued_after must not be later than issued_before"
+            )
+
+        # An omitted cursor or an explicit empty string means the
+        # beginning of the scope (before the smallest grant id). A
+        # whitespace-only or otherwise malformed value is a 422, as is a
+        # forged, tampered, cross-scope or cross-filter cursor.
+        status_filter = status if status is not None else ""
+        if cursor is None or cursor == "":
+            boundary = ""
+        else:
+            if not cursor.strip() or not _CURSOR_RE.fullmatch(cursor):
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            boundary = _decode_grant_audit_cursor(
+                cursor,
+                tenant_id,
+                workload_id,
+                grant_id=grant_filter or "",
+                decision_id=decision_filter or "",
+                data_id=data_filter or "",
+                status=status_filter,
+                issued_after=after_raw,
+                issued_before=before_raw,
+            )
+            if boundary is None:
+                raise HTTPException(status_code=422, detail="invalid cursor")
+
+        # --- read-only audit scan ---------------------------------------
+        try:
+            with session_factory() as session:
+                # Explicitly named identifiers must exist in exactly this
+                # scope; an unknown or cross-scope identifier is a 404
+                # rather than an empty-looking page. A decision's scope is
+                # the scope of its evidence.
+                if grant_filter is not None:
+                    grant_row = session.get(ReleaseGrant, grant_filter)
+                    if (
+                        grant_row is None
+                        or grant_row.tenant_id != tenant_id
+                        or grant_row.workload_id != workload_id
+                    ):
+                        raise HTTPException(
+                            status_code=404, detail="grant not found"
+                        )
+                if decision_filter is not None:
+                    decision_row = session.get(Decision, decision_filter)
+                    evidence_row = (
+                        session.get(Evidence, decision_row.evidence_id)
+                        if decision_row is not None
+                        else None
+                    )
+                    if (
+                        decision_row is None
+                        or evidence_row is None
+                        or evidence_row.tenant_id != tenant_id
+                        or evidence_row.workload_id != workload_id
+                    ):
+                        raise HTTPException(
+                            status_code=404, detail="decision not found"
+                        )
+                if data_filter is not None:
+                    # A data identifier is known in a scope when a data
+                    # envelope is registered there or an audited grant in
+                    # the scope references it (grants may be minted before
+                    # the envelope exists). Anything else — including an
+                    # identifier belonging to another tenant/workload — is
+                    # an indistinguishable 404.
+                    envelope_row = session.get(
+                        DataEnvelope, (tenant_id, workload_id, data_filter)
+                    )
+                    if envelope_row is None:
+                        referenced = session.scalar(
+                            select(ReleaseGrant.grant_id)
+                            .where(
+                                ReleaseGrant.tenant_id == tenant_id,
+                                ReleaseGrant.workload_id == workload_id,
+                                ReleaseGrant.data_id == data_filter,
+                            )
+                            .limit(1)
+                        )
+                        if referenced is None:
+                            raise HTTPException(
+                                status_code=404, detail="data envelope not found"
+                            )
+
+                stmt = select(ReleaseGrant).where(
+                    ReleaseGrant.tenant_id == tenant_id,
+                    ReleaseGrant.workload_id == workload_id,
+                )
+                if grant_filter is not None:
+                    stmt = stmt.where(ReleaseGrant.grant_id == grant_filter)
+                if decision_filter is not None:
+                    stmt = stmt.where(ReleaseGrant.decision_id == decision_filter)
+                if data_filter is not None:
+                    stmt = stmt.where(ReleaseGrant.data_id == data_filter)
+                if status_filter:
+                    stmt = stmt.where(ReleaseGrant.status == status_filter)
+                if after_dt is not None:
+                    stmt = stmt.where(ReleaseGrant.issued_at >= after_dt)
+                if before_dt is not None:
+                    stmt = stmt.where(ReleaseGrant.issued_at <= before_dt)
+                stmt = (
+                    stmt.where(ReleaseGrant.grant_id > boundary)
+                    .order_by(ReleaseGrant.grant_id.asc())
+                    .limit(RELEASE_GRANT_AUDIT_PAGE_SIZE + 1)
+                )
+
+                # One extra row is the "more follows" probe. The scan is a
+                # single read-only statement: a storage failure aborts the
+                # whole request with a 500 rather than returning a partial
+                # page.
+                rows = list(session.scalars(stmt))
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("release grant audit query failed")
+            raise HTTPException(
+                status_code=500, detail="release grant audit unavailable"
+            )
+
+        has_more = len(rows) > RELEASE_GRANT_AUDIT_PAGE_SIZE
+        page = rows[:RELEASE_GRANT_AUDIT_PAGE_SIZE]
+
+        grants = [
+            {
+                "grant_id": row.grant_id,
+                "decision_id": row.decision_id,
+                "data_id": row.data_id,
+                "status": row.status,
+                # The capability is exposed only as its SHA-256 digest;
+                # the plaintext capability exists nowhere on this path.
+                "capability_sha256": row.capability_digest,
+                "issued_at": _rfc3339(row.issued_at),
+                "expires_at": _rfc3339(row.expires_at),
+                "consumed_at": (
+                    _rfc3339(row.consumed_at) if row.consumed_at is not None else None
+                ),
+                "revoked_at": (
+                    _rfc3339(row.revoked_at) if row.revoked_at is not None else None
+                ),
+            }
+            for row in page
+        ]
+
+        if has_more:
+            next_cursor = _encode_grant_audit_cursor(
+                tenant_id,
+                workload_id,
+                page[-1].grant_id,
+                grant_id=grant_filter or "",
+                decision_id=decision_filter or "",
+                data_id=data_filter or "",
+                status=status_filter,
+                issued_after=after_raw,
+                issued_before=before_raw,
+            )
+            complete = False
+        else:
+            next_cursor = ""
+            complete = True
+
+        return _compact_json(
+            {
+                "grants": grants,
+                "next_cursor": next_cursor,
+                "complete": complete,
+            }
         )
 
     @app.post(
