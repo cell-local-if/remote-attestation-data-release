@@ -6,6 +6,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     LargeBinary,
     String,
@@ -69,6 +70,35 @@ REWRAP_RESULT_CODES = frozenset(
         REWRAP_RESULT_KEYRING,
         REWRAP_RESULT_MISSING_KEY,
         REWRAP_RESULT_REWRAP_FAILED,
+    }
+)
+
+
+#: Finite, service-defined set of compliance audit-event types. ``grant``
+#: events trace the one-time release-grant lifecycle; ``rewrap`` events
+#: trace per-envelope key rotation performed by rewrap batches.
+AUDIT_EVENT_TYPE_GRANT = "grant"
+AUDIT_EVENT_TYPE_REWRAP = "rewrap"
+AUDIT_EVENT_TYPE_CODES = frozenset(
+    {AUDIT_EVENT_TYPE_GRANT, AUDIT_EVENT_TYPE_REWRAP}
+)
+
+#: Finite, service-defined set of compliance audit-event statuses. Grant
+#: events move pending -> consumed | revoked (mirroring the grant row);
+#: rewrap events are born rewrapped or skipped. Every value is a fixed
+#: code derived solely from a committed state transition.
+AUDIT_EVENT_STATUS_PENDING = "pending"
+AUDIT_EVENT_STATUS_CONSUMED = "consumed"
+AUDIT_EVENT_STATUS_REVOKED = "revoked"
+AUDIT_EVENT_STATUS_REWRAPPED = "rewrapped"
+AUDIT_EVENT_STATUS_SKIPPED = "skipped"
+AUDIT_EVENT_STATUS_CODES = frozenset(
+    {
+        AUDIT_EVENT_STATUS_PENDING,
+        AUDIT_EVENT_STATUS_CONSUMED,
+        AUDIT_EVENT_STATUS_REVOKED,
+        AUDIT_EVENT_STATUS_REWRAPPED,
+        AUDIT_EVENT_STATUS_SKIPPED,
     }
 )
 
@@ -356,3 +386,54 @@ class RewrapBatchItem(Base):
     # One of REWRAP_RESULT_*; a fixed, service-defined code only.
     result: Mapped[str] = mapped_column(String(16))
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class AuditEvent(Base):
+    """Append-only, tenant-scoped compliance audit event.
+
+    A row is inserted in the same committed transaction as the state
+    transition it records (grant issuance/consumption/revocation, or a
+    per-envelope rewrap-batch outcome), so an event exists if and only if
+    the change committed and it survives restarts. The table is never
+    updated or deleted by the service.
+
+    Only identifiers, the fixed event type/status codes, timestamps and
+    the capability SHA-256 digest are stored. Plaintext capabilities,
+    payloads, evidence, data keys, master keys and certificate material
+    never have a column here. For ``rewrap`` events the grant/decision
+    identifiers and the capability digest are semantically empty and are
+    stored as NULL.
+    """
+
+    __tablename__ = "audit_events"
+    __table_args__ = (
+        # Covers the scoped listing ordered by the (occurred_at, event_id)
+        # keyset, including its exclusive cursor predicate.
+        Index(
+            "ix_audit_events_scope_occurred",
+            "tenant_id",
+            "workload_id",
+            "occurred_at",
+            "event_id",
+        ),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256), index=True)
+    # One of AUDIT_EVENT_TYPE_*; a fixed, service-defined code only.
+    event_type: Mapped[str] = mapped_column(String(16))
+    # Set for grant events; NULL for rewrap events.
+    grant_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    decision_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, index=True
+    )
+    data_id: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
+    # One of AUDIT_EVENT_STATUS_*; a fixed, service-defined code only.
+    status: Mapped[str] = mapped_column(String(16))
+    # SHA-256 digest of the capability for grant events; NULL otherwise.
+    capability_sha256: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    # Commit time of the recorded transition; the stable listing key.
+    occurred_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
