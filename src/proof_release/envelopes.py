@@ -205,6 +205,25 @@ def encrypt_payload(master_key: bytes, plaintext: bytes) -> EncryptedEnvelope:
     )
 
 
+def decrypt_payload(
+    master_key: bytes,
+    wrapped_key: bytes,
+    iv: bytes,
+    ciphertext: bytes,
+    tag: bytes,
+) -> bytes:
+    """Unwrap the data key with ``master_key`` and authenticated-decrypt.
+
+    Used on the release path to recover a sealed payload. Both AES Key
+    Wrap and AES-256-GCM are authenticated: a wrong master key, damaged
+    wrapping material, or any tampering with the IV, tag or ciphertext
+    raises before any plaintext is returned. The unwrapped data key
+    exists only on this stack frame.
+    """
+    data_key = aes_key_unwrap(master_key, wrapped_key)
+    return AESGCM(data_key).decrypt(iv, ciphertext + tag, None)
+
+
 def rewrap_data_key(
     unwrapping_key: bytes, wrapping_key: bytes, wrapped_key: bytes
 ) -> bytes:

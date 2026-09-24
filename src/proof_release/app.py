@@ -46,6 +46,7 @@ from proof_release.envelopes import (
     MasterKeyError,
     b64url_decode,
     b64url_encode,
+    decrypt_payload,
     encrypt_payload,
     load_keyring,
     rewrap_data_key,
@@ -382,6 +383,21 @@ class ReleaseGrantConsumedResponse(BaseModel):
     data_id: str
     consumed: bool
     consumed_at: str
+
+
+class ReleasePayloadRequest(BaseModel):
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    data_id: StrictStr = Field(min_length=1)
+    capability: StrictStr = Field(min_length=1)
+
+    _non_blank = field_validator(
+        "tenant_id", "workload_id", "data_id", "capability"
+    )(_require_non_blank)
+    # As on the consume path, malformed capability syntax is a field/format
+    # error (422); a well-formed value that simply does not match is an
+    # authentication failure (401).
+    _capability_valid = field_validator("capability")(_nonce_format)
 
 
 class CreateDataEnvelopeRequest(BaseModel):
@@ -1229,6 +1245,129 @@ def create_app(
             consumed=True,
             consumed_at=_rfc3339(now),
         )
+
+    @app.post("/v1/release/{grant_id}")
+    def release_payload(grant_id: str, body: ReleasePayloadRequest) -> Response:
+        """Release one protected payload against a one-time grant.
+
+        Judgement order is fixed: unknown/cross-scope grant or data item
+        (404), capability mismatch (401), expiry (410), already consumed
+        (409). Field/format problems are rejected with 422 by the request
+        model before this handler runs. The one-time state is the very
+        same release_grants row used by the consume endpoint: the data
+        key is unwrapped and the payload authenticated-decrypted *before*
+        the pending -> consumed transition is committed, so any keyring
+        or decryption failure leaves the grant pending and writes no
+        consumption audit.
+        """
+        digest = _nonce_digest(body.capability)
+        now = _utcnow()
+        with session_factory() as session:
+            grant = session.get(ReleaseGrant, grant_id)
+            if (
+                grant is None
+                or grant.tenant_id != body.tenant_id
+                or grant.workload_id != body.workload_id
+            ):
+                raise HTTPException(status_code=404, detail="grant not found")
+
+            # The envelope must exist in exactly the grant's scope and the
+            # request's data identifier must match the one the grant was
+            # minted for. An unknown item, a cross-scope item and an
+            # identifier mismatch are indistinguishable 404s.
+            envelope = session.get(
+                DataEnvelope,
+                (body.tenant_id, body.workload_id, body.data_id),
+            )
+            if envelope is None or grant.data_id != body.data_id:
+                raise HTTPException(status_code=404, detail="data envelope not found")
+
+            # The capability is used only for this verification; its
+            # plaintext is never logged, persisted, or returned.
+            if not hmac.compare_digest(grant.capability_digest, digest):
+                raise HTTPException(status_code=401, detail="invalid capability")
+
+            # Expiry precedes the consumed judgement: an expired grant that
+            # was also consumed reports 410.
+            if grant.expires_at <= now:
+                raise HTTPException(status_code=410, detail="grant expired")
+            if grant.status == "consumed":
+                raise HTTPException(status_code=409, detail="grant already consumed")
+
+            # Keyring problems are server failures that must not consume
+            # the grant. Only the failure kind is logged — never key
+            # material, the capability, or any payload.
+            try:
+                keyring = load_keyring()
+                unwrapping_key = keyring.key_for(envelope.key_version)
+            except MasterKeyError as exc:
+                logger.error("master key configuration unavailable: %s", exc)
+                raise HTTPException(
+                    status_code=500, detail="decryption unavailable"
+                )
+
+            # Unwrap the data key with the master key version recorded on
+            # the envelope and authenticated-decrypt the payload. Both
+            # operations are authenticated: any failure rolls back without
+            # touching the grant's one-time state and writes no audit.
+            try:
+                plaintext_bytes = decrypt_payload(
+                    unwrapping_key,
+                    envelope.wrapped_key,
+                    envelope.iv,
+                    envelope.ciphertext,
+                    envelope.tag,
+                )
+                plaintext = plaintext_bytes.decode("utf-8")
+            except Exception:
+                session.rollback()
+                logger.error("payload release decryption failed")
+                raise HTTPException(status_code=500, detail="decryption failed")
+            # Envelopes are created from non-empty strings, so an empty
+            # recovery is unreachable for service-written rows; treat it as
+            # a failure rather than releasing an invalid response.
+            if not plaintext:
+                session.rollback()
+                logger.error("released payload was empty")
+                raise HTTPException(status_code=500, detail="decryption failed")
+
+            # Only after authenticated decryption succeeds is the one-time
+            # state committed. The guarded UPDATE is shared with the
+            # consume endpoint: concurrent or duplicate valid requests
+            # race here and exactly one winner consumes the grant.
+            result = session.execute(
+                update(ReleaseGrant)
+                .where(
+                    ReleaseGrant.grant_id == grant_id,
+                    ReleaseGrant.status == "pending",
+                    ReleaseGrant.expires_at > now,
+                )
+                .values(status="consumed", consumed_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            if result.rowcount != 1:
+                session.rollback()
+                fresh = session.get(ReleaseGrant, grant_id)
+                if fresh is not None and fresh.status == "consumed":
+                    raise HTTPException(
+                        status_code=409, detail="grant already consumed"
+                    )
+                raise HTTPException(status_code=410, detail="grant expired")
+            session.commit()
+
+        # The plaintext exists only in this local value; it is never
+        # logged or persisted. Compact JSON containing exactly one
+        # non-empty string field, terminated by a single newline.
+        body_bytes = (
+            json.dumps(
+                {"payload": plaintext},
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body_bytes, media_type="application/json")
 
     @app.post(
         "/v1/data-envelopes",
