@@ -6,6 +6,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     LargeBinary,
     String,
@@ -69,6 +70,32 @@ REWRAP_RESULT_CODES = frozenset(
         REWRAP_RESULT_KEYRING,
         REWRAP_RESULT_MISSING_KEY,
         REWRAP_RESULT_REWRAP_FAILED,
+    }
+)
+
+#: Event types exposed by the read-only compliance audit. A ``grant`` event
+#: is the lifecycle record of one release grant (pending at issue, then
+#: exactly one consumed/revoked settlement); a ``rewrap`` event is one
+#: per-envelope audit row written by a rewrap batch.
+AUDIT_EVENT_TYPE_GRANT = "grant"
+AUDIT_EVENT_TYPE_REWRAP = "rewrap"
+AUDIT_EVENT_TYPES = frozenset({AUDIT_EVENT_TYPE_GRANT, AUDIT_EVENT_TYPE_REWRAP})
+
+#: Finite, service-defined set of compliance event statuses. Grant events
+#: track the grant lifecycle (pending/consumed/revoked); rewrap events
+#: record the fixed per-envelope batch outcome (rewrapped/skipped).
+AUDIT_EVENT_STATUS_PENDING = "pending"
+AUDIT_EVENT_STATUS_CONSUMED = "consumed"
+AUDIT_EVENT_STATUS_REVOKED = "revoked"
+AUDIT_EVENT_STATUS_REWRAPPED = "rewrapped"
+AUDIT_EVENT_STATUS_SKIPPED = "skipped"
+AUDIT_EVENT_STATUS_CODES = frozenset(
+    {
+        AUDIT_EVENT_STATUS_PENDING,
+        AUDIT_EVENT_STATUS_CONSUMED,
+        AUDIT_EVENT_STATUS_REVOKED,
+        AUDIT_EVENT_STATUS_REWRAPPED,
+        AUDIT_EVENT_STATUS_SKIPPED,
     }
 )
 
@@ -356,3 +383,54 @@ class RewrapBatchItem(Base):
     # One of REWRAP_RESULT_*; a fixed, service-defined code only.
     result: Mapped[str] = mapped_column(String(16))
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class AuditEvent(Base):
+    """One immutable entry in the per-tenant compliance audit trail.
+
+    Rows are append-only: a ``grant`` event is written in the same
+    transaction that mints the grant and updated in-place (status and
+    occurred_at only) by the single consuming/revoking settlement, while a
+    ``rewrap`` event is inserted in the same per-envelope transaction that a
+    rewrap batch commits and never changes afterwards. The row records only
+    identifiers, fixed type/status codes, timestamps and (for grant events)
+    the capability SHA-256 digest — never plaintext capabilities, payloads,
+    evidence, data keys, master keys, certificate material or plugin text.
+
+    Ordering on the read path is (occurred_at, event_id); event_id is a
+    canonical random UUID, so the tiebreaker is stable even when several
+    events share a timestamp.
+    """
+
+    __tablename__ = "audit_events"
+    __table_args__ = (
+        Index(
+            "ix_audit_events_scope_occurred",
+            "tenant_id",
+            "workload_id",
+            "occurred_at",
+            "event_id",
+        ),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256))
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # One of AUDIT_EVENT_TYPE_*; a fixed, service-defined code only.
+    event_type: Mapped[str] = mapped_column(String(16))
+    # Grant events reference the grant and its authorizing decision/data
+    # item. Rewrap events carry no grant linkage: these stay NULL.
+    grant_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    decision_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    data_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # One of AUDIT_EVENT_STATUS_*; a fixed, service-defined code only.
+    status: Mapped[str] = mapped_column(String(16))
+    # Grant events only: SHA-256 digest of the one-time capability. NULL
+    # for rewrap events, whose subject (an envelope) has no capability.
+    capability_sha256: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    # Timestamp the recorded fact occurred: grant issuance for a pending
+    # grant event, the settlement instant afterwards, the per-envelope
+    # commit time for a rewrap event.
+    occurred_at: Mapped[datetime] = mapped_column(UTCDateTime())

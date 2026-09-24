@@ -10,11 +10,12 @@ import re
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qsl
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
-from sqlalchemy import create_engine, event, func, select, text, update
+from sqlalchemy import and_, create_engine, event, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
@@ -22,6 +23,8 @@ from cryptography import x509
 from cryptography.hazmat.primitives.serialization import Encoding
 
 from proof_release.db import (
+    AUDIT_EVENT_STATUS_CODES,
+    AUDIT_EVENT_TYPES,
     DECISION_STATUS_ALLOWED,
     DECISION_STATUS_DENIED,
     RELEASE_GRANT_STATUS_CODES,
@@ -33,6 +36,7 @@ from proof_release.db import (
     REWRAP_RESULT_SKIPPED,
     VERIFICATION_RESULT_ACCEPTED,
     VERIFICATION_RESULT_REJECTED,
+    AuditEvent,
     Base,
     Challenge,
     DataEnvelope,
@@ -89,10 +93,19 @@ REWRAP_BATCH_MAX_LIMIT = 200
 #: never part of the request or response contract.
 RELEASE_GRANT_AUDIT_PAGE_SIZE = 100
 
+#: Fixed page size for the read-only compliance audit-event listing. As
+#: with the grant audit, the page size is an internal constant and never
+#: part of the request or response contract.
+COMPLIANCE_AUDIT_PAGE_SIZE = 100
+
 #: Discriminator embedded in release-grant audit cursors so a rewrap-batch
 #: cursor (authenticated with the same secret) can never be replayed here
 #: and vice versa.
 _GRANT_AUDIT_CURSOR_KIND = "release-grant-audit-v1"
+
+#: Discriminator embedded in compliance audit-event cursors, distinct from
+#: every other cursor family authenticated with the same secret.
+_COMPLIANCE_AUDIT_CURSOR_KIND = "compliance-audit-events-v1"
 
 #: Environment variable naming the secret used to authenticate rewrap
 #: cursors. Cursors are opaque outside the service: each one carries the
@@ -363,6 +376,187 @@ def _decode_grant_audit_cursor(
         if not hmac.compare_digest(str(decoded.get(key, "")), expected):
             return None
     return boundary
+
+
+def _compliance_audit_cursor_payload(
+    tenant_id: str,
+    workload_id: str,
+    position_occurred: str,
+    position_event: str,
+    *,
+    event_id: str,
+    event_type: str,
+    status: str,
+    occurred_after: str,
+    occurred_before: str,
+) -> bytes:
+    """Canonical byte payload authenticated inside a compliance cursor.
+
+    As with the grant-audit cursor, every active filter is part of the
+    signed payload so the token cannot be replayed against another scope or
+    filter set, and the embedded kind tag distinguishes it from the other
+    cursor families. The boundary is the full ordering position
+    (``occurred_at`` + ``event_id``) of the last returned event.
+    """
+    return json.dumps(
+        {
+            "k": _COMPLIANCE_AUDIT_CURSOR_KIND,
+            "t": tenant_id,
+            "w": workload_id,
+            "o": position_occurred,
+            "e": position_event,
+            "id": event_id,
+            "et": event_type,
+            "s": status,
+            "a": occurred_after,
+            "b": occurred_before,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _encode_compliance_audit_cursor(
+    tenant_id: str,
+    workload_id: str,
+    position_occurred: str,
+    position_event: str,
+    *,
+    event_id: str,
+    event_type: str,
+    status: str,
+    occurred_after: str,
+    occurred_before: str,
+) -> str:
+    """Build an opaque, scope- and filter-bound exclusive event cursor."""
+    payload = _compliance_audit_cursor_payload(
+        tenant_id,
+        workload_id,
+        position_occurred,
+        position_event,
+        event_id=event_id,
+        event_type=event_type,
+        status=status,
+        occurred_after=occurred_after,
+        occurred_before=occurred_before,
+    )
+    mac = hmac.new(_cursor_secret(), payload, hashlib.sha256).digest()
+    return b64url_encode(payload + mac)
+
+
+def _decode_compliance_audit_cursor(
+    token: str,
+    tenant_id: str,
+    workload_id: str,
+    *,
+    event_id: str,
+    event_type: str,
+    status: str,
+    occurred_after: str,
+    occurred_before: str,
+) -> tuple[datetime, str] | None:
+    """Validate a compliance cursor, returning its (occurred_at, event_id).
+
+    The returned boundary is the exclusive ordering position of the last
+    returned event. Returns ``None`` for a malformed/forged token, a cursor
+    of another kind, or one minted for any other scope or filter
+    combination. The beginning-of-scope marker (``""``) never reaches this
+    function: it is handled by the caller.
+    """
+    if not _CURSOR_RE.fullmatch(token):
+        return None
+    try:
+        raw = b64url_decode(token)
+    except ValueError:
+        return None
+    # The MAC is a fixed 32-byte suffix; the JSON payload precedes it.
+    if len(raw) <= 32:
+        return None
+    payload, mac = raw[:-32], raw[-32:]
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    if decoded.get("k") != _COMPLIANCE_AUDIT_CURSOR_KIND:
+        return None
+    position_occurred = decoded.get("o")
+    position_event = decoded.get("e")
+    if not isinstance(position_occurred, str) or not isinstance(position_event, str):
+        return None
+    if position_occurred == "" or not _UUID_RE.fullmatch(position_event):
+        # A resume cursor always names a returned event's full position.
+        return None
+    # Recompute the expected MAC over the decoded payload exactly as it
+    # was signed, then verify it in constant time.
+    expected_mac = hmac.new(
+        _cursor_secret(),
+        _compliance_audit_cursor_payload(
+            tenant_id,
+            workload_id,
+            position_occurred,
+            position_event,
+            event_id=event_id,
+            event_type=event_type,
+            status=status,
+            occurred_after=occurred_after,
+            occurred_before=occurred_before,
+        ),
+        hashlib.sha256,
+    ).digest()
+    if not hmac.compare_digest(mac, expected_mac):
+        return None
+    # Defense in depth: the MAC already covers every field, but confirm
+    # the scope and each active filter explicitly.
+    if not hmac.compare_digest(str(decoded.get("t", "")), tenant_id):
+        return None
+    if not hmac.compare_digest(str(decoded.get("w", "")), workload_id):
+        return None
+    for key, expected in (
+        ("id", event_id),
+        ("et", event_type),
+        ("s", status),
+        ("a", occurred_after),
+        ("b", occurred_before),
+    ):
+        if not hmac.compare_digest(str(decoded.get(key, "")), expected):
+            return None
+    # The boundary timestamp must parse as explicit UTC RFC3339. It was
+    # minted by this service, but never trust an unverified string after
+    # the MAC check either.
+    try:
+        boundary_dt = _parse_utc_rfc3339(position_occurred)
+    except ValueError:
+        return None
+    return boundary_dt, position_event
+
+
+def _grant_audit_event(
+    grant: ReleaseGrant,
+    *,
+    status: str,
+    occurred_at: datetime,
+) -> AuditEvent:
+    """Build the immutable compliance event for one grant lifecycle fact.
+
+    The event carries only identifiers, the fixed status code, the
+    timestamp and the capability digest — never the plaintext capability,
+    payload, evidence or any key material. It is added to the same session
+    (and therefore the same transaction) as the grant row it describes.
+    """
+    return AuditEvent(
+        event_id=str(uuid.uuid4()),
+        tenant_id=grant.tenant_id,
+        workload_id=grant.workload_id,
+        event_type="grant",
+        grant_id=grant.grant_id,
+        decision_id=grant.decision_id,
+        data_id=grant.data_id,
+        status=status,
+        capability_sha256=grant.capability_digest,
+        occurred_at=occurred_at,
+    )
 
 
 class CreateChallengeRequest(BaseModel):
@@ -1376,7 +1570,13 @@ def create_app(
                 expires_at=expires_at,
                 consumed_at=None,
             )
+            # The compliance trail records the issuance in the same atomic
+            # transaction as the grant itself, so a minted grant always has
+            # its pending event and a failed mint leaves neither.
             session.add(grant)
+            session.add(
+                _grant_audit_event(grant, status="pending", occurred_at=now)
+            )
             session.commit()
         return ReleaseGrantCreatedResponse(
             grant_id=grant.grant_id,
@@ -1640,6 +1840,256 @@ def create_app(
             }
         )
 
+    @app.get("/v1/compliance/audit-events")
+    def list_compliance_audit_events(request: Request) -> Response:
+        """Return a read-only, cursor-stable page of compliance events.
+
+        The page is scoped by the mandatory tenant/workload and may be
+        narrowed by event id/type, status and an inclusive occurred-at
+        window. Ordering is (occurred_at, event_id) ascending with an
+        exclusive composite keyset cursor; the cursor is HMAC-authenticated
+        and bound to the scope *and* every active filter, so it cannot be
+        forged or replayed against different scope or filter values. The
+        handler only ever issues SELECTs: grant issuance/settlement and
+        rewrap batches remain the sole writers and the query observes only
+        committed state.
+        """
+        # --- raw parameter inspection -----------------------------------
+        # Query parameters are parsed from the raw query string rather
+        # than declared individually so that (a) any parameter outside the
+        # fixed contract and (b) any repeated parameter are both rejected
+        # as 422s instead of being silently accepted or collapsed.
+        allowed = {
+            "tenant_id",
+            "workload_id",
+            "event_id",
+            "event_type",
+            "status",
+            "occurred_after",
+            "occurred_before",
+            "cursor",
+        }
+        raw_pairs = parse_qsl(
+            request.url.query, keep_blank_values=True, strict_parsing=False
+        )
+        seen: set[str] = set()
+        params: dict[str, str] = {}
+        for key, value in raw_pairs:
+            if key not in allowed:
+                raise HTTPException(
+                    status_code=422, detail="unknown query parameter"
+                )
+            if key in seen:
+                raise HTTPException(
+                    status_code=422, detail="query parameter must appear once"
+                )
+            seen.add(key)
+            params[key] = value
+
+        # --- field validation (all 422, no storage touched) -------------
+        tenant_id = params.get("tenant_id")
+        workload_id = params.get("workload_id")
+        if tenant_id is None or workload_id is None:
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        event_filter = params.get("event_id")
+        if event_filter is not None:
+            if not event_filter.strip() or not _UUID_RE.fullmatch(
+                event_filter.lower()
+            ):
+                raise HTTPException(
+                    status_code=422, detail="invalid event identifier"
+                )
+            event_filter = event_filter.lower()
+
+        event_type_filter = params.get("event_type")
+        if event_type_filter is not None:
+            if not event_type_filter.strip() or event_type_filter not in AUDIT_EVENT_TYPES:
+                raise HTTPException(status_code=422, detail="invalid event_type")
+
+        status_filter = params.get("status")
+        if status_filter is not None:
+            if not status_filter.strip() or status_filter not in AUDIT_EVENT_STATUS_CODES:
+                raise HTTPException(status_code=422, detail="invalid status")
+            status_bound = status_filter
+        else:
+            status_bound = ""
+
+        # Timestamp filters: absent means unbounded; an explicit empty or
+        # whitespace value is an illegal format (422), not "unbounded".
+        # Normalized bounds are embedded into the cursor so equivalent
+        # UTC spellings share a single cursor domain.
+        def _time_bound(value: str | None, name: str) -> tuple[str, datetime | None]:
+            if value is None:
+                return "", None
+            if not value.strip():
+                raise HTTPException(
+                    status_code=422, detail=f"{name} must be UTC RFC3339"
+                )
+            try:
+                parsed = _parse_utc_rfc3339(value)
+            except ValueError:
+                raise HTTPException(
+                    status_code=422, detail=f"{name} must be UTC RFC3339"
+                )
+            return _rfc3339(parsed), parsed
+
+        after_raw, after_dt = _time_bound(
+            params.get("occurred_after"), "occurred_after"
+        )
+        before_raw, before_dt = _time_bound(
+            params.get("occurred_before"), "occurred_before"
+        )
+        # Equality is a valid single-instant window; the lower bound must
+        # never be later than the upper bound.
+        if after_dt is not None and before_dt is not None and after_dt > before_dt:
+            raise HTTPException(
+                status_code=422,
+                detail="occurred_after must not be later than occurred_before",
+            )
+
+        # An omitted cursor or an explicit empty string means the
+        # beginning of the scope (before the smallest event position).
+        cursor = params.get("cursor")
+        if cursor is None or cursor == "":
+            boundary_dt: datetime | None = None
+            boundary_event = ""
+        else:
+            if not cursor.strip() or not _CURSOR_RE.fullmatch(cursor):
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            boundary = _decode_compliance_audit_cursor(
+                cursor,
+                tenant_id,
+                workload_id,
+                event_id=event_filter or "",
+                event_type=event_type_filter or "",
+                status=status_bound,
+                occurred_after=after_raw,
+                occurred_before=before_raw,
+            )
+            if boundary is None:
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            boundary_dt, boundary_event = boundary
+
+        # --- read-only audit scan ---------------------------------------
+        try:
+            with session_factory() as session:
+                # An explicit event id must identify an event in exactly
+                # this scope; an unknown or cross-scope event is a 404
+                # rather than an empty-looking page.
+                if event_filter is not None:
+                    event_row = session.get(AuditEvent, event_filter)
+                    if (
+                        event_row is None
+                        or event_row.tenant_id != tenant_id
+                        or event_row.workload_id != workload_id
+                    ):
+                        raise HTTPException(
+                            status_code=404, detail="audit event not found"
+                        )
+
+                stmt = select(AuditEvent).where(
+                    AuditEvent.tenant_id == tenant_id,
+                    AuditEvent.workload_id == workload_id,
+                )
+                if event_filter is not None:
+                    stmt = stmt.where(AuditEvent.event_id == event_filter)
+                if event_type_filter is not None:
+                    stmt = stmt.where(AuditEvent.event_type == event_type_filter)
+                if status_bound:
+                    stmt = stmt.where(AuditEvent.status == status_bound)
+                if after_dt is not None:
+                    stmt = stmt.where(AuditEvent.occurred_at >= after_dt)
+                if before_dt is not None:
+                    stmt = stmt.where(AuditEvent.occurred_at <= before_dt)
+                if boundary_dt is not None:
+                    # Exclusive composite keyset position:
+                    # (occurred_at, event_id) strictly greater.
+                    stmt = stmt.where(
+                        or_(
+                            AuditEvent.occurred_at > boundary_dt,
+                            and_(
+                                AuditEvent.occurred_at == boundary_dt,
+                                AuditEvent.event_id > boundary_event,
+                            ),
+                        )
+                    )
+                stmt = (
+                    stmt.order_by(
+                        AuditEvent.occurred_at.asc(), AuditEvent.event_id.asc()
+                    )
+                    .limit(COMPLIANCE_AUDIT_PAGE_SIZE + 1)
+                )
+
+                # A single read-only statement: a storage failure aborts
+                # the whole request with a 500 rather than a partial page.
+                rows = list(session.scalars(stmt))
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("compliance audit query failed")
+            raise HTTPException(
+                status_code=500, detail="compliance audit unavailable"
+            )
+
+        has_more = len(rows) > COMPLIANCE_AUDIT_PAGE_SIZE
+        page = rows[:COMPLIANCE_AUDIT_PAGE_SIZE]
+
+        events = [
+            {
+                "event_id": row.event_id,
+                "event_type": row.event_type,
+                # Grant linkage is present only on grant lifecycle events;
+                # rewrap events carry null grant/decision identifiers.
+                "grant_id": row.grant_id,
+                "decision_id": row.decision_id,
+                "data_id": row.data_id,
+                "status": row.status,
+                "occurred_at": _rfc3339(row.occurred_at),
+                # The capability appears only as its SHA-256 digest, and
+                # only on grant events; the plaintext never exists here.
+                "capability_sha256": row.capability_sha256,
+            }
+            for row in page
+        ]
+
+        if has_more:
+            last = page[-1]
+            next_cursor = _encode_compliance_audit_cursor(
+                tenant_id,
+                workload_id,
+                _rfc3339(last.occurred_at),
+                last.event_id,
+                event_id=event_filter or "",
+                event_type=event_type_filter or "",
+                status=status_bound,
+                occurred_after=after_raw,
+                occurred_before=before_raw,
+            )
+            complete = False
+        else:
+            next_cursor = ""
+            complete = True
+
+        # Compact JSON in the fixed key order, terminated by one newline.
+        # Every value is a string, null or boolean: no floats (so no -0.0
+        # or non-finite values) ever appear.
+        body = (
+            json.dumps(
+                {
+                    "events": events,
+                    "next_cursor": next_cursor,
+                    "complete": complete,
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
+
     @app.post(
         "/v1/release-grants/{grant_id}/consume",
         response_model=ReleaseGrantConsumedResponse,
@@ -1698,6 +2148,12 @@ def create_app(
                         status_code=409, detail="grant already revoked"
                     )
                 raise HTTPException(status_code=410, detail="grant expired")
+            # The settlement event joins the same transaction as the
+            # guarded status flip, so a consumed grant always has exactly
+            # one consumed compliance event and a losing request writes none.
+            session.add(
+                _grant_audit_event(grant, status="consumed", occurred_at=now)
+            )
             session.commit()
             decision_id = grant.decision_id
             data_id = grant.data_id
@@ -1793,6 +2249,12 @@ def create_app(
                         status_code=409, detail="grant already revoked"
                     )
                 raise HTTPException(status_code=410, detail="grant expired")
+            # The settlement event joins the same transaction as the
+            # guarded status flip, so a revoked grant always has exactly
+            # one revoked compliance event and a losing request writes none.
+            session.add(
+                _grant_audit_event(grant, status="revoked", occurred_at=now)
+            )
             session.commit()
             decision_id = grant.decision_id
             data_id = grant.data_id
@@ -1923,6 +2385,12 @@ def create_app(
                         status_code=409, detail="grant already revoked"
                     )
                 raise HTTPException(status_code=410, detail="grant expired")
+            # The settlement event joins the same transaction as the
+            # guarded status flip: a successful payload release is a grant
+            # consumption, recorded exactly once across release/consume.
+            session.add(
+                _grant_audit_event(grant, status="consumed", occurred_at=now)
+            )
             session.commit()
 
         # The plaintext exists only in this local value; it is never
@@ -2388,7 +2856,12 @@ def create_app(
                         new_version = current_version
 
                 # Independent per-envelope commit: one audit row each,
-                # durable before the next envelope is attempted.
+                # durable before the next envelope is attempted. The
+                # compliance event is inserted in the same transaction;
+                # only rewrapped/skipped outcomes are events — a page that
+                # stops on a failed envelope commits that outcome solely in
+                # the batch audit via _record_stop and emits no event.
+                item_occurred_at = _utcnow()
                 session.add(
                     RewrapBatchItem(
                         item_id=str(uuid.uuid4()),
@@ -2400,7 +2873,21 @@ def create_app(
                         new_key_version=new_version,
                         result=result,
                         seq=counts["processed"],
-                        created_at=_utcnow(),
+                        created_at=item_occurred_at,
+                    )
+                )
+                session.add(
+                    AuditEvent(
+                        event_id=str(uuid.uuid4()),
+                        tenant_id=body.tenant_id,
+                        workload_id=body.workload_id,
+                        event_type="rewrap",
+                        grant_id=None,
+                        decision_id=None,
+                        data_id=data_id,
+                        status=result,
+                        capability_sha256=None,
+                        occurred_at=item_occurred_at,
                     )
                 )
                 counts["processed"] += 1
