@@ -451,6 +451,93 @@ def test_release_rejects_non_object_body(client):
     ).status_code == 422
 
 
+@pytest.mark.parametrize(
+    "grant_id",
+    [
+        "not-a-uuid",
+        "12345",
+        "00000000000000000000000000000000",
+        "gggggggg-gggg-gggg-gggg-gggggggggggg",
+        "00000000-0000-0000-0000-00000000000",
+        "000000000-0000-0000-0000-000000000000",
+        " 00000000-0000-0000-0000-000000000000",
+        "00000000-0000-0000-0000-000000000000 ",
+        "00000000-0000-0000-0000-000000000000%0A",
+        "00000000-0000-0000-0000-000000000000%09",
+        "{00000000-0000-0000-0000-000000000000}",
+        "urn:uuid:00000000-0000-0000-0000-000000000000",
+    ],
+)
+def test_release_invalid_path_identifier_returns_422(client, grant_id):
+    grant = _setup(client)
+    response = _release(client, grant_id, grant["capability"])
+    assert response.status_code == 422
+    assert "payload" not in response.text
+
+
+def test_release_empty_path_segment_returns_422(client):
+    grant = _setup(client)
+    response = client.post(
+        "/v1/release/",
+        json={
+            "tenant_id": TENANT,
+            "workload_id": WORKLOAD,
+            "data_id": DATA_ID,
+            "capability": grant["capability"],
+        },
+    )
+    assert response.status_code == 422
+    assert PAYLOAD not in response.text
+
+
+def test_release_422_path_identifier_neither_decrypts_nor_writes_state(
+    client, app
+):
+    grant = _setup(client)
+    from proof_release.db import AuditEvent
+
+    with app.state.session_factory() as session:
+        before = session.query(AuditEvent).count()
+
+    for bad in ("not-a-uuid", "%20%20", "00000000000000000000000000000000"):
+        response = client.post(
+            f"/v1/release/{bad}",
+            json={
+                "tenant_id": TENANT,
+                "workload_id": WORKLOAD,
+                "data_id": DATA_ID,
+                "capability": grant["capability"],
+            },
+        )
+        assert response.status_code == 422
+
+    with app.state.session_factory() as session:
+        row = session.get(ReleaseGrant, grant["grant_id"])
+        assert row.status == "pending"
+        assert row.consumed_at is None
+        assert session.query(AuditEvent).count() == before
+
+    # The grant remains fully usable: one release still succeeds.
+    ok = _release(client, grant["grant_id"], grant["capability"])
+    assert ok.status_code == 200
+    assert ok.json()["payload"] == PAYLOAD
+
+
+def test_release_accepts_uppercase_path_uuid(client):
+    grant = _setup(client)
+    response = _release(client, grant["grant_id"].upper(), grant["capability"])
+    assert response.status_code == 200
+    assert response.json()["payload"] == PAYLOAD
+
+
+def test_release_valid_uuid_path_unknown_row_returns_404(client):
+    _decision(client)
+    response = _release(
+        client, "00000000-0000-0000-0000-000000000000", "A" * 43
+    )
+    assert response.status_code == 404
+
+
 def test_concurrent_releases_only_one_succeeds(app):
     client = TestClient(app)
     grant = _setup(client)

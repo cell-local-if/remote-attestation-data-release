@@ -573,6 +573,12 @@ def test_revoke_rejects_non_object_body(client):
         "gggggggg-gggg-gggg-gggg-gggggggggggg",
         "00000000-0000-0000-0000-00000000000",
         "000000000-0000-0000-0000-000000000000",
+        " 00000000-0000-0000-0000-000000000000",
+        "00000000-0000-0000-0000-000000000000 ",
+        "00000000-0000-0000-0000-000000000000%0A",
+        "00000000-0000-0000-0000-000000000000%09",
+        "{00000000-0000-0000-0000-000000000000}",
+        "urn:uuid:00000000-0000-0000-0000-000000000000",
     ],
 )
 def test_revoke_invalid_path_identifier_returns_422(client, grant_id):
@@ -597,6 +603,30 @@ def test_revoke_empty_path_segment_returns_422(client):
     assert client.post(
         "/v1/release-grants//revoke", json=body
     ).status_code == 422
+
+
+def test_revoke_422_path_identifier_writes_no_state_or_audit(client, app):
+    from proof_release.db import AuditEvent
+
+    grant = _setup(client)
+    with app.state.session_factory() as session:
+        before_events = session.query(AuditEvent).count()
+
+    for bad in ("not-a-uuid", "00000000000000000000000000000000", "  "):
+        response = _revoke(client, bad, grant["capability"])
+        assert response.status_code == 422
+
+    with app.state.session_factory() as session:
+        row = session.get(ReleaseGrant, grant["grant_id"])
+        assert row.status == "pending"
+        assert row.revoked_at is None
+        assert row.consumed_at is None
+        assert session.query(AuditEvent).count() == before_events
+    # The grant remains fully revocable afterwards.
+    assert (
+        _revoke(client, grant["grant_id"], grant["capability"]).status_code
+        == 200
+    )
 
 
 def test_revoke_valid_uuid_path_unknown_row_returns_404(client):
