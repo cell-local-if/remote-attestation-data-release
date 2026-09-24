@@ -58,6 +58,7 @@ from proof_release.db import (
     Decision,
     Evidence,
     Policy,
+    RateLimitWindow,
     ReleaseGrant,
     RewrapBatch,
     RewrapBatchItem,
@@ -107,6 +108,12 @@ REWRAP_BATCH_MAX_LIMIT = 200
 #: listing is cursor-driven; the page size is an internal constant and is
 #: never part of the request or response contract.
 RELEASE_GRANT_AUDIT_PAGE_SIZE = 100
+
+#: Field-valid requests admitted per (tenant, workload) scope and UTC
+#: minute, shared across the release-grant consume, revoke and
+#: payload-release endpoints. The sixth valid request within the same
+#: scope and minute is rejected with 429.
+RATE_LIMIT_PER_MINUTE = 5
 
 #: Discriminator embedded in release-grant audit cursors so a rewrap-batch
 #: cursor (authenticated with the same secret) can never be replayed here
@@ -912,6 +919,87 @@ def create_app(
     app.state.engine = engine
     app.state.session_factory = session_factory
     app.state.verifier_registry = registry
+
+    def _scope_budget_acquire(
+        tenant_id: str, workload_id: str, now: datetime
+    ) -> bool:
+        """Consume one unit of the scope's per-minute request budget.
+
+        Returns ``True`` when the request is admitted (its budget unit is
+        committed before this returns, regardless of the request's later
+        outcome) and ``False`` when the scope's current UTC-minute window
+        is already full. The counter lives in the database, so the budget
+        is shared by the consume/revoke/release endpoints, across
+        processes, and survives restarts. The guarded increment plus the
+        (scope, window) primary key make concurrent acquisitions exact:
+        more than RATE_LIMIT_PER_MINUTE simultaneous valid requests admit
+        exactly RATE_LIMIT_PER_MINUTE winners.
+        """
+        window_minute = int(now.timestamp() // 60)
+        increment = (
+            update(RateLimitWindow)
+            .where(
+                RateLimitWindow.tenant_id == tenant_id,
+                RateLimitWindow.workload_id == workload_id,
+                RateLimitWindow.window_minute == window_minute,
+                RateLimitWindow.used < RATE_LIMIT_PER_MINUTE,
+            )
+            .values(used=RateLimitWindow.used + 1)
+            .execution_options(synchronize_session=False)
+        )
+        with session_factory() as session:
+            result = session.execute(increment)
+            if result.rowcount == 1:
+                session.commit()
+                return True
+            session.rollback()
+        # No row for this window yet (or it is already full). Try to open
+        # the window; the primary key rejects the insert if a concurrent
+        # request created the row first.
+        with session_factory() as session:
+            session.add(
+                RateLimitWindow(
+                    tenant_id=tenant_id,
+                    workload_id=workload_id,
+                    window_minute=window_minute,
+                    used=1,
+                )
+            )
+            try:
+                session.commit()
+                return True
+            except IntegrityError:
+                session.rollback()
+        # A concurrent request opened the window first; take a slot from
+        # it. If this also misses, the window is genuinely full.
+        with session_factory() as session:
+            result = session.execute(increment)
+            if result.rowcount == 1:
+                session.commit()
+                return True
+            session.rollback()
+        return False
+
+    def _rate_limited_response(now: datetime) -> Response:
+        """Compact 429 body: only the whole seconds left in the window.
+
+        ``retry_after_seconds`` is the number of full seconds until the
+        current UTC minute window closes — always a positive integer in
+        [1, 60], never a float. Repeating a limited request changes
+        nothing: no budget is consumed and the window is not extended.
+        """
+        retry_after = 60 - now.second
+        body = (
+            json.dumps(
+                {"retry_after_seconds": retry_after},
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(
+            content=body, status_code=429, media_type="application/json"
+        )
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -2067,9 +2155,14 @@ def create_app(
     )
     def consume_release_grant(
         grant_id: str, body: ConsumeReleaseGrantRequest
-    ) -> ReleaseGrantConsumedResponse:
-        digest = _nonce_digest(body.capability)
+    ) -> ReleaseGrantConsumedResponse | Response:
+        # Field validation (the request model) ran before this handler;
+        # every syntactically valid, scoped request consumes one unit of
+        # the shared per-minute budget whatever its later outcome.
         now = _utcnow()
+        if not _scope_budget_acquire(body.tenant_id, body.workload_id, now):
+            return _rate_limited_response(now)
+        digest = _nonce_digest(body.capability)
         with session_factory() as session:
             grant = session.get(ReleaseGrant, grant_id)
             if (
@@ -2156,7 +2249,7 @@ def create_app(
     )
     def revoke_release_grant(
         grant_id: str, body: RevokeReleaseGrantRequest
-    ) -> ReleaseGrantRevokedResponse:
+    ) -> ReleaseGrantRevokedResponse | Response:
         # Grant ids are canonical lowercase UUIDs; a syntactically illegal
         # path identifier is a 422 field error indistinguishable from any
         # other bad input, never a lookup.
@@ -2164,8 +2257,12 @@ def create_app(
             raise HTTPException(status_code=422, detail="invalid grant identifier")
         grant_id = grant_id.strip().lower()
 
-        digest = _nonce_digest(body.capability)
+        # Only requests that passed every field/identifier validation
+        # consume budget; the 422 above does not.
         now = _utcnow()
+        if not _scope_budget_acquire(body.tenant_id, body.workload_id, now):
+            return _rate_limited_response(now)
+        digest = _nonce_digest(body.capability)
         with session_factory() as session:
             grant = session.get(ReleaseGrant, grant_id)
             # The path grant must belong to exactly the body's tenant and
@@ -2268,8 +2365,15 @@ def create_app(
         pending and writes no consumption audit, and a revocation that
         settles first makes this path observe 409 without releasing.
         """
-        digest = _nonce_digest(body.capability)
+        # Field validation (the request model) ran before this handler;
+        # every syntactically valid, scoped request consumes one unit of
+        # the shared per-minute budget whatever its later outcome. A
+        # limited request returns 429 before any lookup, decryption or
+        # state change.
         now = _utcnow()
+        if not _scope_budget_acquire(body.tenant_id, body.workload_id, now):
+            return _rate_limited_response(now)
+        digest = _nonce_digest(body.capability)
         with session_factory() as session:
             grant = session.get(ReleaseGrant, grant_id)
             if (

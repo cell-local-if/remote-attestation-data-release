@@ -324,6 +324,26 @@ class ReleaseGrant(Base):
     )
 
 
+class RateLimitWindow(Base):
+    """Per-scope request budget for one UTC minute window.
+
+    One row per (tenant, workload, UTC minute), shared by the release-grant
+    consume, revoke and payload-release endpoints. ``used`` counts the
+    field-valid requests admitted into business judgement during that
+    minute; the only writer is the guarded increment in the app layer, so
+    the count is exact under concurrency and survives process restarts.
+    Rows from past minutes are never updated again.
+    """
+
+    __tablename__ = "rate_limit_windows"
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # UTC minute the window covers, as whole minutes since the Unix epoch.
+    window_minute: Mapped[int] = mapped_column(Integer, primary_key=True)
+    used: Mapped[int] = mapped_column(Integer, default=0)
+
+
 class RewrapBatch(Base):
     """One page of a scoped, cursor-driven envelope rewrap batch.
 

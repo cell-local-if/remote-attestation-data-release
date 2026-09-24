@@ -783,7 +783,10 @@ def test_query_writes_no_state(app, client):
 def test_concurrent_settlement_then_replay_remains_stable(app):
     client = TestClient(app)
     decision = _decision(client)
-    grants = [_mint(client, decision["decision_id"], data_id=f"d{i}") for i in range(6)]
+    # Eight grants fill two pages of three with room to spare; the five
+    # concurrent settlements exactly exhaust the scope's per-minute
+    # admission budget shared by consume/revoke/release.
+    grants = [_mint(client, decision["decision_id"], data_id=f"d{i}") for i in range(8)]
 
     import proof_release.app as app_module
 
@@ -813,7 +816,7 @@ def test_concurrent_settlement_then_replay_remains_stable(app):
             assert response.status_code == 200
 
         with ThreadPoolExecutor(max_workers=4) as pool:
-            list(pool.map(settle, range(6)))
+            list(pool.map(settle, range(5)))
 
         # Replaying the cursor returns the identical page of pre-existing
         # events; newly committed settlement events appear only on later
@@ -835,8 +838,8 @@ def test_concurrent_settlement_then_replay_remains_stable(app):
             token = data["next_cursor"]
         keys = [(row["occurred_at"], row["event_id"]) for row in all_rows]
         assert keys == sorted(keys)
-        assert len(keys) == 12  # 6 pending + 6 settlement events
-        assert len({key[1] for key in keys}) == 12
+        assert len(keys) == 13  # 8 pending + 5 settlement events
+        assert len({key[1] for key in keys}) == 13
     finally:
         app_module.AUDIT_EVENT_PAGE_SIZE = 100
 

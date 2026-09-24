@@ -468,8 +468,12 @@ def test_concurrent_releases_only_one_succeeds(app):
     with ThreadPoolExecutor(max_workers=8) as pool:
         statuses = list(pool.map(lambda _: release(), range(16)))
 
+    # The shared per-scope minute budget admits exactly five of the
+    # sixteen valid requests; the rest are rate-limited. Of the admitted
+    # five, exactly one releases the payload and the others observe 409.
     assert statuses.count(200) == 1
-    assert statuses.count(409) == 15
+    assert statuses.count(409) == 4
+    assert statuses.count(429) == 11
 
 
 def test_concurrent_release_and_consume_share_single_win(app):
@@ -501,8 +505,12 @@ def test_concurrent_release_and_consume_share_single_win(app):
     with ThreadPoolExecutor(max_workers=8) as pool:
         statuses = list(pool.map(call, range(16)))
 
+    # Five admissions under the shared per-scope minute budget: exactly
+    # one legal settlement across both operations; the other admitted
+    # requests observe 409 and the rest are rate-limited.
     assert statuses.count(200) == 1
-    assert all(code in (200, 409) for code in statuses)
+    assert statuses.count(409) == 4
+    assert statuses.count(429) == 11
     with app.state.session_factory() as session:
         row = session.get(ReleaseGrant, grant["grant_id"])
         assert row.status == "consumed"
