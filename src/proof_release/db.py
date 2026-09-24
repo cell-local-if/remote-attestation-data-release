@@ -37,13 +37,21 @@ DECISION_STATUS_DENIED = "denied"
 DECISION_STATUS_CODES = frozenset({DECISION_STATUS_ALLOWED, DECISION_STATUS_DENIED})
 
 #: Finite, service-defined set of persisted release-grant statuses. A grant
-#: is born pending and settles atomically to consumed on its first (and
-#: only) successful presentation; expiry is derived from expires_at rather
-#: than stored as a status.
+#: is born pending and settles atomically, exactly once, to either consumed
+#: (its first successful presentation/payload release) or revoked (an
+#: explicit revocation while still pending). Revoke, consume and release
+#: share this single guarded state, so the three operations race as peers
+#: with at most one winner. Expiry is derived from expires_at rather than
+#: stored as a status.
 RELEASE_GRANT_STATUS_PENDING = "pending"
 RELEASE_GRANT_STATUS_CONSUMED = "consumed"
+RELEASE_GRANT_STATUS_REVOKED = "revoked"
 RELEASE_GRANT_STATUS_CODES = frozenset(
-    {RELEASE_GRANT_STATUS_PENDING, RELEASE_GRANT_STATUS_CONSUMED}
+    {
+        RELEASE_GRANT_STATUS_PENDING,
+        RELEASE_GRANT_STATUS_CONSUMED,
+        RELEASE_GRANT_STATUS_REVOKED,
+    }
 )
 
 #: Per-envelope outcome codes recorded by a rewrap batch. ``rewrapped``
@@ -248,9 +256,14 @@ class ReleaseGrant(Base):
     """A one-time, TTL-bounded capability that releases one data item.
 
     A grant can only be minted for an ``allowed`` decision in the same
-    tenant/workload scope. Exactly one consume may ever succeed: the first
-    caller that presents the correct capability while the grant is pending
-    and unexpired atomically settles it to ``consumed``.
+    tenant/workload scope. It settles exactly once: the first caller that
+    presents the correct capability while the grant is pending and
+    unexpired atomically settles it to ``consumed`` (via the consume or
+    payload-release endpoints), or a valid revocation atomically settles
+    it to ``revoked``. All three paths drive the same guarded
+    pending -> terminal transition, so a revoked grant can never be
+    consumed or released and vice versa; losers only observe the final
+    state and write nothing of their own.
 
     The plaintext capability is never stored — only its SHA-256 digest —
     and it is returned exactly once, on the create response. The row stores
@@ -269,11 +282,17 @@ class ReleaseGrant(Base):
     data_id: Mapped[str] = mapped_column(String(256))
     # Only the SHA-256 digest of the capability is persisted.
     capability_digest: Mapped[str] = mapped_column(String(64))
-    # pending -> consumed, settled atomically on the first valid consume.
+    # pending -> consumed | revoked, settled atomically on the first valid
+    # consume, release or revocation.
     status: Mapped[str] = mapped_column(String(16), default="pending")
     issued_at: Mapped[datetime] = mapped_column(UTCDateTime())
     expires_at: Mapped[datetime] = mapped_column(UTCDateTime())
     consumed_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
+    # Set only by the single winning pending -> revoked transition; a
+    # repeat revocation returns this same timestamp and never writes.
+    revoked_at: Mapped[datetime | None] = mapped_column(
         UTCDateTime(), nullable=True
     )
 
