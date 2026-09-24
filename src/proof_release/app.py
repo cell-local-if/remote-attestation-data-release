@@ -53,6 +53,7 @@ from proof_release.db import (
     AUDIT_EVENT_STATUS_CODES,
     AuditEvent,
     Base,
+    CertificateRevocation,
     Challenge,
     DataEnvelope,
     Decision,
@@ -130,6 +131,28 @@ _CURSOR_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
+#: A certificate fingerprint is the unpadded base64url encoding of the
+#: 32-byte SHA-256 of the certificate's DER, which is exactly 43 characters.
+_FINGERPRINT_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+
+
+def _certificate_fingerprint_format(value: str) -> str:
+    """Validate a certificate fingerprint as canonical 32-byte base64url.
+
+    Beyond the alphabet and length, the encoding must be canonical: the
+    two spare bits of the final character must be zero, which the
+    decode/re-encode round trip enforces.
+    """
+    if not _FINGERPRINT_RE.fullmatch(value):
+        raise ValueError(
+            "certificate_fingerprint must be unpadded base64url of 32 bytes"
+        )
+    raw = base64.urlsafe_b64decode(value + "=")
+    if len(raw) != 32 or b64url_encode(raw) != value:
+        raise ValueError(
+            "certificate_fingerprint must be unpadded base64url of 32 bytes"
+        )
+    return value
 
 
 def _utcnow() -> datetime:
@@ -237,6 +260,66 @@ def _parse_utc_rfc3339(value: str) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
         raise ValueError("timestamp must be UTC RFC3339")
     return parsed.astimezone(timezone.utc)
+
+
+def _x509_chain_revoked(
+    session, evidence: str, tenant_id: str, workload_id: str, now: datetime
+) -> bool:
+    """Return True when any certificate of an X.509 evidence chain is revoked.
+
+    The evidence document is re-parsed just far enough to recover the
+    certificate chain the verifier already accepted; the SHA-256 of each
+    certificate's DER (root, intermediates and leaf alike) is compared, in
+    the registered unpadded-base64url fingerprint form, against revocations
+    under the trust root the chain anchors to in exactly this scope. Only
+    registrations whose effective time has been reached apply. A document
+    that cannot be re-parsed is treated as unrevoked — the verifier's own
+    verdict already covers malformed evidence.
+    """
+    try:
+        document = json.loads(evidence)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    if not isinstance(document, dict):
+        return False
+    chain_pems = document.get("certificate_chain")
+    if not isinstance(chain_pems, list) or not chain_pems:
+        return False
+    certificates = []
+    for pem in chain_pems:
+        if not isinstance(pem, str):
+            return False
+        try:
+            certificates.append(x509.load_pem_x509_certificate(pem.encode("utf-8")))
+        except Exception:
+            return False
+    der_hashes = [
+        hashlib.sha256(certificate.public_bytes(Encoding.DER)).digest()
+        for certificate in certificates
+    ]
+    fingerprints = [b64url_encode(digest) for digest in der_hashes]
+    # The verifier accepted, so the chain root is byte-identical to a trust
+    # root configured for exactly this tenant and workload; resolve that
+    # root to scope the revocation lookup.
+    root = session.scalar(
+        select(TrustRoot).where(
+            TrustRoot.tenant_id == tenant_id,
+            TrustRoot.workload_id == workload_id,
+            TrustRoot.cert_sha256 == der_hashes[-1].hex(),
+        )
+    )
+    if root is None:
+        return False
+    match = session.scalar(
+        select(CertificateRevocation.revocation_id)
+        .where(
+            CertificateRevocation.trust_root_id == root.root_id,
+            CertificateRevocation.cert_fingerprint.in_(fingerprints),
+            CertificateRevocation.effective_at <= now,
+        )
+        .limit(1)
+    )
+    return match is not None
 
 
 def _grant_audit_cursor_payload(
@@ -627,6 +710,40 @@ class TrustRootCreatedResponse(BaseModel):
     workload_id: str
     name: str | None
     created_at: str
+
+
+class CreateRevocationRequest(BaseModel):
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    trust_root_id: StrictStr = Field(min_length=1)
+    certificate_fingerprint: StrictStr = Field(min_length=1)
+    effective_at: StrictStr = Field(min_length=1)
+
+    _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
+
+    @field_validator("trust_root_id")
+    @classmethod
+    def _trust_root_id_canonical(cls, value: str) -> str:
+        # Only the canonical lowercase hyphenated UUID form is accepted;
+        # blank, padded, uppercase or otherwise non-canonical spellings
+        # are field errors decided before any state is read or written.
+        if not _UUID_RE.fullmatch(value):
+            raise ValueError("trust_root_id must be a canonical UUID")
+        return value
+
+    _fingerprint_valid = field_validator("certificate_fingerprint")(
+        _certificate_fingerprint_format
+    )
+
+    @field_validator("effective_at")
+    @classmethod
+    def _effective_at_utc(cls, value: str) -> str:
+        # The effective time must explicitly denote UTC (zero offset).
+        try:
+            _parse_utc_rfc3339(value)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        return value
 
 
 class CreatePolicyRequest(BaseModel):
@@ -1162,6 +1279,33 @@ def create_app(
                     type(exc).__name__,
                 )
                 raise HTTPException(status_code=500, detail="verification failed")
+            # Revocation enforcement applies to the built-in X.509 format
+            # only: an accepted chain is re-checked against the effective
+            # revocations registered under its trust root. A revocation-store
+            # failure is a 500 that leaves the evidence received (it can be
+            # verified again once the store recovers); a match flips the
+            # verdict to rejected before the atomic settlement below, so
+            # exactly the registrations committed before settlement apply
+            # and later ones never rewrite a settled record.
+            if accepted and evidence.evidence_format == X509_ATTESTED_NONCE_JSON:
+                try:
+                    revoked = _x509_chain_revoked(
+                        session,
+                        body.evidence,
+                        body.tenant_id,
+                        body.workload_id,
+                        _utcnow(),
+                    )
+                except Exception:
+                    logger.error(
+                        "revocation lookup failed for evidence %s",
+                        evidence.evidence_id,
+                    )
+                    raise HTTPException(
+                        status_code=500, detail="verification failed"
+                    )
+                if revoked:
+                    accepted = False
             # The persisted outcome is a fixed, service-defined result code
             # derived solely from the accept/reject verdict. Any free-form
             # text the plugin attached to its result is discarded here and
@@ -1279,6 +1423,82 @@ def create_app(
             workload_id=body.workload_id,
             name=body.name,
             created_at=_rfc3339(now),
+        )
+
+    @app.post("/v1/revocations", status_code=201)
+    def create_revocation(body: CreateRevocationRequest) -> Response:
+        """Register a certificate revocation under one trust root.
+
+        All field validation (scope, canonical trust-root UUID, fingerprint
+        shape, explicit-UTC effective time) happens in the request model,
+        before any state is read or written. An unknown or cross-scope
+        trust root is an indistinguishable 404; the same fingerprint under
+        the same root is a 409, while any other fingerprint — or the same
+        fingerprint under another root — is independent. The row commits as
+        a single atomic write: a storage failure is a 500 with no partial
+        registration visible.
+        """
+        effective_at = _parse_utc_rfc3339(body.effective_at)
+        now = _utcnow()
+        revocation_id = str(uuid.uuid4())
+        with session_factory() as session:
+            root = session.get(TrustRoot, body.trust_root_id)
+            if (
+                root is None
+                or root.tenant_id != body.tenant_id
+                or root.workload_id != body.workload_id
+            ):
+                raise HTTPException(status_code=404, detail="trust root not found")
+            duplicate = session.scalar(
+                select(CertificateRevocation.revocation_id).where(
+                    CertificateRevocation.trust_root_id == body.trust_root_id,
+                    CertificateRevocation.cert_fingerprint
+                    == body.certificate_fingerprint,
+                )
+            )
+            if duplicate is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="certificate already revoked for this trust root",
+                )
+            session.add(
+                CertificateRevocation(
+                    revocation_id=revocation_id,
+                    tenant_id=body.tenant_id,
+                    workload_id=body.workload_id,
+                    trust_root_id=body.trust_root_id,
+                    cert_fingerprint=body.certificate_fingerprint,
+                    effective_at=effective_at,
+                    created_at=now,
+                )
+            )
+            try:
+                session.commit()
+            except IntegrityError:
+                # A concurrent request registered the same fingerprint
+                # under this root first; the unique constraint guarantees
+                # at most one winner and every loser a stable 409.
+                session.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail="certificate already revoked for this trust root",
+                )
+            except Exception:
+                session.rollback()
+                logger.error("certificate revocation write failed")
+                raise HTTPException(status_code=500, detail="revocation unavailable")
+        body_bytes = json.dumps(
+            {
+                "revocation_id": revocation_id,
+                "trust_root_id": body.trust_root_id,
+                "certificate_fingerprint": body.certificate_fingerprint,
+                "effective_at": _rfc3339(effective_at),
+            },
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return Response(
+            content=body_bytes, media_type="application/json", status_code=201
         )
 
     @app.post("/v1/policies", status_code=201, response_model=PolicyCreatedResponse)

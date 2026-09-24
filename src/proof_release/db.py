@@ -184,6 +184,51 @@ class TrustRoot(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
+class CertificateRevocation(Base):
+    """A registered certificate revocation scoped to one trust root.
+
+    The row binds the SHA-256 fingerprint of a revoked certificate's DER
+    encoding (unpadded base64url, 43 characters) to the trust root the
+    registration was made under, within that root's tenant/workload scope.
+    At most one registration exists per (trust root, fingerprint): the
+    unique constraint is what makes concurrent duplicate registrations
+    settle on exactly one winner. ``effective_at`` is the explicit UTC
+    instant from which the revocation applies; X.509 evidence verified at
+    or after that instant settles as rejected. Only identifiers, the
+    fingerprint and timestamps are stored — never certificate material.
+    """
+
+    __tablename__ = "certificate_revocations"
+    __table_args__ = (
+        UniqueConstraint(
+            "trust_root_id",
+            "cert_fingerprint",
+            name="uq_revocation_root_fingerprint",
+        ),
+        # Covers the verify-time lookup of effective revocations under one
+        # trust root.
+        Index(
+            "ix_revocations_root_effective",
+            "trust_root_id",
+            "effective_at",
+        ),
+    )
+
+    revocation_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # The trust root (and thereby the tenant/workload scope) this
+    # revocation is registered under.
+    trust_root_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("trust_roots.root_id"), index=True
+    )
+    # Unpadded base64url of the 32-byte SHA-256 of the certificate's DER.
+    cert_fingerprint: Mapped[str] = mapped_column(String(43))
+    # Explicit UTC instant from which the revocation takes effect.
+    effective_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class Policy(Base):
     """A versioned release policy scoped to a tenant and workload.
 
