@@ -634,8 +634,11 @@ def test_concurrent_revokes_only_one_succeeds(app):
     with ThreadPoolExecutor(max_workers=8) as pool:
         statuses = list(pool.map(lambda _: call(), range(16)))
 
+    # The per-scope rate budget admits exactly five requests into business
+    # judgement: one wins, four observe 409, the remaining eleven are 429.
     assert statuses.count(200) == 1
-    assert statuses.count(409) == 15
+    assert statuses.count(409) == 4
+    assert statuses.count(429) == 11
     with app.state.session_factory() as session:
         row = session.get(ReleaseGrant, grant["grant_id"])
         assert row.status == "revoked"
@@ -669,10 +672,12 @@ def test_concurrent_revoke_and_consume_single_win(app):
     with ThreadPoolExecutor(max_workers=8) as pool:
         statuses = list(pool.map(call, range(16)))
 
-    # Exactly one legal settlement across both operations; every loser
-    # observes the final state as 409, nothing else.
+    # Exactly one legal settlement across both operations. The rate budget
+    # admits five requests into judgement; every loser there observes the
+    # final state as 409, and requests beyond the budget are 429.
     assert statuses.count(200) == 1
-    assert all(code in (200, 409) for code in statuses)
+    assert statuses.count(409) == 4
+    assert statuses.count(429) == 11
     with app.state.session_factory() as session:
         row = session.get(ReleaseGrant, grant["grant_id"])
         assert row.status in ("revoked", "consumed")
@@ -713,8 +718,11 @@ def test_concurrent_revoke_and_release_single_win(app):
     with ThreadPoolExecutor(max_workers=8) as pool:
         statuses = list(pool.map(call, range(16)))
 
+    # Exactly one legal settlement across both operations. The rate budget
+    # admits five requests into judgement; the rest are 429.
     assert statuses.count(200) == 1
-    assert all(code in (200, 409) for code in statuses)
+    assert statuses.count(409) == 4
+    assert statuses.count(429) == 11
     with app.state.session_factory() as session:
         row = session.get(ReleaseGrant, grant["grant_id"])
         assert row.status in ("revoked", "consumed")

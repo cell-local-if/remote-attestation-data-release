@@ -431,8 +431,11 @@ def test_concurrent_consume_only_one_succeeds(app):
     with ThreadPoolExecutor(max_workers=8) as pool:
         statuses = list(pool.map(lambda _: consume(), range(16)))
 
+    # The per-scope rate budget admits exactly five requests into business
+    # judgement: one wins, four observe 409, the remaining eleven are 429.
     assert statuses.count(200) == 1
-    assert statuses.count(409) == 15
+    assert statuses.count(409) == 4
+    assert statuses.count(429) == 11
 
     with app.state.session_factory() as session:
         row = session.get(ReleaseGrant, grant["grant_id"])

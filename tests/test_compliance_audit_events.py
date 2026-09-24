@@ -812,8 +812,11 @@ def test_concurrent_settlement_then_replay_remains_stable(app):
             )
             assert response.status_code == 200
 
+        # Settle five of the six grants: exactly the per-scope per-minute
+        # rate budget shared by the consume/revoke endpoints, so every
+        # settlement is admitted into business judgement.
         with ThreadPoolExecutor(max_workers=4) as pool:
-            list(pool.map(settle, range(6)))
+            list(pool.map(settle, range(5)))
 
         # Replaying the cursor returns the identical page of pre-existing
         # events; newly committed settlement events appear only on later
@@ -835,8 +838,8 @@ def test_concurrent_settlement_then_replay_remains_stable(app):
             token = data["next_cursor"]
         keys = [(row["occurred_at"], row["event_id"]) for row in all_rows]
         assert keys == sorted(keys)
-        assert len(keys) == 12  # 6 pending + 6 settlement events
-        assert len({key[1] for key in keys}) == 12
+        assert len(keys) == 11  # 6 pending + 5 settlement events
+        assert len({key[1] for key in keys}) == 11
     finally:
         app_module.AUDIT_EVENT_PAGE_SIZE = 100
 

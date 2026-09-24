@@ -388,6 +388,31 @@ class RewrapBatchItem(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
+class RateLimitWindow(Base):
+    """Per-scope consumption counter for one UTC-minute rate-limit window.
+
+    One row exists per (tenant, workload, window start) that has seen at
+    least one field-valid authorization action (grant consume, grant
+    revoke or payload release). ``used`` counts how many such requests
+    have been admitted into business judgement during that window; it is
+    only ever incremented by a guarded UPDATE, so concurrent requests can
+    never race past the per-window budget. Rows persist in the same
+    database as everything else, so the count survives process restarts;
+    a new UTC minute simply keys a fresh row, which is how the budget
+    resets. Requests rejected for field/format errors (422) never touch
+    this table, and a rejected (429) request never increments ``used``.
+    """
+
+    __tablename__ = "rate_limit_windows"
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # Inclusive UTC start of the minute window, truncated to whole minutes.
+    window_start: Mapped[datetime] = mapped_column(UTCDateTime(), primary_key=True)
+    # Number of admitted requests in this window; never exceeds the budget.
+    used: Mapped[int] = mapped_column(Integer, default=0)
+
+
 class AuditEvent(Base):
     """Append-only, tenant-scoped compliance audit event.
 
