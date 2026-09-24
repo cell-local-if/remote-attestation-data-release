@@ -118,7 +118,7 @@ def test_consume_success_then_conflict(client):
 
 def test_consume_wrong_nonce_returns_401(client):
     created = _create(client).json()
-    wrong = "A" + created["nonce"][1:]
+    wrong = ("B" if created["nonce"][0] != "B" else "C") + created["nonce"][1:]
 
     response = _consume(client, created["challenge_id"], nonce=wrong)
 

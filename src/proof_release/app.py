@@ -24,6 +24,7 @@ from cryptography.hazmat.primitives.serialization import Encoding
 from proof_release.db import (
     DECISION_STATUS_ALLOWED,
     DECISION_STATUS_DENIED,
+    RELEASE_GRANT_STATUS_REVOKED,
     REWRAP_RESULT_KEYRING,
     REWRAP_RESULT_MISSING_KEY,
     REWRAP_RESULT_REWRAP_FAILED,
@@ -385,6 +386,28 @@ class ReleaseGrantConsumedResponse(BaseModel):
     consumed_at: str
 
 
+class RevokeReleaseGrantRequest(BaseModel):
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    capability: StrictStr = Field(min_length=1)
+
+    _non_blank = field_validator(
+        "tenant_id", "workload_id", "capability"
+    )(_require_non_blank)
+    # As on consume/release, malformed capability syntax is a field/format
+    # error (422); a well-formed value that simply does not match is an
+    # authentication failure (401).
+    _capability_valid = field_validator("capability")(_nonce_format)
+
+
+class ReleaseGrantRevokedResponse(BaseModel):
+    grant_id: str
+    decision_id: str
+    data_id: str
+    revoked: bool
+    revoked_at: str
+
+
 class ReleasePayloadRequest(BaseModel):
     tenant_id: StrictStr = Field(min_length=1)
     workload_id: StrictStr = Field(min_length=1)
@@ -486,6 +509,9 @@ def _migrate_additive(engine) -> None:
         "evidence": (
             ("verified_at", "DATETIME"),
             ("verification_result", "VARCHAR(16)"),
+        ),
+        "release_grants": (
+            ("revoked_at", "DATETIME"),
         ),
     }
     with engine.begin() as conn:
@@ -1209,14 +1235,21 @@ def create_app(
                 raise HTTPException(status_code=404, detail="grant not found")
             if not hmac.compare_digest(grant.capability_digest, digest):
                 raise HTTPException(status_code=401, detail="invalid capability")
+            # A settled grant can never be consumed: revocation is a
+            # terminal state exactly like consumed, and is judged before
+            # expiry so a grant revoked while pending is reported 409 even
+            # after it has since expired.
             if grant.status == "consumed":
                 raise HTTPException(status_code=409, detail="grant already consumed")
+            if grant.status == RELEASE_GRANT_STATUS_REVOKED:
+                raise HTTPException(status_code=409, detail="grant already revoked")
             if grant.expires_at <= now:
                 raise HTTPException(status_code=410, detail="grant expired")
             # Atomic claim: only one concurrent consumer can flip
             # pending -> consumed for an unexpired grant. BEGIN IMMEDIATE
             # (SQLite) / row locks (other backends) plus the guarded UPDATE
-            # guarantee exactly one winner across processes and restarts.
+            # guarantee exactly one winner across consume, release and
+            # revoke, across processes and restarts.
             result = session.execute(
                 update(ReleaseGrant)
                 .where(
@@ -1234,6 +1267,12 @@ def create_app(
                     raise HTTPException(
                         status_code=409, detail="grant already consumed"
                     )
+                if fresh is not None and fresh.status == RELEASE_GRANT_STATUS_REVOKED:
+                    # A concurrent revocation won the shared state; the
+                    # loser only observes the terminal revoked status.
+                    raise HTTPException(
+                        status_code=409, detail="grant already revoked"
+                    )
                 raise HTTPException(status_code=410, detail="grant expired")
             session.commit()
             decision_id = grant.decision_id
@@ -1246,19 +1285,115 @@ def create_app(
             consumed_at=_rfc3339(now),
         )
 
+    @app.post("/v1/release-grants//revoke")
+    def revoke_release_grant_identifier_required() -> Response:
+        # An empty path segment is a missing grant identifier: a 422
+        # client error rather than a routing-level 404.
+        raise HTTPException(status_code=422, detail="invalid grant identifier")
+
+    @app.post(
+        "/v1/release-grants/{grant_id}/revoke",
+        response_model=ReleaseGrantRevokedResponse,
+    )
+    def revoke_release_grant(
+        grant_id: str, body: RevokeReleaseGrantRequest
+    ) -> ReleaseGrantRevokedResponse:
+        # Grant ids are canonical lowercase UUIDs; a syntactically illegal
+        # path identifier is a 422 field error indistinguishable from any
+        # other bad input, never a lookup.
+        if not grant_id.strip() or not _UUID_RE.fullmatch(grant_id.lower()):
+            raise HTTPException(status_code=422, detail="invalid grant identifier")
+        grant_id = grant_id.strip().lower()
+
+        digest = _nonce_digest(body.capability)
+        now = _utcnow()
+        with session_factory() as session:
+            grant = session.get(ReleaseGrant, grant_id)
+            # The path grant must belong to exactly the body's tenant and
+            # workload; an unknown grant and an out-of-scope one are
+            # indistinguishable 404s.
+            if (
+                grant is None
+                or grant.tenant_id != body.tenant_id
+                or grant.workload_id != body.workload_id
+            ):
+                raise HTTPException(status_code=404, detail="grant not found")
+            # The capability is used only for this verification; its
+            # plaintext is never logged, persisted, or returned. A mismatch
+            # is an authentication failure that changes no state: the grant
+            # (and its pending/expired status) is left exactly as found.
+            if not hmac.compare_digest(grant.capability_digest, digest):
+                raise HTTPException(status_code=401, detail="invalid capability")
+            # Status is judged completely before any write. A settled grant
+            # always reports 409, even if it has since passed its expiry, so
+            # a repeated revoke observes the same outcome and never rewrites
+            # revoked_at; only a still-pending grant past its expiry reports
+            # 410.
+            if grant.status == "consumed":
+                raise HTTPException(status_code=409, detail="grant already consumed")
+            if grant.status == RELEASE_GRANT_STATUS_REVOKED:
+                raise HTTPException(status_code=409, detail="grant already revoked")
+            if grant.expires_at <= now:
+                raise HTTPException(status_code=410, detail="grant expired")
+            # Atomic settlement shared with the consume and release
+            # endpoints: only one concurrent caller can flip pending ->
+            # revoked for an unexpired grant. BEGIN IMMEDIATE (SQLite) /
+            # row locks (other backends) plus the guarded UPDATE guarantee
+            # that revocation, consumption and release have at most one
+            # winner across processes and restarts.
+            result = session.execute(
+                update(ReleaseGrant)
+                .where(
+                    ReleaseGrant.grant_id == grant_id,
+                    ReleaseGrant.status == "pending",
+                    ReleaseGrant.expires_at > now,
+                )
+                .values(status=RELEASE_GRANT_STATUS_REVOKED, revoked_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            if result.rowcount != 1:
+                # A concurrent consume/release/revoke settled the row first,
+                # or it expired between the check and the write. Observe the
+                # final state only and write nothing: a settled grant is
+                # 409 (consumed or revoked), an expired-pending one is 410.
+                session.rollback()
+                fresh = session.get(ReleaseGrant, grant_id)
+                if fresh is None:
+                    raise HTTPException(status_code=404, detail="grant not found")
+                if fresh.status == "consumed":
+                    raise HTTPException(
+                        status_code=409, detail="grant already consumed"
+                    )
+                if fresh.status == RELEASE_GRANT_STATUS_REVOKED:
+                    raise HTTPException(
+                        status_code=409, detail="grant already revoked"
+                    )
+                raise HTTPException(status_code=410, detail="grant expired")
+            session.commit()
+            decision_id = grant.decision_id
+            data_id = grant.data_id
+        return ReleaseGrantRevokedResponse(
+            grant_id=grant_id,
+            decision_id=decision_id,
+            data_id=data_id,
+            revoked=True,
+            revoked_at=_rfc3339(now),
+        )
+
     @app.post("/v1/release/{grant_id}")
     def release_payload(grant_id: str, body: ReleasePayloadRequest) -> Response:
         """Release one protected payload against a one-time grant.
 
         Judgement order is fixed: unknown/cross-scope grant or data item
-        (404), capability mismatch (401), expiry (410), already consumed
-        (409). Field/format problems are rejected with 422 by the request
-        model before this handler runs. The one-time state is the very
-        same release_grants row used by the consume endpoint: the data
-        key is unwrapped and the payload authenticated-decrypted *before*
-        the pending -> consumed transition is committed, so any keyring
-        or decryption failure leaves the grant pending and writes no
-        consumption audit.
+        (404), capability mismatch (401), expiry (410), already consumed or
+        revoked (409). Field/format problems are rejected with 422 by the
+        request model before this handler runs. The one-time state is the
+        very same release_grants row used by the consume and revoke
+        endpoints: the data key is unwrapped and the payload
+        authenticated-decrypted *before* the pending -> consumed transition
+        is committed, so any keyring or decryption failure leaves the grant
+        pending and writes no consumption audit, and a revocation that
+        settles first makes this path observe 409 without releasing.
         """
         digest = _nonce_digest(body.capability)
         now = _utcnow()
@@ -1287,12 +1422,16 @@ def create_app(
             if not hmac.compare_digest(grant.capability_digest, digest):
                 raise HTTPException(status_code=401, detail="invalid capability")
 
-            # Expiry precedes the consumed judgement: an expired grant that
-            # was also consumed reports 410.
+            # Expiry precedes the settled-status judgement: an expired grant
+            # that was also consumed or revoked reports 410.
             if grant.expires_at <= now:
                 raise HTTPException(status_code=410, detail="grant expired")
             if grant.status == "consumed":
                 raise HTTPException(status_code=409, detail="grant already consumed")
+            if grant.status == RELEASE_GRANT_STATUS_REVOKED:
+                # Revocation settled the shared one-time state first; no
+                # decryption or release happens past this point.
+                raise HTTPException(status_code=409, detail="grant already revoked")
 
             # Keyring problems are server failures that must not consume
             # the grant. Only the failure kind is logged — never key
@@ -1351,6 +1490,13 @@ def create_app(
                 if fresh is not None and fresh.status == "consumed":
                     raise HTTPException(
                         status_code=409, detail="grant already consumed"
+                    )
+                if fresh is not None and fresh.status == RELEASE_GRANT_STATUS_REVOKED:
+                    # A concurrent revocation settled the shared state
+                    # before this release: no payload is released and the
+                    # loser only observes the terminal revoked status.
+                    raise HTTPException(
+                        status_code=409, detail="grant already revoked"
                     )
                 raise HTTPException(status_code=410, detail="grant expired")
             session.commit()

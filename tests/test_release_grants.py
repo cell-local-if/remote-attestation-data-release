@@ -326,7 +326,7 @@ def test_consume_cross_scope_returns_404(client):
 def test_consume_wrong_capability_returns_401(client):
     decision, _ = _decision(client)
     grant = _grant(client, decision["decision_id"]).json()
-    wrong = "B" + grant["capability"][1:]
+    wrong = ("B" if grant["capability"][0] != "B" else "C") + grant["capability"][1:]
 
     response = _consume(client, grant["grant_id"], wrong)
     assert response.status_code == 401

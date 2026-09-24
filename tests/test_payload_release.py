@@ -285,7 +285,7 @@ def test_data_id_mismatch_returns_404(client, app):
     )
     assert response.status_code == 404
     # The mismatch 404 takes precedence over a wrong capability.
-    wrong = "B" + grant["capability"][1:]
+    wrong = ("B" if grant["capability"][0] != "B" else "C") + grant["capability"][1:]
     response = _release(
         client, grant["grant_id"], wrong, data_id="data-2"
     )
@@ -335,7 +335,7 @@ def test_404_takes_precedence_over_401(client):
 
 def test_wrong_capability_returns_401_and_grant_stays_pending(client, app):
     grant = _setup(client)
-    wrong = "B" + grant["capability"][1:]
+    wrong = ("B" if grant["capability"][0] != "B" else "C") + grant["capability"][1:]
 
     response = _release(client, grant["grant_id"], wrong)
     assert response.status_code == 401
@@ -352,7 +352,7 @@ def test_wrong_capability_returns_401_and_grant_stays_pending(client, app):
 
 def test_capability_checked_before_expiry(client, app):
     grant = _setup(client)
-    wrong = "B" + grant["capability"][1:]
+    wrong = ("B" if grant["capability"][0] != "B" else "C") + grant["capability"][1:]
     with app.state.session_factory() as session:
         row = session.get(ReleaseGrant, grant["grant_id"])
         row.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)

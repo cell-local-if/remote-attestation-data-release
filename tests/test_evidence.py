@@ -97,7 +97,7 @@ def test_submit_evidence_tenant_and_workload_mismatch_return_404(client):
 
 def test_submit_evidence_wrong_nonce_returns_401(client):
     created = _create(client).json()
-    wrong = "A" + created["nonce"][1:]
+    wrong = ("B" if created["nonce"][0] != "B" else "C") + created["nonce"][1:]
 
     response = _submit(client, created, nonce=wrong)
 

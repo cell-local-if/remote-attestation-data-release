@@ -327,7 +327,7 @@ def test_unknown_and_cross_scope_policy_return_404(client):
 def test_wrong_nonce_returns_422(client):
     created, evidence, evidence_id = _receive_and_verify(client)
     policy = _policy(client, {"claim": "x", "equals": 1})
-    wrong = "B" + created["nonce"][1:]
+    wrong = ("B" if created["nonce"][0] != "B" else "C") + created["nonce"][1:]
 
     response = _decide(
         client, evidence_id, created, evidence, policy["policy_id"], nonce=wrong

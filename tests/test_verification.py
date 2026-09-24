@@ -141,7 +141,7 @@ def test_verify_rejected_evidence_still_200_with_timestamp(client):
 
 def test_verify_wrong_nonce_in_body_returns_401(submitted, client):
     created, evidence, evidence_id = submitted
-    wrong = "B" + created["nonce"][1:]
+    wrong = ("B" if created["nonce"][0] != "B" else "C") + created["nonce"][1:]
 
     response = _verify(client, evidence_id, created, evidence, nonce=wrong)
 
@@ -278,7 +278,7 @@ def test_repeated_verify_with_different_evidence_returns_stored_conclusion(
 def test_repeated_verify_with_wrong_nonce_still_401(submitted, client):
     created, evidence, evidence_id = submitted
     assert _verify(client, evidence_id, created, evidence).status_code == 200
-    wrong = "C" + created["nonce"][1:]
+    wrong = ("B" if created["nonce"][0] != "B" else "C") + created["nonce"][1:]
 
     response = _verify(client, evidence_id, created, evidence, nonce=wrong)
 
