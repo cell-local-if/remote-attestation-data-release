@@ -205,6 +205,22 @@ def encrypt_payload(master_key: bytes, plaintext: bytes) -> EncryptedEnvelope:
     )
 
 
+def decrypt_payload(master_key: bytes, sealed: EncryptedEnvelope) -> bytes:
+    """Unwrap the data key and authenticated-decrypt the payload.
+
+    The inverse of ``encrypt_payload``: the data key is unwrapped with the
+    master key for the envelope's recorded version and the ciphertext is
+    decrypted under AES-256-GCM, which authenticates the material. Any
+    failure (corrupt wrapping, tampered ciphertext or tag, wrong key)
+    raises; the plaintext payload and data key exist only on this stack
+    frame.
+    """
+    data_key = aes_key_unwrap(master_key, sealed.wrapped_key)
+    return AESGCM(data_key).decrypt(
+        sealed.iv, sealed.ciphertext + sealed.tag, None
+    )
+
+
 def rewrap_data_key(
     unwrapping_key: bytes, wrapping_key: bytes, wrapped_key: bytes
 ) -> bytes:
