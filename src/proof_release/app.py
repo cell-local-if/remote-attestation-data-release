@@ -43,6 +43,8 @@ from proof_release.db import (
     DECISION_STATUS_ALLOWED,
     DECISION_STATUS_DENIED,
     RELEASE_GRANT_STATUS_CODES,
+    RELEASE_GRANT_STATUS_CONSUMED,
+    RELEASE_GRANT_STATUS_PENDING,
     RELEASE_GRANT_STATUS_REVOKED,
     REWRAP_RESULT_KEYRING,
     REWRAP_RESULT_MISSING_KEY,
@@ -3538,6 +3540,182 @@ def create_app(
                 "complete": complete,
             }
         )
+
+    @app.get("/v1/observability/release-summary")
+    def get_release_summary(
+        request: Request,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return a read-only, point-in-time summary of committed release state.
+
+        The range is fixed entirely by the two mandatory, non-blank query
+        parameters; the request body is always empty. Every shape failure
+        (a missing or blank parameter, a wrong-typed or unknown parameter,
+        or any non-empty body) is rejected as a 422 before any state is
+        read. The handler then takes a single read-only snapshot and never
+        writes: it consumes no rate-limit budget, appends no audit row, and
+        returns no capability, payload, evidence or key material.
+
+        The summary reports the three grant status counts, the pending
+        grants split into live (still within their validity window) and
+        expired, the current UTC minute's shared budget usage, and the
+        envelope population split by current versus historical master key
+        version. A storage failure or an unusable master keyring is a 500
+        with no partial summary; nothing is ever modified.
+        """
+        # --- request shape (all 422, no state is read) ------------------
+        allowed_params = {"tenant_id", "workload_id"}
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+        # Each scope parameter is a single scalar string; a repeated
+        # parameter (a multi-valued/list value) is the wrong shape, not a
+        # silently last-wins scalar.
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(
+                status_code=422, detail="query parameter must appear once"
+            )
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        # The current master key version classifies the envelope rows; it
+        # is key material metadata only (an integer version), never a key.
+        # A missing or malformed keyring is a server failure: fail closed
+        # with a 500 rather than reporting an unclassified envelope set.
+        try:
+            current_key_version = load_keyring().current_version
+        except MasterKeyError as exc:
+            logger.error("master key configuration unavailable: %s", exc)
+            raise HTTPException(
+                status_code=500, detail="release summary unavailable"
+            )
+
+        now = _utcnow()
+        window_start = _utc_minute_window(now)
+
+        def _grant_count(*predicates):
+            return (
+                select(func.count())
+                .select_from(ReleaseGrant)
+                .where(
+                    ReleaseGrant.tenant_id == tenant_id,
+                    ReleaseGrant.workload_id == workload_id,
+                    *predicates,
+                )
+                .scalar_subquery()
+            )
+
+        def _envelope_count(*predicates):
+            return (
+                select(func.count())
+                .select_from(DataEnvelope)
+                .where(
+                    DataEnvelope.tenant_id == tenant_id,
+                    DataEnvelope.workload_id == workload_id,
+                    *predicates,
+                )
+                .scalar_subquery()
+            )
+
+        # Every figure is computed by one statement of independent scalar
+        # subqueries. A single statement evaluates against one consistent
+        # database snapshot on every backend (and the write lock taken by
+        # BEGIN IMMEDIATE on sqlite additionally orders it against
+        # concurrent committers), so a grant/envelope group committing
+        # concurrently can never appear as a half-applied set. The handler
+        # issues no writes: it consumes no rate-limit slot and appends no
+        # audit row.
+        rate_used_sq = (
+            select(RateLimitCounter.count)
+            .where(
+                RateLimitCounter.tenant_id == tenant_id,
+                RateLimitCounter.workload_id == workload_id,
+                RateLimitCounter.window_start == window_start,
+            )
+            .scalar_subquery()
+        )
+        summary_stmt = select(
+            _grant_count(
+                ReleaseGrant.status == RELEASE_GRANT_STATUS_PENDING
+            ).label("pending"),
+            _grant_count(
+                ReleaseGrant.status == RELEASE_GRANT_STATUS_CONSUMED
+            ).label("consumed"),
+            _grant_count(
+                ReleaseGrant.status == RELEASE_GRANT_STATUS_REVOKED
+            ).label("revoked"),
+            # Live pending grants are still within their validity window;
+            # every other pending grant is expired. The expired figure is
+            # derived as pending minus live so the two parts always sum
+            # exactly to pending even at the expiry boundary.
+            _grant_count(
+                ReleaseGrant.status == RELEASE_GRANT_STATUS_PENDING,
+                ReleaseGrant.expires_at > now,
+            ).label("live_pending"),
+            _envelope_count().label("envelopes"),
+            # Envelopes recorded at the keyring's current version are
+            # migrated; every other recorded version is historical.
+            _envelope_count(
+                DataEnvelope.key_version == current_key_version
+            ).label("current_key_envelopes"),
+            rate_used_sq.label("rate_used"),
+        )
+        try:
+            with session_factory() as session:
+                result = session.execute(summary_stmt).one()
+        except Exception:
+            logger.error("release summary query failed")
+            raise HTTPException(
+                status_code=500, detail="release summary unavailable"
+            )
+
+        pending_count = result.pending
+        consumed_count = result.consumed
+        revoked_count = result.revoked
+        live_pending_count = result.live_pending
+        expired_pending_count = pending_count - live_pending_count
+        envelopes_count = result.envelopes
+        current_key_envelopes = result.current_key_envelopes
+        historical_key_envelopes = envelopes_count - current_key_envelopes
+        # A scope with no business request this minute has no counter row,
+        # so the scalar subquery returns NULL: zero used, the full five
+        # remaining.
+        rate_used = result.rate_used or 0
+        rate_remaining = max(0, GRANT_BUDGET_PER_MINUTE - rate_used)
+
+        # Exactly twelve fields in a fixed order: two JSON strings naming
+        # the scope, then ten JSON integers. Every count is a Python int
+        # produced by SQL count aggregation (never a float), so no -0.0 or
+        # non-finite value is possible; allow_nan=False makes that
+        # explicit. Compact JSON terminated by a single newline.
+        body = (
+            json.dumps(
+                {
+                    "tenant_id": tenant_id,
+                    "workload_id": workload_id,
+                    "pending": pending_count,
+                    "consumed": consumed_count,
+                    "revoked": revoked_count,
+                    "live_pending": live_pending_count,
+                    "expired_pending": expired_pending_count,
+                    "rate_used": rate_used,
+                    "rate_remaining": rate_remaining,
+                    "envelopes": envelopes_count,
+                    "current_key_envelopes": current_key_envelopes,
+                    "historical_key_envelopes": historical_key_envelopes,
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
 
     @app.get("/v1/compliance/audit-events")
     def list_compliance_audit_events(
