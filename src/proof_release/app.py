@@ -58,6 +58,7 @@ from proof_release.db import (
     REWRAP_JOB_STATUS_QUEUED,
     REWRAP_JOB_STATUS_RUNNING,
     REWRAP_JOB_STATUS_SUCCEEDED,
+    REWRAP_JOB_STATUS_CANCELLED,
     REWRAP_JOB_STATUS_CODES,
     VERIFICATION_RESULT_ACCEPTED,
     VERIFICATION_RESULT_REJECTED,
@@ -1604,6 +1605,23 @@ class CreateRewrapJobRequest(BaseModel):
         return value
 
 
+class CancelRewrapJobRequest(BaseModel):
+    """Scope naming the asynchronous rewrap job to cancel.
+
+    The body carries only the two non-blank scope strings; any missing,
+    blank, wrong-typed or unknown field is rejected as a client error
+    rather than silently ignored, and validation completes before the
+    handler reads the job.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+
+    _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
+
+
 def _migrate_additive(engine) -> None:
     """Apply forward-only additive column additions to pre-existing databases."""
     if engine.dialect.name != "sqlite":
@@ -1628,6 +1646,12 @@ def _migrate_additive(engine) -> None:
         ),
         "workload_identity_claims": (
             ("seq", "INTEGER"),
+        ),
+        "rewrap_jobs": (
+            # Cancellation was added after the job lifecycle first shipped;
+            # rows created before then have never been cancelled, so the
+            # new column backfills to NULL.
+            ("cancelled_at", "DATETIME"),
         ),
     }
     with engine.begin() as conn:
@@ -1805,6 +1829,13 @@ def create_app(
         #: page loop does not mistake it for a failure it caused.
         _CLAIM_LOST = object()
 
+        #: Sentinel returned by _process_one when an in-process cancel was
+        #: requested before the current envelope committed: the whole
+        #: envelope transaction (material change, audit event, job counters)
+        #: has been rolled back, leaving the envelope and audit untouched,
+        #: so the blocked cancel transaction can settle the job.
+        _CANCELLED_BEFORE_COMMIT = object()
+
         def __init__(self, session_factory, *, max_workers: int = 4) -> None:
             self._session_factory = session_factory
             self._max_workers = max_workers
@@ -1825,6 +1856,32 @@ def create_app(
             # job id. A plain dict is sufficient for single-key access; all
             # real mutual exclusion is the guarded UPDATE in the database.
             self._claim_tokens: dict[str, str] = {}
+            # Scope of each job this process currently holds a claim on,
+            # keyed by job id and populated from the loaded row before any
+            # envelope is processed. It lets a cancel endpoint raise its
+            # in-process stop signal only for an *in-scope* locally claimed
+            # job, so a fraudulent cross-scope (always-404) request can
+            # never interrupt another tenant's runner.
+            self._claim_scopes: dict[str, tuple[str, str]] = {}
+            # In-process cancel requests, keyed by job id. A cancel
+            # endpoint sets the event before it opens its write transaction
+            # so a worker holding that lock for the current envelope can
+            # observe the request and roll the uncommitted envelope
+            # operation back (material, audit and progress together)
+            # instead of committing it. Cross-process cancellation cannot
+            # signal here; there the writer-lock serialization plus the
+            # cleared claim token stops the scan at the next envelope.
+            self._cancel_events: dict[str, dict[str, threading.Event]] = {}
+            self._cancel_lock = threading.Lock()
+            # Job ids whose runner thread is currently inside one
+            # envelope's independent transaction in _process_one. A cancel
+            # endpoint waits for the runner's acknowledgement only while
+            # this is set (the worker may have to roll the in-flight
+            # envelope back); when the runner is parked outside an
+            # envelope transaction (claim hook, page scan, between
+            # envelopes) there is nothing to discard and the cancel
+            # proceeds immediately, serializing on the writer lock.
+            self._envelope_active: set[str] = set()
             # Optional test/observability hook invoked exactly once after a
             # runner has claimed a job (queued/running -> running committed),
             # outside any database transaction. Production leaves it None.
@@ -1951,6 +2008,7 @@ def create_app(
             )
             token = b64url_encode(secrets.token_bytes(CAPABILITY_BYTES))
             now = _utcnow()
+            scope: tuple[str, str] | None = None
             with self._session_factory() as session:
                 claimed = session.execute(
                     update(RewrapJob)
@@ -1966,11 +2024,15 @@ def create_app(
                     )
                     .execution_options(synchronize_session=False)
                 ).rowcount
+                if claimed == 1:
+                    row = session.get(RewrapJob, job_id)
+                    scope = (row.tenant_id, row.workload_id) if row else None
                 session.commit()
-            if claimed == 1:
+            if claimed == 1 and scope is not None:
                 # Remember the token so this runner releases only its own
                 # claim; the guarded UPDATE above is the real exclusion.
                 self._claim_tokens[job_id] = token
+                self._claim_scopes[job_id] = scope
                 return True
             return False
 
@@ -1985,6 +2047,7 @@ def create_app(
 
         def _release_claim(self, job_id: str) -> None:
             token = self._claim_tokens.pop(job_id, None)
+            self._claim_scopes.pop(job_id, None)
             if token is None:
                 return
             with self._session_factory() as session:
@@ -1999,22 +2062,96 @@ def create_app(
                 )
                 session.commit()
 
+        # -- cancellation ------------------------------------------------
+
+        def claim_scope(self, job_id: str) -> tuple[str, str] | None:
+            """Return the scope of the job this process currently claims.
+
+            ``None`` when no runner in this process holds the job (it is
+            queued/unclaimed, claimed by another process, or terminal).
+            Tenant and workload are immutable for a job, so the value is
+            authoritative for a same-process scope check.
+            """
+            return self._claim_scopes.get(job_id)
+
+        def request_cancel(
+            self,
+            job_id: str,
+            scope: tuple[str, str],
+            *,
+            ack_timeout: float = 5.0,
+        ) -> None:
+            """Ask an in-process runner of an in-scope ``job_id`` to stop.
+
+            The signal is raised *before* the cancel endpoint opens its
+            write transaction, but only when this process currently holds
+            the job's claim for the exact requesting scope: a cross-scope
+            (always-404) request therefore can never interrupt another
+            tenant's runner, and an unknown id or a job claimed by another
+            process signals nothing. When matched, a worker currently
+            inside the current envelope's transaction observes the signal
+            and rolls that uncommitted envelope operation back (material,
+            audit and progress together), releasing the writer lock the
+            endpoint waits on; the endpoint's guarded UPDATE then settles
+            the job. A short ack wait only avoids an unnecessary lock wait
+            and never blocks cancellation if it elapses.
+            """
+            if self._claim_scopes.get(job_id) != scope:
+                return
+            in_envelope = job_id in self._envelope_active
+            with self._cancel_lock:
+                signal = self._cancel_events.get(job_id)
+                if signal is None:
+                    signal = {
+                        "cancel": threading.Event(),
+                        "ack": threading.Event(),
+                    }
+                    self._cancel_events[job_id] = signal
+            signal["cancel"].set()
+            if in_envelope:
+                # The runner is inside the current envelope's transaction;
+                # wait for it to roll that work back and release the writer
+                # lock so the cancel settles without discarding a committed
+                # envelope. When the runner is between envelopes there is
+                # nothing to wait for and the writer lock orders us.
+                signal["ack"].wait(timeout=ack_timeout)
+
+        def finish_cancel(self, job_id: str) -> None:
+            """Drop the in-process cancel signal once settlement is decided."""
+            with self._cancel_lock:
+                self._cancel_events.pop(job_id, None)
+
+        def _cancel_requested(self, job_id: str) -> bool:
+            signal = self._cancel_events.get(job_id)
+            return signal is not None and signal["cancel"].is_set()
+
+        def _ack_cancel(self, job_id: str) -> None:
+            signal = self._cancel_events.get(job_id)
+            if signal is not None:
+                signal["ack"].set()
+
         # -- advancement ------------------------------------------------
 
         def run(self, job_id: str, *, retry: bool = False) -> None:
             if not self._claim(job_id, retry=retry):
-                # Succeeded, already advanced by another runner, or a
-                # failed job presented to a non-retry claim.
+                # Succeeded, cancelled, already advanced by another
+                # runner, or a failed job presented to a non-retry claim.
                 return
             if self.post_claim is not None:
                 self.post_claim(job_id)
             try:
                 while True:
                     terminal = self._advance_page(job_id)
+                    if terminal is RewrapJobRunner._CLAIM_LOST:
+                        # The claim moved (a cancel cleared it or another
+                        # runner took over): stop immediately rather than
+                        # spinning, leaving the durable row exactly as the
+                        # winning transaction committed it.
+                        return
                     if terminal is not None:
-                        # succeeded or failed: the terminal transition was
-                        # committed inside _advance_page and the claim
-                        # cleared there.
+                        # succeeded, failed or cancelled: the terminal
+                        # transition was committed inside _advance_page and
+                        # the claim cleared there.
                         return
                     if self._shutdown.is_set():
                         # Stop between pages at a fully committed boundary.
@@ -2024,24 +2161,38 @@ def create_app(
                         self._release_claim(job_id)
                         return
             finally:
+                # Release any cancel endpoint waiting on this runner. The
+                # uncommitted-envelope path acks earlier (right after it
+                # rolls back so the cancel can acquire the lock); every
+                # other stop path — claim lost between envelopes, a
+                # terminal settlement, shutdown — acks here as the run
+                # ends. Harmless when no cancel was requested.
+                self._ack_cancel(job_id)
                 self._claim_tokens.pop(job_id, None)
+                self._claim_scopes.pop(job_id, None)
 
-        def _advance_page(self, job_id: str) -> str | None:
+        def _advance_page(self, job_id: str) -> str | object | None:
             """Process up to ``limit`` envelopes from the current cursor.
 
             Returns the terminal status when the job settles
-            (``succeeded``/``failed``), or ``None`` when a full page was
-            handled and the runner should page again.
+            (``succeeded``/``failed``/``cancelled``), ``None`` when a full
+            page was handled and the runner should page again, or the
+            ``_CLAIM_LOST`` sentinel when this runner no longer owns the
+            job (a cancel cleared the token or another runner settled it).
             """
             with self._session_factory() as session:
                 if not self._owns(session, job_id):
-                    return None
+                    return RewrapJobRunner._CLAIM_LOST
                 job = session.get(RewrapJob, job_id)
-                if job is None or job.status not in (
+                if job is None:
+                    return RewrapJobRunner._CLAIM_LOST
+                if job.status not in (
                     REWRAP_JOB_STATUS_QUEUED,
                     REWRAP_JOB_STATUS_RUNNING,
                 ):
-                    return job.status if job else None
+                    # A terminal status appeared under us (succeeded,
+                    # failed or cancelled). It is never ours to advance.
+                    return job.status
                 tenant_id = job.tenant_id
                 workload_id = job.workload_id
                 limit = job.limit
@@ -2096,17 +2247,36 @@ def create_app(
                     if self._shutdown.is_set():
                         return None
                     continue
+                if processed is RewrapJobRunner._CANCELLED_BEFORE_COMMIT:
+                    # The current envelope's uncommitted work was
+                    # discarded at a cancel's request; the cancel
+                    # transaction settles the job. Stop without touching
+                    # any later envelope.
+                    return RewrapJobRunner._CLAIM_LOST
                 if processed is RewrapJobRunner._CLAIM_LOST:
-                    # Another runner owns or settled the job; stop without
-                    # touching it.
-                    return None
+                    # A cancel cleared the claim (or another runner
+                    # settled the job): the scan stops immediately after
+                    # the last independently committed envelope, with no
+                    # further envelope touched.
+                    return RewrapJobRunner._CLAIM_LOST
                 # This runner settled the job as failed.
                 return REWRAP_JOB_STATUS_FAILED
             # Whole page reached without a failure.
             with self._session_factory() as session:
                 if not self._owns(session, job_id):
-                    return None
+                    return RewrapJobRunner._CLAIM_LOST
                 job = session.get(RewrapJob, job_id)
+                if job is None or job.status not in (
+                    REWRAP_JOB_STATUS_QUEUED,
+                    REWRAP_JOB_STATUS_RUNNING,
+                ):
+                    # A cancel or another settlement landed between the
+                    # last envelope commit and this point; leave it.
+                    return (
+                        job.status
+                        if job is not None
+                        else RewrapJobRunner._CLAIM_LOST
+                    )
                 now = _utcnow()
                 if not has_more:
                     # The limit+1 probe found nothing beyond this page, so
@@ -2116,6 +2286,7 @@ def create_app(
                         .where(
                             RewrapJob.job_id == job_id,
                             RewrapJob.status == REWRAP_JOB_STATUS_RUNNING,
+                            RewrapJob.claim_token == self._claim_tokens.get(job_id),
                         )
                         .values(
                             status=REWRAP_JOB_STATUS_SUCCEEDED,
@@ -2128,18 +2299,57 @@ def create_app(
                     ).rowcount
                     if settled != 1:
                         session.rollback()
+                        # A concurrent cancel (or another settlement) won
+                        # the row first: observe it and stop rather than
+                        # forcing a second terminal state.
+                        fresh = session.get(RewrapJob, job_id)
+                        if fresh is not None and fresh.status in (
+                            REWRAP_JOB_STATUS_CANCELLED,
+                            REWRAP_JOB_STATUS_SUCCEEDED,
+                            REWRAP_JOB_STATUS_FAILED,
+                        ):
+                            return fresh.status
                         raise RuntimeError(
                             "rewrap job success settlement did not settle"
                         )
                     session.commit()
                     return REWRAP_JOB_STATUS_SUCCEEDED
-                # Full page and more may follow: just bump updated_at.
-                job.updated_at = now
+                # Full page and more may follow: just bump updated_at, and
+                # only while the job is still ours and open. A guarded
+                # update keeps a concurrent cancel from being overwritten.
+                bumped = session.execute(
+                    update(RewrapJob)
+                    .where(
+                        RewrapJob.job_id == job_id,
+                        RewrapJob.status.in_(
+                            (REWRAP_JOB_STATUS_QUEUED, REWRAP_JOB_STATUS_RUNNING)
+                        ),
+                        RewrapJob.claim_token == self._claim_tokens.get(job_id),
+                    )
+                    .values(updated_at=now)
+                    .execution_options(synchronize_session=False)
+                ).rowcount
+                if bumped != 1:
+                    session.rollback()
+                    fresh = session.get(RewrapJob, job_id)
+                    if fresh is not None and fresh.status in (
+                        REWRAP_JOB_STATUS_CANCELLED,
+                        REWRAP_JOB_STATUS_SUCCEEDED,
+                        REWRAP_JOB_STATUS_FAILED,
+                    ):
+                        return fresh.status
+                    return RewrapJobRunner._CLAIM_LOST
                 session.commit()
             return None
 
-        def _process_one(self, job_id: str, envelope) -> str | None:
-            """Independently commit one envelope; non-None result = failure.
+        def _process_one(self, job_id: str, envelope) -> str | object | None:
+            """Independently commit one envelope.
+
+            Returns ``None`` when the envelope committed, a result code
+            string when this runner settled the job failed, or one of the
+            ``_CLAIM_LOST``/``_CANCELLED_BEFORE_COMMIT`` sentinels when the
+            envelope's uncommitted work was discarded and the scan must
+            stop without touching a later envelope.
 
             ``envelope`` is the detached snapshot tuple
             ``(tenant_id, workload_id, data_id, key_version, wrapped_key)``
@@ -2147,135 +2357,230 @@ def create_app(
             """
             tenant_id, workload_id, data_id, stored_version, wrapped_key = envelope
 
-            with self._session_factory() as session:
-                if not self._owns(session, job_id):
-                    return RewrapJobRunner._CLAIM_LOST
-                job = session.get(RewrapJob, job_id)
-                if job is None or job.status not in (
-                    REWRAP_JOB_STATUS_QUEUED,
-                    REWRAP_JOB_STATUS_RUNNING,
-                ):
-                    return RewrapJobRunner._CLAIM_LOST
-
-                # Re-resolve the keyring per envelope: a keyring that
-                # becomes unusable mid-job fails the job on the envelope
-                # that could not be handled.
-                try:
-                    keyring = load_keyring()
-                except MasterKeyError:
-                    logger.error("master keyring unavailable during rewrap job")
-                    self._settle_failed(session, job, job.next_cursor)
-                    return REWRAP_RESULT_KEYRING
-
-                current_version = keyring.current_version
-                audit_old_version = stored_version
-                if stored_version == current_version:
-                    result = REWRAP_RESULT_SKIPPED
-                    new_version = stored_version
-                else:
-                    try:
-                        unwrapping_key = keyring.key_for(stored_version)
-                        new_wrapped_key = rewrap_data_key(
-                            unwrapping_key,
-                            keyring.current_key(),
-                            wrapped_key,
-                        )
-                    except MasterKeyError:
-                        logger.error(
-                            "master key version %s unavailable during rewrap job",
-                            stored_version,
-                        )
-                        self._settle_failed(session, job, job.next_cursor)
-                        return REWRAP_RESULT_MISSING_KEY
-                    except Exception:
-                        logger.error("rewrap job single-envelope rewrap failed")
-                        self._settle_failed(session, job, job.next_cursor)
-                        return REWRAP_RESULT_REWRAP_FAILED
-
-                    # Guarded update, mirroring the batch and
-                    # single-envelope paths: only a row still at the
-                    # version we unwrapped can rotate. A concurrent winner
-                    # leaves current-version material, recorded as a skip.
-                    outcome = session.execute(
-                        update(DataEnvelope)
-                        .where(
-                            DataEnvelope.tenant_id == tenant_id,
-                            DataEnvelope.workload_id == workload_id,
-                            DataEnvelope.data_id == data_id,
-                            DataEnvelope.key_version == stored_version,
-                        )
-                        .values(
-                            key_version=current_version,
-                            wrapped_key=new_wrapped_key,
-                        )
-                        .execution_options(synchronize_session=False)
-                    )
-                    if outcome.rowcount != 1:
+            # Mark the envelope in flight so a cancel endpoint knows
+            # whether to wait for this runner to roll back its current
+            # uncommitted envelope. Cleared as soon as the envelope
+            # commits or is discarded.
+            self._envelope_active.add(job_id)
+            try:
+                with self._session_factory() as session:
+                    if not self._owns(session, job_id):
+                        return RewrapJobRunner._CLAIM_LOST
+                    job = session.get(RewrapJob, job_id)
+                    if job is None or job.status not in (
+                        REWRAP_JOB_STATUS_QUEUED,
+                        REWRAP_JOB_STATUS_RUNNING,
+                    ):
+                        return RewrapJobRunner._CLAIM_LOST
+                    if self._cancel_requested(job_id):
+                        # A cancel arrived before this envelope did any
+                        # material work. Do none of it: release the writer
+                        # lock the cancel endpoint is waiting on and let
+                        # that transaction settle the job at the prior
+                        # cursor.
                         session.rollback()
-                        fresh = session.scalar(
-                            select(DataEnvelope)
+                        self._ack_cancel(job_id)
+                        return RewrapJobRunner._CANCELLED_BEFORE_COMMIT
+
+                    # Re-resolve the keyring per envelope: a keyring that
+                    # becomes unusable mid-job fails the job on the envelope
+                    # that could not be handled.
+                    try:
+                        keyring = load_keyring()
+                    except MasterKeyError:
+                        if self._cancel_requested(job_id):
+                            # A cancel is waiting on this writer lock:
+                            # prefer it over a failure settlement and
+                            # discard the uncommitted envelope attempt.
+                            session.rollback()
+                            self._ack_cancel(job_id)
+                            return RewrapJobRunner._CANCELLED_BEFORE_COMMIT
+                        logger.error(
+                            "master keyring unavailable during rewrap job"
+                        )
+                        self._settle_failed(session, job, job.next_cursor)
+                        return REWRAP_RESULT_KEYRING
+
+                    current_version = keyring.current_version
+                    audit_old_version = stored_version
+                    if stored_version == current_version:
+                        result = REWRAP_RESULT_SKIPPED
+                        new_version = stored_version
+                    else:
+                        try:
+                            unwrapping_key = keyring.key_for(stored_version)
+                            new_wrapped_key = rewrap_data_key(
+                                unwrapping_key,
+                                keyring.current_key(),
+                                wrapped_key,
+                            )
+                        except MasterKeyError:
+                            if self._cancel_requested(job_id):
+                                session.rollback()
+                                self._ack_cancel(job_id)
+                                return RewrapJobRunner._CANCELLED_BEFORE_COMMIT
+                            logger.error(
+                                "master key version %s unavailable during "
+                                "rewrap job",
+                                stored_version,
+                            )
+                            self._settle_failed(session, job, job.next_cursor)
+                            return REWRAP_RESULT_MISSING_KEY
+                        except Exception:
+                            if self._cancel_requested(job_id):
+                                session.rollback()
+                                self._ack_cancel(job_id)
+                                return RewrapJobRunner._CANCELLED_BEFORE_COMMIT
+                            logger.error(
+                                "rewrap job single-envelope rewrap failed"
+                            )
+                            self._settle_failed(session, job, job.next_cursor)
+                            return REWRAP_RESULT_REWRAP_FAILED
+
+                        # Guarded update, mirroring the batch and
+                        # single-envelope paths: only a row still at the
+                        # version we unwrapped can rotate. A concurrent
+                        # winner leaves current-version material, recorded
+                        # as a skip.
+                        outcome = session.execute(
+                            update(DataEnvelope)
                             .where(
                                 DataEnvelope.tenant_id == tenant_id,
                                 DataEnvelope.workload_id == workload_id,
                                 DataEnvelope.data_id == data_id,
+                                DataEnvelope.key_version == stored_version,
                             )
-                            .execution_options(populate_existing=True)
+                            .values(
+                                key_version=current_version,
+                                wrapped_key=new_wrapped_key,
+                            )
+                            .execution_options(synchronize_session=False)
                         )
-                        if fresh is not None and fresh.key_version == current_version:
-                            result = REWRAP_RESULT_SKIPPED
-                            new_version = current_version
-                            audit_old_version = current_version
-                            job = session.get(RewrapJob, job_id)
+                        if outcome.rowcount != 1:
+                            session.rollback()
+                            fresh = session.scalar(
+                                select(DataEnvelope)
+                                .where(
+                                    DataEnvelope.tenant_id == tenant_id,
+                                    DataEnvelope.workload_id == workload_id,
+                                    DataEnvelope.data_id == data_id,
+                                )
+                                .execution_options(populate_existing=True)
+                            )
+                            if (
+                                fresh is not None
+                                and fresh.key_version == current_version
+                            ):
+                                result = REWRAP_RESULT_SKIPPED
+                                new_version = current_version
+                                audit_old_version = current_version
+                                job = session.get(RewrapJob, job_id)
+                            else:
+                                job = session.get(RewrapJob, job_id)
+                                self._settle_failed(
+                                    session, job, job.next_cursor
+                                )
+                                return REWRAP_RESULT_REWRAP_FAILED
                         else:
-                            job = session.get(RewrapJob, job_id)
-                            self._settle_failed(session, job, job.next_cursor)
-                            return REWRAP_RESULT_REWRAP_FAILED
-                    else:
-                        result = REWRAP_RESULT_REWRAPPED
-                        new_version = current_version
+                            result = REWRAP_RESULT_REWRAPPED
+                            new_version = current_version
 
-                # Independent per-envelope commit: the material change,
-                # the existing rewrap audit event and the job's progress
-                # land together and durably before the next envelope.
-                item_occurred_at = _utcnow()
-                event_status = (
-                    AUDIT_EVENT_STATUS_REWRAPPED
-                    if result == REWRAP_RESULT_REWRAPPED
-                    else AUDIT_EVENT_STATUS_SKIPPED
-                )
-                session.add(
-                    AuditEvent(
-                        event_id=str(uuid.uuid4()),
-                        tenant_id=tenant_id,
-                        workload_id=workload_id,
-                        event_type=AUDIT_EVENT_TYPE_REWRAP,
-                        grant_id=None,
-                        decision_id=None,
-                        data_id=data_id,
-                        status=event_status,
-                        capability_sha256=None,
-                        occurred_at=item_occurred_at,
+                    # Independent per-envelope commit: the material change,
+                    # the existing rewrap audit event and the job's
+                    # progress land together and durably before the next
+                    # envelope.
+                    item_occurred_at = _utcnow()
+                    event_status = (
+                        AUDIT_EVENT_STATUS_REWRAPPED
+                        if result == REWRAP_RESULT_REWRAPPED
+                        else AUDIT_EVENT_STATUS_SKIPPED
                     )
-                )
-                job = session.get(RewrapJob, job_id)
-                job.processed += 1
-                if result == REWRAP_RESULT_REWRAPPED:
-                    job.rewrapped += 1
-                else:
-                    job.skipped += 1
-                job.next_cursor = (
-                    _encode_cursor(tenant_id, workload_id, data_id)
-                    if data_id
-                    else ""
-                )
-                job.updated_at = item_occurred_at
-                try:
-                    session.commit()
-                except Exception:
-                    session.rollback()
-                    logger.error("rewrap job progress commit failed")
-                    raise
-                return None
+                    session.add(
+                        AuditEvent(
+                            event_id=str(uuid.uuid4()),
+                            tenant_id=tenant_id,
+                            workload_id=workload_id,
+                            event_type=AUDIT_EVENT_TYPE_REWRAP,
+                            grant_id=None,
+                            decision_id=None,
+                            data_id=data_id,
+                            status=event_status,
+                            capability_sha256=None,
+                            occurred_at=item_occurred_at,
+                        )
+                    )
+                    next_boundary = (
+                        _encode_cursor(tenant_id, workload_id, data_id)
+                        if data_id
+                        else ""
+                    )
+                    if self._cancel_requested(job_id):
+                        # A cancel landed while this envelope was being
+                        # processed but before its commit. The material
+                        # update, the audit event and the job's counters are
+                        # all still uncommitted in this one transaction:
+                        # roll them back together so the envelope, its
+                        # wrapping material and the audit stay exactly as
+                        # they were, release the writer lock the cancel is
+                        # waiting on, and stop.
+                        session.rollback()
+                        self._ack_cancel(job_id)
+                        return RewrapJobRunner._CANCELLED_BEFORE_COMMIT
+                    # Advance the job progress with a guarded UPDATE
+                    # rather than an ORM primary-key write: a cancel that
+                    # wins the writer lock first moves the row to cancelled
+                    # (and clears the claim token), and this guard then
+                    # matches zero rows. On a miss the whole envelope
+                    # transaction — material, audit and progress — is rolled
+                    # back together, so a cancel marker can never be
+                    # overwritten back to running and an envelope never
+                    # lands without its progress.
+                    token = self._claim_tokens.get(job_id)
+                    advanced = session.execute(
+                        update(RewrapJob)
+                        .where(
+                            RewrapJob.job_id == job_id,
+                            RewrapJob.status.in_(
+                                (
+                                    REWRAP_JOB_STATUS_QUEUED,
+                                    REWRAP_JOB_STATUS_RUNNING,
+                                )
+                            ),
+                            RewrapJob.claim_token == token,
+                        )
+                        .values(
+                            processed=RewrapJob.processed + 1,
+                            rewrapped=(
+                                RewrapJob.rewrapped + 1
+                                if result == REWRAP_RESULT_REWRAPPED
+                                else RewrapJob.rewrapped
+                            ),
+                            skipped=(
+                                RewrapJob.skipped
+                                if result == REWRAP_RESULT_REWRAPPED
+                                else RewrapJob.skipped + 1
+                            ),
+                            next_cursor=next_boundary,
+                            updated_at=item_occurred_at,
+                        )
+                        .execution_options(synchronize_session=False)
+                    ).rowcount
+                    if advanced != 1:
+                        # A cancel (or another settlement) committed first.
+                        # Discard the uncommitted envelope operation
+                        # wholesale.
+                        session.rollback()
+                        self._ack_cancel(job_id)
+                        return RewrapJobRunner._CLAIM_LOST
+                    try:
+                        session.commit()
+                    except Exception:
+                        session.rollback()
+                        logger.error("rewrap job progress commit failed")
+                        raise
+                    return None
+            finally:
+                self._envelope_active.discard(job_id)
 
         def _settle_failed(self, session, job, resume_cursor: str) -> None:
             """Move a running job to ``failed`` and park the resume cursor.
@@ -2304,6 +2609,16 @@ def create_app(
             ).rowcount
             if settled != 1:
                 session.rollback()
+                # A concurrent terminal transition (e.g. a cancel from
+                # another process) won the row first; keep that terminal
+                # state instead of forcing a second one.
+                fresh = session.get(RewrapJob, job.job_id)
+                if fresh is not None and fresh.status in (
+                    REWRAP_JOB_STATUS_CANCELLED,
+                    REWRAP_JOB_STATUS_SUCCEEDED,
+                    REWRAP_JOB_STATUS_FAILED,
+                ):
+                    return
                 raise RuntimeError("rewrap job failure settlement did not settle")
             session.commit()
 
@@ -6631,6 +6946,210 @@ def create_app(
             raise HTTPException(status_code=500, detail="rewrap job unavailable")
 
         return _compact_json_line(payload)
+
+    @app.post("/v1/rewrap-jobs//cancel")
+    def cancel_rewrap_job_identifier_required(
+        body: CancelRewrapJobRequest,
+    ) -> Response:
+        # An empty path segment is a missing job identifier: a 422 client
+        # error rather than a routing-level 404 or 405. It never reads a
+        # job.
+        raise HTTPException(status_code=422, detail="invalid job identifier")
+
+    @app.post("/v1/rewrap-jobs/{job_id}/cancel")
+    def cancel_rewrap_job(job_id: str, body: CancelRewrapJobRequest) -> Response:
+        """Cancel a queued or running asynchronous rewrap job.
+
+        The path identifier must be a canonical lowercase UUID and the
+        body carries exactly the two non-blank scope strings; any
+        missing, blank, wrong-typed or unknown field is a 422 that never
+        reads the job. An unknown job or one outside the body's
+        tenant/workload is an indistinguishable 404 (existence is never
+        revealed). A succeeded, failed or already-cancelled job returns
+        409 and changes neither status, counters nor any timestamp; a
+        repeat cancel likewise returns 409 and rewrites nothing.
+
+        The winning cancel commits the status flip to ``cancelled`` and
+        ``cancelled_at`` in one guarded transaction (queued|running ->
+        cancelled), so concurrent cancels settle as exactly one success
+        with stable 409s, and a per-envelope commit racing the flip can
+        never overwrite the marker (the runner discards an envelope that
+        loses). A running runner stops after the current envelope: an
+        envelope still uncommitted when the cancel arrives is rolled back
+        wholesale (material, audit, progress), while an envelope that
+        already committed keeps its change and audit and the job records
+        cancellation at that stopping point. A write or commit failure is
+        a 500 after a full rollback.
+        """
+        # A path identifier that is missing (empty segment), blank,
+        # whitespace-padded, uppercase or otherwise non-canonical is a
+        # field/format error checked before any state is read.
+        if not _UUID_RE.fullmatch(job_id):
+            raise HTTPException(status_code=422, detail="invalid job identifier")
+
+        runner = app.state.rewrap_job_runner
+        scope = (body.tenant_id, body.workload_id)
+
+        # Raise the in-process stop signal *before* taking the writer
+        # lock, but only when this process currently claims the job for
+        # exactly the requesting scope. A cross-scope (always-404) request
+        # therefore cannot interrupt another tenant's runner, and an
+        # unknown id or a job claimed elsewhere signals nothing. The matched
+        # worker rolls its current uncommitted envelope back and releases
+        # the writer lock so the read below is not blocked; a job claimed
+        # by another process is simply cancelled after its current envelope
+        # commits (the row lock + cleared claim token stop the scan).
+        runner.request_cancel(job_id, scope)
+
+        # Read-only scope/status judgement: an unknown id or a job outside
+        # the body's tenant/workload is an indistinguishable 404.
+        try:
+            with session_factory() as session:
+                existing = session.get(RewrapJob, job_id)
+                if (
+                    existing is None
+                    or existing.tenant_id != body.tenant_id
+                    or existing.workload_id != body.workload_id
+                ):
+                    raise HTTPException(
+                        status_code=404, detail="rewrap job not found"
+                    )
+                prior_status = existing.status
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("rewrap job cancel failed")
+            raise HTTPException(status_code=500, detail="rewrap job cancel failed")
+
+        if prior_status == REWRAP_JOB_STATUS_CANCELLED:
+            # A repeated cancel is a conflict observed without a write: it
+            # rewrites neither cancelled_at nor any other state and appends
+            # no audit.
+            raise HTTPException(status_code=409, detail="rewrap job already cancelled")
+        if prior_status in (REWRAP_JOB_STATUS_SUCCEEDED, REWRAP_JOB_STATUS_FAILED):
+            raise HTTPException(status_code=409, detail="rewrap job already settled")
+
+        cancelled_at = _utcnow()
+        try:
+            with session_factory() as session:
+                try:
+                    # Re-read under the writer lock; the open-status
+                    # judgement above is advisory and the guarded UPDATE
+                    # below is the real settlement. SQLite ignores FOR
+                    # UPDATE but already serializes all writers via BEGIN
+                    # IMMEDIATE, so the cancel and the runner's
+                    # per-envelope commit are strictly ordered.
+                    job = session.scalar(
+                        select(RewrapJob)
+                        .where(
+                            RewrapJob.job_id == job_id,
+                            RewrapJob.tenant_id == body.tenant_id,
+                            RewrapJob.workload_id == body.workload_id,
+                        )
+                        .with_for_update()
+                    )
+                    if job is None:
+                        raise HTTPException(
+                            status_code=404, detail="rewrap job not found"
+                        )
+                    if job.status == REWRAP_JOB_STATUS_CANCELLED:
+                        raise HTTPException(
+                            status_code=409, detail="rewrap job already cancelled"
+                        )
+                    if job.status in (
+                        REWRAP_JOB_STATUS_SUCCEEDED,
+                        REWRAP_JOB_STATUS_FAILED,
+                    ):
+                        raise HTTPException(
+                            status_code=409, detail="rewrap job already settled"
+                        )
+                    # Atomic settlement: only a still-queued/running row
+                    # flips, and cancelled_at is written by that same
+                    # single-row update together with the status. The
+                    # guarded predicate is what makes concurrent cancels
+                    # settle with exactly one winner and prevents a racing
+                    # runner settlement from being overwritten.
+                    outcome = session.execute(
+                        update(RewrapJob)
+                        .where(
+                            RewrapJob.job_id == job_id,
+                            RewrapJob.status.in_(
+                                (
+                                    REWRAP_JOB_STATUS_QUEUED,
+                                    REWRAP_JOB_STATUS_RUNNING,
+                                )
+                            ),
+                        )
+                        .values(
+                            status=REWRAP_JOB_STATUS_CANCELLED,
+                            cancelled_at=cancelled_at,
+                            claim_token=None,
+                            updated_at=cancelled_at,
+                        )
+                        .execution_options(synchronize_session=False)
+                    )
+                    if outcome.rowcount != 1:
+                        session.rollback()
+                        fresh = session.get(RewrapJob, job_id)
+                        if fresh is not None:
+                            if fresh.status == REWRAP_JOB_STATUS_CANCELLED:
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail="rewrap job already cancelled",
+                                )
+                            if fresh.status in (
+                                REWRAP_JOB_STATUS_SUCCEEDED,
+                                REWRAP_JOB_STATUS_FAILED,
+                            ):
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail="rewrap job already settled",
+                                )
+                        raise HTTPException(
+                            status_code=500, detail="rewrap job cancel failed"
+                        )
+                    try:
+                        session.commit()
+                    except Exception:
+                        session.rollback()
+                        logger.error("rewrap job cancel failed")
+                        raise HTTPException(
+                            status_code=500, detail="rewrap job cancel failed"
+                        )
+                except HTTPException:
+                    raise
+                except Exception:
+                    # A failure during the locked lookup or guarded update
+                    # is a full rollback and a sanitized 500: the status
+                    # change and cancelled_at can never have happened on
+                    # this path, so the job keeps its prior state and time.
+                    session.rollback()
+                    logger.error("rewrap job cancel failed")
+                    raise HTTPException(
+                        status_code=500, detail="rewrap job cancel failed"
+                    )
+        finally:
+            runner.finish_cancel(job_id)
+
+        # Compact JSON describing only the cancellation result. The keys
+        # are emitted in lexicographic (string) order — cancelled_at,
+        # job_id, status — every value is a string (allow_nan=False
+        # excludes non-finite numbers), terminated by exactly one newline.
+        body_bytes = json.dumps(
+            {
+                "cancelled_at": _rfc3339(cancelled_at),
+                "job_id": job_id,
+                "status": REWRAP_JOB_STATUS_CANCELLED,
+            },
+            separators=(",", ":"),
+            allow_nan=False,
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return Response(
+            content=body_bytes + b"\n",
+            status_code=200,
+            media_type="application/json",
+        )
 
     return app
 

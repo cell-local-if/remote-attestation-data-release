@@ -77,19 +77,24 @@ REWRAP_RESULT_CODES = frozenset(
 #: Lifecycle statuses of a persistent asynchronous rewrap job. A job is
 #: born ``queued``; its background runner (or a post-restart recovery
 #: sweep) moves it to ``running`` exactly once, and it settles exactly
-#: once to ``succeeded`` (every envelope in scope was reached) or
-#: ``failed`` (the keyring went bad, a historical key was missing, or a
-#: single envelope failed). A terminal status is never changed.
+#: once to ``succeeded`` (every envelope in scope was reached), ``failed``
+#: (the keyring went bad, a historical key was missing, or a single
+#: envelope failed), or ``cancelled`` (an explicit cancel won the guarded
+#: transition while the job was still queued or running). A terminal
+#: status is never changed; a cancelled job is never re-enqueued by the
+#: startup recovery sweep.
 REWRAP_JOB_STATUS_QUEUED = "queued"
 REWRAP_JOB_STATUS_RUNNING = "running"
 REWRAP_JOB_STATUS_SUCCEEDED = "succeeded"
 REWRAP_JOB_STATUS_FAILED = "failed"
+REWRAP_JOB_STATUS_CANCELLED = "cancelled"
 REWRAP_JOB_STATUS_CODES = frozenset(
     {
         REWRAP_JOB_STATUS_QUEUED,
         REWRAP_JOB_STATUS_RUNNING,
         REWRAP_JOB_STATUS_SUCCEEDED,
         REWRAP_JOB_STATUS_FAILED,
+        REWRAP_JOB_STATUS_CANCELLED,
     }
 )
 
@@ -667,7 +672,8 @@ class RewrapJob(Base):
     # On failure it stays immediately before the failing envelope.
     next_cursor: Mapped[str] = mapped_column(String(256))
     # One of REWRAP_JOB_STATUS_*; queued -> running -> succeeded|failed,
-    # each transition made at most once with a guarded UPDATE.
+    # or queued|running -> cancelled, each transition made at most once
+    # with a guarded UPDATE.
     status: Mapped[str] = mapped_column(String(16), default="queued")
     # Cumulative counters across every page the job has advanced.
     processed: Mapped[int] = mapped_column(Integer, default=0)
@@ -687,6 +693,13 @@ class RewrapJob(Base):
     # Bumped on every status/progress commit; equal to created_at until
     # the background runner makes its first transition.
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    # Set exactly once, by the winning queued|running -> cancelled
+    # transition; NULL in every other state. A repeated cancel observes
+    # the stored value and never rewrites it. The cancel marker and the
+    # status change commit in the same transaction.
+    cancelled_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
 
 
 class RewrapJobIdempotencyRecord(Base):
