@@ -74,6 +74,26 @@ REWRAP_RESULT_CODES = frozenset(
 )
 
 
+#: Finite, service-defined set of persisted rewrap-job statuses. A job is
+#: born ``queued`` once its row commits, is claimed into ``running`` by the
+#: background worker that advances it, and settles exactly once to a
+#: terminal state: ``succeeded`` when every envelope in its scope has been
+#: reached, or ``failed`` when the keyring turns unusable mid-run, a
+#: historical key is missing, or a single envelope cannot be rewrapped.
+REWRAP_JOB_STATUS_QUEUED = "queued"
+REWRAP_JOB_STATUS_RUNNING = "running"
+REWRAP_JOB_STATUS_SUCCEEDED = "succeeded"
+REWRAP_JOB_STATUS_FAILED = "failed"
+REWRAP_JOB_STATUS_CODES = frozenset(
+    {
+        REWRAP_JOB_STATUS_QUEUED,
+        REWRAP_JOB_STATUS_RUNNING,
+        REWRAP_JOB_STATUS_SUCCEEDED,
+        REWRAP_JOB_STATUS_FAILED,
+    }
+)
+
+
 #: Finite, service-defined set of compliance audit-event types. ``grant``
 #: events trace the one-time release-grant lifecycle; ``rewrap`` events
 #: trace per-envelope key rotation performed by rewrap batches.
@@ -606,6 +626,53 @@ class RewrapBatchItem(Base):
     # One of REWRAP_RESULT_*; a fixed, service-defined code only.
     result: Mapped[str] = mapped_column(String(16))
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class RewrapJob(Base):
+    """One persistent, asynchronously advanced scoped rewrap job.
+
+    Each POST creates one job bound to exactly one tenant/workload scope
+    and the exclusive data_id cursor it starts from. Unlike a synchronous
+    rewrap batch, the job row is the durable progress record: a background
+    worker advances it envelope by envelope (``limit`` is the per-scan
+    page size), committing each envelope's material change, its compliance
+    audit event and the job counters in one independent transaction, so
+    the stored ``next_cursor`` always names the last successfully
+    processed envelope. A job left ``queued`` or ``running`` by a process
+    interruption is resumed from exactly that position on the next start;
+    a ``failed`` job is terminal with its cursor parked before the
+    envelope that could not be advanced, and a ``succeeded`` job has
+    reached the end of its scope. The row stores only identifiers, the
+    fixed status code, counters and timestamps — never key material,
+    wrapped keys, ciphertext or payloads.
+    """
+
+    __tablename__ = "rewrap_jobs"
+
+    job_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # Requested per-scan page size (1..200); informational for audit reads.
+    limit: Mapped[int] = mapped_column(Integer)
+    # Exclusive data_id boundary the job started after; empty string for
+    # the beginning of the scope. Never NULL.
+    cursor: Mapped[str] = mapped_column(String(256))
+    # Opaque resume token naming the last successfully processed envelope;
+    # empty string when nothing has been processed yet and when the job
+    # has completed its scope. Never NULL.
+    next_cursor: Mapped[str] = mapped_column(String(1024))
+    # One of REWRAP_JOB_STATUS_*; queued -> running -> succeeded | failed.
+    status: Mapped[str] = mapped_column(
+        String(16), default=REWRAP_JOB_STATUS_QUEUED
+    )
+    complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    processed: Mapped[int] = mapped_column(Integer, default=0)
+    rewrapped: Mapped[int] = mapped_column(Integer, default=0)
+    skipped: Mapped[int] = mapped_column(Integer, default=0)
+    failed: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    # Bumped by every committed progress step and every status transition.
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
 class AuditEvent(Base):

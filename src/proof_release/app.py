@@ -9,6 +9,7 @@ import math
 import os
 import re
 import secrets
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -51,6 +52,10 @@ from proof_release.db import (
     REWRAP_RESULT_REWRAP_FAILED,
     REWRAP_RESULT_REWRAPPED,
     REWRAP_RESULT_SKIPPED,
+    REWRAP_JOB_STATUS_FAILED,
+    REWRAP_JOB_STATUS_QUEUED,
+    REWRAP_JOB_STATUS_RUNNING,
+    REWRAP_JOB_STATUS_SUCCEEDED,
     VERIFICATION_RESULT_ACCEPTED,
     VERIFICATION_RESULT_REJECTED,
     WORKLOAD_IDENTITY_STATUS_ACTIVE,
@@ -78,6 +83,7 @@ from proof_release.db import (
     ReleaseGrant,
     RewrapBatch,
     RewrapBatchItem,
+    RewrapJob,
     TrustRoot,
     WorkloadIdentityClaim,
     WorkloadIdentityProfile,
@@ -160,6 +166,14 @@ _CURSOR_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
+
+#: In-process registry of rewrap jobs a worker thread is currently
+#: advancing. Guards against double-launch within one process (a job id
+#: is a random UUID, so one global set safely spans app instances); the
+#: durable resume mechanism across processes is the startup scan of
+#: queued/running rows, not this set.
+_rewrap_job_workers: set[str] = set()
+_rewrap_job_workers_lock = threading.Lock()
 
 
 def _utcnow() -> datetime:
@@ -1336,6 +1350,18 @@ class CreateRewrapBatchRequest(BaseModel):
         if not value.strip() or not _CURSOR_RE.fullmatch(value):
             raise ValueError("cursor is not a valid rewrap cursor")
         return value
+
+
+class CreateRewrapJobRequest(CreateRewrapBatchRequest):
+    """Submission body for a persistent asynchronous rewrap job.
+
+    Identical contract to a synchronous rewrap batch: two required
+    non-blank scope strings, an optional integer page size (1..200,
+    default 50) and an optional opaque scope-bound cursor (absent or
+    empty starts before the smallest envelope). The cursor's scope
+    binding and MAC are verified in the endpoint, where a forged,
+    tampered or cross-scope token is an indistinguishable 422.
+    """
 
 
 def _migrate_additive(engine) -> None:
@@ -5323,6 +5349,435 @@ def create_app(
             raise HTTPException(status_code=500, detail="rewrap batch unavailable")
 
         return _compact_json(payload)
+
+    # --- persistent asynchronous rewrap jobs ---------------------------
+    #
+    # A rewrap job is the durable, resumable counterpart of a synchronous
+    # rewrap batch: submission persists a queued row and returns at once,
+    # and a background worker then advances the job envelope by envelope
+    # (per-scan pages of the submitted limit), committing each envelope's
+    # material change, its compliance audit event and the job counters in
+    # one independent transaction. The stored next_cursor therefore always
+    # names the last successfully processed envelope, which is exactly the
+    # position a later process resumes from.
+
+    def _rewrap_job_json(payload: dict, status_code: int = 200) -> Response:
+        # Compact JSON terminated by a single newline. Counters are Python
+        # ints (never floats, so no -0.0 or non-finite values can appear)
+        # and allow_nan=False makes that invariant explicit.
+        body = (
+            json.dumps(
+                payload, separators=(",", ":"), allow_nan=False
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(
+            content=body, status_code=status_code, media_type="application/json"
+        )
+
+    def _fail_rewrap_job(session, job_id: str, code: str) -> None:
+        """Settle a job to ``failed``, leaving the current envelope as-is.
+
+        Any uncommitted material change is rolled back first; the stored
+        next_cursor already names the last successfully processed
+        envelope, so the resume point stays immediately before the failed
+        item. The failure counter increases by exactly one. Only the
+        fixed failure kind is logged, never key material or values.
+        """
+        session.rollback()
+        job = session.get(RewrapJob, job_id)
+        if job is None or job.status in (
+            REWRAP_JOB_STATUS_SUCCEEDED,
+            REWRAP_JOB_STATUS_FAILED,
+        ):
+            return
+        job.failed = job.failed + 1
+        job.status = REWRAP_JOB_STATUS_FAILED
+        job.updated_at = _utcnow()
+        session.commit()
+        logger.error("rewrap job %s failed: %s", job_id, code)
+
+    def _advance_rewrap_job(job_id: str) -> None:
+        """Worker loop: advance one job until it settles or is settled."""
+        while True:
+            with session_factory() as session:
+                job = session.get(RewrapJob, job_id)
+                if job is None or job.status not in (
+                    REWRAP_JOB_STATUS_QUEUED,
+                    REWRAP_JOB_STATUS_RUNNING,
+                ):
+                    return
+                tenant_id = job.tenant_id
+                workload_id = job.workload_id
+                limit = job.limit
+                # Resume position: the stored token names the last
+                # successfully processed envelope; empty means the start
+                # of the scope.
+                token = job.next_cursor
+                if token:
+                    boundary = _decode_cursor(token, tenant_id, workload_id)
+                    if boundary is None:
+                        # A cursor this service issued no longer verifies
+                        # (the cursor secret changed): the position cannot
+                        # be proven, so the job cannot safely advance.
+                        logger.error(
+                            "rewrap job resume cursor no longer verifies"
+                        )
+                        _fail_rewrap_job(session, job_id, REWRAP_RESULT_KEYRING)
+                        return
+                else:
+                    boundary = ""
+                if job.status == REWRAP_JOB_STATUS_QUEUED:
+                    job.status = REWRAP_JOB_STATUS_RUNNING
+                    job.updated_at = _utcnow()
+                    session.commit()
+
+                # Stable per-scan page of the scope, ordered by data_id,
+                # starting strictly after the exclusive resume boundary.
+                try:
+                    rows = list(
+                        session.scalars(
+                            select(DataEnvelope)
+                            .where(
+                                DataEnvelope.tenant_id == tenant_id,
+                                DataEnvelope.workload_id == workload_id,
+                                DataEnvelope.data_id > boundary,
+                            )
+                            .order_by(DataEnvelope.data_id.asc())
+                            .limit(limit + 1)
+                        )
+                    )
+                except Exception:
+                    logger.error("rewrap job scan failed")
+                    _fail_rewrap_job(session, job_id, REWRAP_RESULT_REWRAP_FAILED)
+                    return
+                page = rows[:limit]
+                if not page:
+                    # The scan reached the end of the scope: only now does
+                    # the job settle as succeeded.
+                    job.complete = True
+                    job.next_cursor = ""
+                    job.status = REWRAP_JOB_STATUS_SUCCEEDED
+                    job.updated_at = _utcnow()
+                    session.commit()
+                    return
+
+                for envelope in page:
+                    data_id = envelope.data_id
+                    stored_version = envelope.key_version
+
+                    # Re-resolve the keyring per envelope: a keyring that
+                    # becomes unusable mid-run fails the job on the
+                    # envelope that could not be handled.
+                    try:
+                        keyring = load_keyring()
+                    except MasterKeyError:
+                        logger.error("master keyring became unavailable mid-job")
+                        _fail_rewrap_job(session, job_id, REWRAP_RESULT_KEYRING)
+                        return
+
+                    current_version = keyring.current_version
+                    # Version pair recorded on the audit; the
+                    # concurrent-loser path below reports both sides as
+                    # the current version.
+                    audit_old_version = stored_version
+                    if stored_version == current_version:
+                        result = REWRAP_RESULT_SKIPPED
+                        new_version = stored_version
+                    else:
+                        try:
+                            unwrapping_key = keyring.key_for(stored_version)
+                            new_wrapped_key = rewrap_data_key(
+                                unwrapping_key,
+                                keyring.current_key(),
+                                envelope.wrapped_key,
+                            )
+                        except MasterKeyError:
+                            # The historical key needed to unwrap is gone;
+                            # the envelope is not modified.
+                            logger.error(
+                                "master key version %s unavailable during job",
+                                stored_version,
+                            )
+                            _fail_rewrap_job(
+                                session, job_id, REWRAP_RESULT_MISSING_KEY
+                            )
+                            return
+                        except Exception:
+                            # Any crypto/rewrap failure: the job fails
+                            # with the row untouched.
+                            logger.error("data envelope job rewrap failed")
+                            _fail_rewrap_job(
+                                session, job_id, REWRAP_RESULT_REWRAP_FAILED
+                            )
+                            return
+
+                        # Guarded update, mirroring the batch path: only a
+                        # row still at the version we unwrapped can be
+                        # rotated, so concurrent jobs advance one envelope
+                        # at most once. A concurrent winner leaves
+                        # current-version material, recorded as a skip.
+                        outcome = session.execute(
+                            update(DataEnvelope)
+                            .where(
+                                DataEnvelope.tenant_id == tenant_id,
+                                DataEnvelope.workload_id == workload_id,
+                                DataEnvelope.data_id == data_id,
+                                DataEnvelope.key_version == stored_version,
+                            )
+                            .values(
+                                key_version=current_version,
+                                wrapped_key=new_wrapped_key,
+                            )
+                            .execution_options(synchronize_session=False)
+                        )
+                        if outcome.rowcount != 1:
+                            session.rollback()
+                            fresh = session.scalar(
+                                select(DataEnvelope)
+                                .where(
+                                    DataEnvelope.tenant_id == tenant_id,
+                                    DataEnvelope.workload_id == workload_id,
+                                    DataEnvelope.data_id == data_id,
+                                )
+                                .execution_options(populate_existing=True)
+                            )
+                            if (
+                                fresh is not None
+                                and fresh.key_version == current_version
+                            ):
+                                result = REWRAP_RESULT_SKIPPED
+                                new_version = current_version
+                                audit_old_version = current_version
+                            else:
+                                _fail_rewrap_job(
+                                    session, job_id, REWRAP_RESULT_REWRAP_FAILED
+                                )
+                                return
+                        else:
+                            result = REWRAP_RESULT_REWRAPPED
+                            new_version = current_version
+
+                    # Independent per-envelope commit: the material change,
+                    # the compliance audit event and the job progress land
+                    # in one transaction, durable before the next envelope
+                    # is attempted. Rewrap events carry the envelope data
+                    # identifier and the fixed rewrapped/skipped status;
+                    # grant/decision identifiers and the capability digest
+                    # are empty (NULL).
+                    occurred_at = _utcnow()
+                    session.add(
+                        AuditEvent(
+                            event_id=str(uuid.uuid4()),
+                            tenant_id=tenant_id,
+                            workload_id=workload_id,
+                            event_type=AUDIT_EVENT_TYPE_REWRAP,
+                            grant_id=None,
+                            decision_id=None,
+                            data_id=data_id,
+                            status=(
+                                AUDIT_EVENT_STATUS_REWRAPPED
+                                if result == REWRAP_RESULT_REWRAPPED
+                                else AUDIT_EVENT_STATUS_SKIPPED
+                            ),
+                            capability_sha256=None,
+                            occurred_at=occurred_at,
+                        )
+                    )
+                    job.processed = job.processed + 1
+                    if result == REWRAP_RESULT_REWRAPPED:
+                        job.rewrapped = job.rewrapped + 1
+                    else:
+                        job.skipped = job.skipped + 1
+                    job.next_cursor = _encode_cursor(
+                        tenant_id, workload_id, data_id
+                    )
+                    job.updated_at = occurred_at
+                    try:
+                        session.commit()
+                    except Exception:
+                        logger.error("rewrap job progress write failed")
+                        _fail_rewrap_job(
+                            session, job_id, REWRAP_RESULT_REWRAP_FAILED
+                        )
+                        return
+                # The page is exhausted; loop to scan the next page from
+                # the freshly committed resume cursor.
+
+    def _run_rewrap_job(job_id: str) -> None:
+        try:
+            _advance_rewrap_job(job_id)
+        except Exception:
+            logger.exception("rewrap job worker crashed")
+            try:
+                with session_factory() as session:
+                    _fail_rewrap_job(session, job_id, REWRAP_RESULT_REWRAP_FAILED)
+            except Exception:
+                logger.error("rewrap job failure state could not be recorded")
+        finally:
+            with _rewrap_job_workers_lock:
+                _rewrap_job_workers.discard(job_id)
+
+    def _launch_rewrap_job(job_id: str) -> None:
+        with _rewrap_job_workers_lock:
+            if job_id in _rewrap_job_workers:
+                return
+            _rewrap_job_workers.add(job_id)
+        worker = threading.Thread(
+            target=_run_rewrap_job,
+            args=(job_id,),
+            name=f"rewrap-job-{job_id}",
+            daemon=True,
+        )
+        worker.start()
+
+    def _resume_rewrap_jobs() -> None:
+        """Re-launch workers for jobs a previous process left incomplete.
+
+        A job stored as queued or running was interrupted before it could
+        settle; its committed next_cursor names the exact envelope to
+        resume after, so the new worker continues from there.
+        """
+        try:
+            with session_factory() as session:
+                job_ids = list(
+                    session.scalars(
+                        select(RewrapJob.job_id).where(
+                            RewrapJob.status.in_(
+                                [
+                                    REWRAP_JOB_STATUS_QUEUED,
+                                    REWRAP_JOB_STATUS_RUNNING,
+                                ]
+                            )
+                        )
+                    )
+                )
+        except Exception:
+            logger.error("rewrap job resume scan failed")
+            return
+        for resumable_job_id in job_ids:
+            _launch_rewrap_job(resumable_job_id)
+
+    @app.post("/v1/rewrap-jobs")
+    def create_rewrap_job(body: CreateRewrapJobRequest) -> Response:
+        # Authenticate the cursor against this exact scope before touching
+        # the keyring or storage: a forged, tampered or cross-scope cursor
+        # is a client error indistinguishable from any other bad field.
+        boundary = (
+            _decode_cursor(body.cursor, body.tenant_id, body.workload_id)
+            if body.cursor
+            else ""
+        )
+        if boundary is None:
+            raise HTTPException(status_code=422, detail="invalid cursor")
+
+        # A wholly unusable keyring is a server configuration failure:
+        # no job row and no envelope may exist as evidence of the call.
+        try:
+            load_keyring()
+        except MasterKeyError as exc:
+            logger.error("master key configuration unavailable: %s", exc)
+            raise HTTPException(status_code=500, detail="encryption unavailable")
+
+        job_id = str(uuid.uuid4())
+        now = _utcnow()
+        with session_factory() as session:
+            # Persist the job before any envelope is touched so progress
+            # is queryable from the moment the submission is accepted.
+            session.add(
+                RewrapJob(
+                    job_id=job_id,
+                    tenant_id=body.tenant_id,
+                    workload_id=body.workload_id,
+                    limit=body.limit,
+                    cursor=boundary,
+                    next_cursor="",
+                    status=REWRAP_JOB_STATUS_QUEUED,
+                    complete=False,
+                    processed=0,
+                    rewrapped=0,
+                    skipped=0,
+                    failed=0,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            try:
+                session.commit()
+            except Exception:
+                session.rollback()
+                logger.error("rewrap job write failed")
+                raise HTTPException(status_code=500, detail="rewrap job unavailable")
+
+        # Accepted: a background worker advances the job from here.
+        _launch_rewrap_job(job_id)
+        return _rewrap_job_json(
+            {
+                "job_id": job_id,
+                "status": REWRAP_JOB_STATUS_QUEUED,
+                "limit": body.limit,
+                "cursor": body.cursor or "",
+                "created_at": _rfc3339(now),
+                "updated_at": _rfc3339(now),
+            },
+            status_code=202,
+        )
+
+    @app.get("/v1/rewrap-jobs/")
+    def rewrap_job_identifier_required() -> Response:
+        # An empty path segment is a missing job identifier: a 422
+        # client error rather than a routing-level 404.
+        raise HTTPException(status_code=422, detail="invalid job identifier")
+
+    @app.get("/v1/rewrap-jobs/{job_id}")
+    def get_rewrap_job(
+        job_id: str,
+        tenant_id: str = Query(..., min_length=1),
+        workload_id: str = Query(..., min_length=1),
+    ) -> Response:
+        # The path identifier must be a syntactically valid job id;
+        # missing/blank scope query parameters are the same 422 class.
+        # Job ids are canonical lowercase UUIDs.
+        if not job_id.strip() or not _UUID_RE.fullmatch(job_id.lower()):
+            raise HTTPException(status_code=422, detail="invalid job identifier")
+        job_id = job_id.strip().lower()
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        try:
+            with session_factory() as session:
+                job = session.get(RewrapJob, job_id)
+                if (
+                    job is None
+                    or job.tenant_id != tenant_id
+                    or job.workload_id != workload_id
+                ):
+                    # Unknown and cross-scope jobs are indistinguishable.
+                    raise HTTPException(status_code=404, detail="rewrap job not found")
+                # The whole progress snapshot is assembled before any
+                # response bytes exist: a read failure is a 500 and never
+                # a half-filled progress body.
+                payload = {
+                    "job_id": job.job_id,
+                    "status": job.status,
+                    "processed": job.processed,
+                    "rewrapped": job.rewrapped,
+                    "skipped": job.skipped,
+                    "failed": job.failed,
+                    "next_cursor": job.next_cursor,
+                    "complete": job.complete,
+                    "created_at": _rfc3339(job.created_at),
+                    "updated_at": _rfc3339(job.updated_at),
+                }
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("rewrap job lookup failed")
+            raise HTTPException(status_code=500, detail="rewrap job unavailable")
+
+        return _rewrap_job_json(payload)
+
+    _resume_rewrap_jobs()
 
     return app
 
