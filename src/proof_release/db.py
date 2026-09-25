@@ -232,6 +232,17 @@ class CertificateRevocation(Base):
             "certificate_fingerprint",
             "effective_at",
         ),
+        # Covers the read-only listing ordered by the scoped
+        # (effective_at, revocation_id) keyset, including its exclusive
+        # cursor predicate; snapshot and optional filters are then applied
+        # as residual predicates on the indexed range.
+        Index(
+            "ix_cert_revocations_listing",
+            "tenant_id",
+            "workload_id",
+            "effective_at",
+            "revocation_id",
+        ),
     )
 
     revocation_id: Mapped[str] = mapped_column(String(36), primary_key=True)
