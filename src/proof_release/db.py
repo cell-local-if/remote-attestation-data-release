@@ -114,6 +114,21 @@ WORKLOAD_IDENTITY_STATUS_CODES = frozenset(
 )
 
 
+#: Finite, service-defined set of trust-root lifecycle statuses. A trust
+#: root is born active and is retired exactly once; retirement is a
+#: terminal state. A retired root keeps its row (so its id, scope and
+#: certificate remain addressable) but no longer anchors X.509 evidence:
+#: a chain anchored to it settles as rejected before revocation, identity
+#: or signature checks. The same certificate can never be re-created as a
+#: new root in the same scope, so retirement cannot be bypassed. A retired
+#: root is never made active again.
+TRUST_ROOT_STATUS_ACTIVE = "active"
+TRUST_ROOT_STATUS_RETIRED = "retired"
+TRUST_ROOT_STATUS_CODES = frozenset(
+    {TRUST_ROOT_STATUS_ACTIVE, TRUST_ROOT_STATUS_RETIRED}
+)
+
+
 class UTCDateTime(TypeDecorator):
     """Store datetimes as UTC and always return timezone-aware UTC values."""
 
@@ -176,7 +191,9 @@ class Evidence(Base):
 
 class TrustRoot(Base):
     __tablename__ = "trust_roots"
-    # A certificate is configured at most once per tenant and workload.
+    # A certificate is configured at most once per tenant and workload;
+    # retirement leaves the row in place, so the duplicate rule keeps
+    # holding for retired roots as well.
     __table_args__ = (
         UniqueConstraint(
             "tenant_id", "workload_id", "cert_sha256", name="uq_trust_root_cert"
@@ -192,7 +209,19 @@ class TrustRoot(Base):
     root_pem: Mapped[str] = mapped_column(Text)
     # SHA-256 of the DER encoding, used for exact duplicate detection.
     cert_sha256: Mapped[str] = mapped_column(String(64))
+    # One of TRUST_ROOT_STATUS_*; active -> retired exactly once. A retired
+    # root remains stored (its certificate still identifies it for
+    # verification short-circuits and duplicate detection) but is a
+    # terminal state: it is never made active again.
+    status: Mapped[str] = mapped_column(
+        String(16), default=TRUST_ROOT_STATUS_ACTIVE
+    )
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    # Set exactly once, by the winning active -> retired transition; a
+    # repeated retire observes the stored value and never rewrites it.
+    retired_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
 
 
 class CertificateRevocation(Base):

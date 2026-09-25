@@ -53,6 +53,8 @@ from proof_release.db import (
     VERIFICATION_RESULT_REJECTED,
     WORKLOAD_IDENTITY_STATUS_ACTIVE,
     WORKLOAD_IDENTITY_STATUS_REVOKED,
+    TRUST_ROOT_STATUS_ACTIVE,
+    TRUST_ROOT_STATUS_RETIRED,
     AUDIT_EVENT_STATUS_CONSUMED,
     AUDIT_EVENT_STATUS_PENDING,
     AUDIT_EVENT_STATUS_REVOKED,
@@ -1002,6 +1004,23 @@ class TrustRootCreatedResponse(BaseModel):
     created_at: str
 
 
+class RetireTrustRootRequest(BaseModel):
+    """Scope naming the trust root to retire.
+
+    The body carries only the two non-blank scope strings; any missing,
+    blank, wrong-typed or unknown field is rejected as a client error
+    rather than silently ignored, and validation completes before the
+    handler touches storage.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+
+    _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
+
+
 class CreateRevocationRequest(BaseModel):
     tenant_id: StrictStr = Field(min_length=1)
     workload_id: StrictStr = Field(min_length=1)
@@ -1330,6 +1349,10 @@ def _migrate_additive(engine) -> None:
         "release_grants": (
             ("revoked_at", "DATETIME"),
         ),
+        "trust_roots": (
+            ("status", "VARCHAR(16)"),
+            ("retired_at", "DATETIME"),
+        ),
         "workload_identity_profiles": (
             ("status", "VARCHAR(16)"),
             ("updated_at", "DATETIME"),
@@ -1360,6 +1383,16 @@ def _migrate_additive(engine) -> None:
                         "SET status = :active WHERE status IS NULL"
                     ),
                     {"active": WORKLOAD_IDENTITY_STATUS_ACTIVE},
+                )
+            if table == "trust_roots":
+                # Trust roots created before retirement existed are all
+                # active; only an explicit retire ever sets retired_at.
+                conn.execute(
+                    text(
+                        "UPDATE trust_roots "
+                        "SET status = :active WHERE status IS NULL"
+                    ),
+                    {"active": TRUST_ROOT_STATUS_ACTIVE},
                 )
             if table == "workload_identity_claims":
                 conn.execute(
@@ -1724,11 +1757,25 @@ def create_app(
             # rolls back and the evidence stays received, so it can be
             # re-verified once the registry recovers.
             revoked = False
+            # Retirement short-circuit, X.509 chain format only: when the
+            # chain anchors to a *retired* trust root the evidence settles
+            # as rejected before the revocation check, the workload
+            # identity gate and the verifier run — no certificate signature
+            # is ever computed and the verifier plugin is not called.
+            # Retirement takes the same anchor row lock as retirement and
+            # registration, so only a retirement committed before this
+            # settlement is observed; a later retirement never rewrites a
+            # settled conclusion. A failure reading the anchor's status is
+            # a 500 before any settlement write: the evidence stays
+            # received and can be re-verified after recovery.
+            retired_anchor = False
             # Identity gating state, populated only for an X.509 chain
-            # that parses and anchors to a configured trust root. When set,
-            # the anchor's workload identity profiles are consulted after
-            # the verifier passes; left None when the chain cannot possibly
-            # verify (the verifier rejects on its own and no lookup runs).
+            # that parses and anchors to a configured, *active* trust root.
+            # When set, the anchor's workload identity profiles are
+            # consulted after the verifier passes; left None when the chain
+            # cannot possibly verify (the verifier rejects on its own and
+            # no lookup runs) or when its anchor is retired (the rejection
+            # above already settles the outcome).
             identity_anchor_id: str | None = None
             identity_leaf: x509.Certificate | None = None
             if evidence.evidence_format == X509_ATTESTED_NONCE_JSON:
@@ -1741,63 +1788,87 @@ def create_app(
                     # The verifier performs the actual byte-identical
                     # anchoring check; this only maps the anchor to the
                     # trust-root id registrations are scoped under and
-                    # serializes with concurrent registrations. None means
-                    # unconfigured: the verifier rejects on its own and no
-                    # revocation lookup happens.
-                    anchor = session.scalar(
-                        select(TrustRoot)
-                        .where(
-                            TrustRoot.tenant_id == body.tenant_id,
-                            TrustRoot.workload_id == body.workload_id,
-                            TrustRoot.cert_sha256 == anchor_digest,
+                    # serializes with concurrent registrations and
+                    # retirements. None means unconfigured: the verifier
+                    # rejects on its own and no revocation lookup happens.
+                    try:
+                        anchor = session.scalar(
+                            select(TrustRoot)
+                            .where(
+                                TrustRoot.tenant_id == body.tenant_id,
+                                TrustRoot.workload_id == body.workload_id,
+                                TrustRoot.cert_sha256 == anchor_digest,
+                            )
+                            .with_for_update()
                         )
-                        .with_for_update()
-                    )
+                    except Exception:
+                        # A failure reading the anchor's retirement status
+                        # (e.g. an unavailable registry) is a 500 before
+                        # any settlement write; nothing about the evidence
+                        # changes, so it stays received and re-verifiable.
+                        session.rollback()
+                        logger.error(
+                            "trust root status query failed for evidence %s",
+                            evidence.evidence_id,
+                        )
+                        raise HTTPException(
+                            status_code=500,
+                            detail="trust root registry unavailable",
+                        )
                     if anchor is not None:
-                        now = _utcnow()
-                        fingerprints = [
-                            b64url_encode(
-                                hashlib.sha256(
-                                    certificate.public_bytes(Encoding.DER)
-                                ).digest()
-                            )
-                            for certificate in chain_certificates
-                        ]
-                        try:
-                            hit = session.scalar(
-                                select(CertificateRevocation.revocation_id)
-                                .where(
-                                    CertificateRevocation.tenant_id
-                                    == body.tenant_id,
-                                    CertificateRevocation.workload_id
-                                    == body.workload_id,
-                                    CertificateRevocation.trust_root_id
-                                    == anchor.root_id,
-                                    CertificateRevocation.certificate_fingerprint.in_(
-                                        fingerprints
-                                    ),
-                                    CertificateRevocation.effective_at <= now,
+                        if anchor.status == TRUST_ROOT_STATUS_RETIRED:
+                            # Terminal retirement wins over every other
+                            # check: no revocation lookup, no identity gate,
+                            # no verifier call and therefore no certificate
+                            # signature computation.
+                            retired_anchor = True
+                        else:
+                            now = _utcnow()
+                            fingerprints = [
+                                b64url_encode(
+                                    hashlib.sha256(
+                                        certificate.public_bytes(Encoding.DER)
+                                    ).digest()
                                 )
-                                .limit(1)
-                            )
-                        except Exception:
-                            logger.error(
-                                "revocation registry query failed for evidence %s",
-                                evidence.evidence_id,
-                            )
-                            raise HTTPException(
-                                status_code=500,
-                                detail="revocation registry unavailable",
-                            )
-                        revoked = hit is not None
-                        # The chain parses and anchors to a configured
-                        # trust root: its identity profiles gate the
-                        # verifier's accept verdict. The leaf supplies the
-                        # parsed issuer, subject and SAN URI strings
-                        # compared against claims.
-                        identity_anchor_id = anchor.root_id
-                        identity_leaf = chain_certificates[0]
-            if revoked:
+                                for certificate in chain_certificates
+                            ]
+                            try:
+                                hit = session.scalar(
+                                    select(CertificateRevocation.revocation_id)
+                                    .where(
+                                        CertificateRevocation.tenant_id
+                                        == body.tenant_id,
+                                        CertificateRevocation.workload_id
+                                        == body.workload_id,
+                                        CertificateRevocation.trust_root_id
+                                        == anchor.root_id,
+                                        CertificateRevocation.certificate_fingerprint.in_(
+                                            fingerprints
+                                        ),
+                                        CertificateRevocation.effective_at <= now,
+                                    )
+                                    .limit(1)
+                                )
+                            except Exception:
+                                logger.error(
+                                    "revocation registry query failed for evidence %s",
+                                    evidence.evidence_id,
+                                )
+                                raise HTTPException(
+                                    status_code=500,
+                                    detail="revocation registry unavailable",
+                                )
+                            revoked = hit is not None
+                            # The chain parses and anchors to an active,
+                            # configured trust root: its identity profiles
+                            # gate the verifier's accept verdict. The leaf
+                            # supplies the parsed issuer, subject and SAN
+                            # URI strings compared against claims.
+                            identity_anchor_id = anchor.root_id
+                            identity_leaf = chain_certificates[0]
+            if revoked or retired_anchor:
+                # A revocation hit and a retired anchor are both settled
+                # rejections that must never reach the verifier.
                 accepted = False
             else:
                 verification_context = VerificationContext(
@@ -2012,6 +2083,142 @@ def create_app(
             workload_id=body.workload_id,
             name=body.name,
             created_at=_rfc3339(now),
+        )
+
+    @app.post("/v1/trust-roots//retire")
+    def retire_trust_root_identifier_required(
+        body: RetireTrustRootRequest,
+    ) -> Response:
+        # An empty path segment is a missing trust-root identifier: a 422
+        # client error rather than a routing-level 404 or 405. It never
+        # reads or modifies a trust root.
+        raise HTTPException(status_code=422, detail="invalid trust root identifier")
+
+    @app.post("/v1/trust-roots/{root_id}/retire")
+    def retire_trust_root(root_id: str, body: RetireTrustRootRequest) -> Response:
+        """Retire a configured trust root.
+
+        The path identifier must be a canonical UUID and the body carries
+        only the two non-blank scope strings; any missing, blank,
+        wrong-typed or unknown field is a 422 that never reads or writes
+        the trust root. A path UUID is checked before storage is touched.
+        An unknown root or one outside the body's tenant/workload is an
+        indistinguishable 404 (existence is never revealed). A repeat
+        retire returns 409 and never rewrites the recorded ``retired_at``
+        and appends no other record. The active -> retired transition is
+        one guarded atomic update under the trust-root row lock — the same
+        lock X.509 verification takes while inspecting the anchor — so
+        concurrent retires of one root settle as exactly one success and
+        stable 409s, and only a retirement committed before an evidence
+        settles can affect that verification. A write or commit failure
+        returns 500 after a full rollback, leaving status and time
+        unchanged.
+        """
+        # A path identifier that is missing (empty segment), blank,
+        # whitespace-padded or not a canonical lowercase UUID is a
+        # field/format error; the raw value must match exactly. This runs
+        # before any storage access, so a malformed path can neither read
+        # nor modify a trust root.
+        if not _UUID_RE.fullmatch(root_id):
+            raise HTTPException(status_code=422, detail="invalid trust root identifier")
+
+        retired_at = _utcnow()
+        with session_factory() as session:
+            try:
+                # Lock the trust-root row for the whole transition. X.509
+                # verification takes the same lock while inspecting the
+                # anchor, so retirement and verification are strictly
+                # ordered: a retirement either commits before the evidence
+                # settles (and the verification rejects) or waits until
+                # after it settles (and never retroactively changes the
+                # conclusion). SQLite ignores FOR UPDATE but already
+                # serializes all writers via BEGIN IMMEDIATE.
+                trust_root = session.scalar(
+                    select(TrustRoot)
+                    .where(
+                        TrustRoot.root_id == root_id,
+                        TrustRoot.tenant_id == body.tenant_id,
+                        TrustRoot.workload_id == body.workload_id,
+                    )
+                    .with_for_update()
+                )
+                if trust_root is None:
+                    # Do not reveal whether an out-of-scope or unknown root
+                    # exists: unknown id and scope mismatch share one 404.
+                    raise HTTPException(status_code=404, detail="trust root not found")
+                if trust_root.status == TRUST_ROOT_STATUS_RETIRED:
+                    # A repeated retire is a conflict. It neither rewrites
+                    # the recorded retirement time nor appends any audit or
+                    # other state record.
+                    raise HTTPException(
+                        status_code=409, detail="trust root already retired"
+                    )
+                # Atomic settlement: only one caller can flip
+                # active -> retired, and retired_at is written by that
+                # same single-row update.
+                outcome = session.execute(
+                    update(TrustRoot)
+                    .where(
+                        TrustRoot.root_id == root_id,
+                        TrustRoot.status == TRUST_ROOT_STATUS_ACTIVE,
+                    )
+                    .values(
+                        status=TRUST_ROOT_STATUS_RETIRED,
+                        retired_at=retired_at,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                if outcome.rowcount != 1:
+                    session.rollback()
+                    fresh = session.get(TrustRoot, root_id)
+                    if (
+                        fresh is not None
+                        and fresh.status == TRUST_ROOT_STATUS_RETIRED
+                    ):
+                        raise HTTPException(
+                            status_code=409, detail="trust root already retired"
+                        )
+                    raise HTTPException(
+                        status_code=409, detail="trust root retirement conflict"
+                    )
+                try:
+                    session.commit()
+                except Exception:
+                    session.rollback()
+                    logger.error("trust root retirement failed")
+                    raise HTTPException(
+                        status_code=500, detail="trust root retirement failed"
+                    )
+            except HTTPException:
+                # 404/409 judgements and the controlled 500 above keep
+                # their status; a read-only judgement has written nothing.
+                raise
+            except Exception:
+                # A failure during the locked lookup is a full rollback and
+                # a sanitized 500: the status update can never have happened
+                # on this path, so the root stays active with no time set.
+                session.rollback()
+                logger.error("trust root retirement failed")
+                raise HTTPException(
+                    status_code=500, detail="trust root retirement failed"
+                )
+        # Compact JSON describing only the retirement result. The keys are
+        # emitted in the fixed order root_id, status, retired_at; every
+        # value is a string (allow_nan=False makes non-finite numbers
+        # impossible), terminated by exactly one newline.
+        body_bytes = json.dumps(
+            {
+                "root_id": root_id,
+                "status": TRUST_ROOT_STATUS_RETIRED,
+                "retired_at": _rfc3339(retired_at),
+            },
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return Response(
+            content=body_bytes + b"\n",
+            status_code=200,
+            media_type="application/json",
         )
 
     @app.post("/v1/revocations", status_code=201)
