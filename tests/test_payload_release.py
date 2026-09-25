@@ -465,11 +465,13 @@ def test_concurrent_releases_only_one_succeeds(app):
     def release():
         return TestClient(app).post(url, json=body).status_code
 
+    # Five concurrent claimants stay inside the shared per-minute budget,
+    # so the race is decided purely by the atomic settlement.
     with ThreadPoolExecutor(max_workers=8) as pool:
-        statuses = list(pool.map(lambda _: release(), range(16)))
+        statuses = list(pool.map(lambda _: release(), range(5)))
 
     assert statuses.count(200) == 1
-    assert statuses.count(409) == 15
+    assert statuses.count(409) == 4
 
 
 def test_concurrent_release_and_consume_share_single_win(app):
@@ -498,8 +500,9 @@ def test_concurrent_release_and_consume_share_single_win(app):
             json=consume_body,
         ).status_code
 
+    # Five concurrent claimants stay inside the shared per-minute budget.
     with ThreadPoolExecutor(max_workers=8) as pool:
-        statuses = list(pool.map(call, range(16)))
+        statuses = list(pool.map(call, range(5)))
 
     assert statuses.count(200) == 1
     assert all(code in (200, 409) for code in statuses)

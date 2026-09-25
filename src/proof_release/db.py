@@ -378,6 +378,32 @@ class ReleaseGrant(Base):
     )
 
 
+class RateLimitWindow(Base):
+    """Persisted per-scope request budget for one UTC natural minute.
+
+    One row per (tenant, workload, minute window): the shared budget
+    consumed by the grant consume, grant revoke and payload release
+    endpoints, which together admit at most a fixed number of validated
+    requests per scope and minute. The row is created by the first
+    validated request of a minute with a count of one and incremented
+    atomically up to the cap; the next UTC minute is always a fresh row,
+    so quota recovers at the boundary and scopes never borrow from each
+    other. Rows survive restarts (the budget cannot be reset by bouncing
+    the service) and are never updated across windows or deleted.
+    """
+
+    __tablename__ = "rate_limit_windows"
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # UTC start of the natural minute this counter governs.
+    window_start: Mapped[datetime] = mapped_column(
+        UTCDateTime(), primary_key=True
+    )
+    # Number of validated requests admitted in this window so far.
+    count: Mapped[int] = mapped_column(Integer)
+
+
 class RewrapBatch(Base):
     """One page of a scoped, cursor-driven envelope rewrap batch.
 

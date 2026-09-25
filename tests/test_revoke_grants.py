@@ -631,11 +631,13 @@ def test_concurrent_revokes_only_one_succeeds(app):
     def call():
         return TestClient(app).post(url, json=body).status_code
 
+    # Five concurrent claimants stay inside the shared per-minute budget,
+    # so the race is decided purely by the atomic settlement.
     with ThreadPoolExecutor(max_workers=8) as pool:
-        statuses = list(pool.map(lambda _: call(), range(16)))
+        statuses = list(pool.map(lambda _: call(), range(5)))
 
     assert statuses.count(200) == 1
-    assert statuses.count(409) == 15
+    assert statuses.count(409) == 4
     with app.state.session_factory() as session:
         row = session.get(ReleaseGrant, grant["grant_id"])
         assert row.status == "revoked"
@@ -666,8 +668,9 @@ def test_concurrent_revoke_and_consume_single_win(app):
             json=consume_body,
         ).status_code
 
+    # Five concurrent claimants stay inside the shared per-minute budget.
     with ThreadPoolExecutor(max_workers=8) as pool:
-        statuses = list(pool.map(call, range(16)))
+        statuses = list(pool.map(call, range(5)))
 
     # Exactly one legal settlement across both operations; every loser
     # observes the final state as 409, nothing else.
@@ -710,8 +713,9 @@ def test_concurrent_revoke_and_release_single_win(app):
             payloads.append(response.text)
         return response.status_code
 
+    # Five concurrent claimants stay inside the shared per-minute budget.
     with ThreadPoolExecutor(max_workers=8) as pool:
-        statuses = list(pool.map(call, range(16)))
+        statuses = list(pool.map(call, range(5)))
 
     assert statuses.count(200) == 1
     assert all(code in (200, 409) for code in statuses)

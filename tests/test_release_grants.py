@@ -428,11 +428,13 @@ def test_concurrent_consume_only_one_succeeds(app):
     def consume():
         return TestClient(app).post(url, json=body).status_code
 
+    # Five concurrent claimants stay inside the shared per-minute budget,
+    # so the race is decided purely by the atomic settlement.
     with ThreadPoolExecutor(max_workers=8) as pool:
-        statuses = list(pool.map(lambda _: consume(), range(16)))
+        statuses = list(pool.map(lambda _: consume(), range(5)))
 
     assert statuses.count(200) == 1
-    assert statuses.count(409) == 15
+    assert statuses.count(409) == 4
 
     with app.state.session_factory() as session:
         row = session.get(ReleaseGrant, grant["grant_id"])
