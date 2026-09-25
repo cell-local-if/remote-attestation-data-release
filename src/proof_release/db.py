@@ -83,6 +83,16 @@ AUDIT_EVENT_TYPE_CODES = frozenset(
     {AUDIT_EVENT_TYPE_GRANT, AUDIT_EVENT_TYPE_REWRAP}
 )
 
+#: Finite, service-defined set of workload identity profile statuses. A
+#: profile is born ``active`` and participates in X.509 identity gating; an
+#: explicit revocation settles it once to ``revoked``, after which it stays
+#: queryable but never gates evidence again.
+WORKLOAD_IDENTITY_STATUS_ACTIVE = "active"
+WORKLOAD_IDENTITY_STATUS_REVOKED = "revoked"
+WORKLOAD_IDENTITY_STATUS_CODES = frozenset(
+    {WORKLOAD_IDENTITY_STATUS_ACTIVE, WORKLOAD_IDENTITY_STATUS_REVOKED}
+)
+
 #: Finite, service-defined set of compliance audit-event statuses. Grant
 #: events move pending -> consumed | revoked (mirroring the grant row);
 #: rewrap events are born rewrapped or skipped. Every value is a fixed
@@ -248,18 +258,30 @@ class WorkloadIdentityProfile(Base):
     parsed issuer, subject and URI all match the leaf; otherwise — when any
     profile exists for the anchor — the evidence is rejected.
 
-    Two profiles under the same trust root may not carry the identical
-    claim *set*. The set identity is the SHA-256 of the canonical
+    Two active profiles under the same trust root may not carry the
+    identical claim *set*. The set identity is the SHA-256 of the canonical
     (sorted, compact) JSON of the normalized claims; a unique constraint
     over ``(trust_root_id, claims_fingerprint)`` is what makes concurrent
     duplicate registrations settle as one insert plus stable 409s, and
     distinct claim sets are always independent rows that never overwrite
-    each other.
+    each other. A profile's claim set may be replaced in place (PUT): the
+    fingerprint moves with the new set and the same uniqueness rule applies
+    — a set already held by another (even revoked) profile is rejected
+    rather than duplicated.
+
+    A profile is born ``active``; revocation settles it once to
+    ``revoked``, recording ``revoked_at``. Revoked profiles remain
+    queryable for audit but never participate in X.509 gating again, and a
+    repeated revocation is rejected without rewriting ``revoked_at``.
+    ``updated_at`` is set by each successful claim-set replacement and is
+    NULL for a never-updated profile; ``created_at`` and the profile's
+    scope/identity are immutable for the life of the row.
 
     Only non-sensitive comparison strings are stored — the RFC4514 text of
     a certificate's issuer/subject distinguished names and SAN URI values —
-    plus identifiers, scope and a timestamp. No certificate material,
-    evidence, private keys or free-form secrets have a column here.
+    plus identifiers, scope, the fixed status code and timestamps. No
+    certificate material, evidence, private keys or free-form secrets have
+    a column here.
     """
 
     __tablename__ = "workload_identity_profiles"
@@ -275,6 +297,13 @@ class WorkloadIdentityProfile(Base):
             "workload_id",
             "trust_root_id",
         ),
+        Index(
+            "ix_workload_identity_profiles_lookup",
+            "tenant_id",
+            "workload_id",
+            "trust_root_id",
+            "status",
+        ),
     )
 
     profile_id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -284,9 +313,26 @@ class WorkloadIdentityProfile(Base):
     # cross trust roots, tenants or workloads.
     trust_root_id: Mapped[str] = mapped_column(String(36), index=True)
     # SHA-256 hex of the canonical JSON of the normalized claim set, used
-    # for exact whole-set duplicate detection within one trust root.
+    # for exact whole-set duplicate detection within one trust root. It
+    # moves with the claim set when a profile is updated.
     claims_fingerprint: Mapped[str] = mapped_column(String(64))
+    # One of WORKLOAD_IDENTITY_STATUS_*; a fixed, service-defined code only.
+    # active -> revoked, settled atomically by the first revocation.
+    status: Mapped[str] = mapped_column(
+        String(16), default=WORKLOAD_IDENTITY_STATUS_ACTIVE
+    )
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    # Set by each successful claim-set replacement; NULL when the profile
+    # has never been updated. Immutable created_at keeps the original
+    # registration time.
+    updated_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
+    # Set exactly once, by the winning active -> revoked transition; a
+    # repeated revocation observes the stored value and never rewrites it.
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
 
 
 class WorkloadIdentityClaim(Base):
@@ -298,8 +344,10 @@ class WorkloadIdentityClaim(Base):
     equal to ``issuer``, ``subject`` and ``uri`` respectively. All three
     are required (an identity claim is rejected at the API boundary
     otherwise). Rows are written in the same transaction as their parent
-    profile and never updated or deleted by the service. Only the
-    non-sensitive comparison strings are stored.
+    profile and replaced as a set when the profile's claims are updated.
+    ``position`` records the claim's first-seen order within its profile so
+    reads reproduce registration/update order without relying on physical
+    storage order. Only the non-sensitive comparison strings are stored.
     """
 
     __tablename__ = "workload_identity_claims"
@@ -313,6 +361,11 @@ class WorkloadIdentityClaim(Base):
             "subject",
             "uri",
         ),
+        Index(
+            "ix_workload_identity_claims_profile_position",
+            "profile_id",
+            "position",
+        ),
     )
 
     claim_id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -321,6 +374,9 @@ class WorkloadIdentityClaim(Base):
         ForeignKey("workload_identity_profiles.profile_id"),
         index=True,
     )
+    # Zero-based first-seen position of the claim within its profile, so
+    # list/update/revoke responses reproduce stored order deterministically.
+    position: Mapped[int] = mapped_column(Integer)
     tenant_id: Mapped[str] = mapped_column(String(256), index=True)
     workload_id: Mapped[str] = mapped_column(String(256))
     trust_root_id: Mapped[str] = mapped_column(String(36), index=True)
