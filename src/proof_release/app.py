@@ -722,6 +722,173 @@ def _decode_audit_event_cursor(
     return boundary_at, boundary_event
 
 
+def _revocation_cursor_payload(
+    tenant_id: str,
+    workload_id: str,
+    trust_root_id: str,
+    boundary_at: str,
+    boundary_revocation: str,
+    *,
+    revocation_id: str,
+    certificate_fingerprint: str,
+    effective_after: str,
+    effective_before: str,
+    snapshot_at: str,
+    snapshot_id: str,
+) -> bytes:
+    """Canonical byte payload authenticated inside a revocation cursor.
+
+    The cursor marks an exclusive ``(effective_at, revocation_id)``
+    position and every active filter plus the fixed replayable snapshot
+    high-water mark ``(created_at, revocation_id)`` are part of the
+    signed payload, so a cursor minted for one filter set or snapshot
+    cannot be replayed against another. The kind tag distinguishes these
+    cursors from the rewrap, grant-audit and compliance audit-event
+    families even though all share the same HMAC secret.
+    """
+    return json.dumps(
+        {
+            "k": _REVOCATION_CURSOR_KIND,
+            "t": tenant_id,
+            "w": workload_id,
+            "r": trust_root_id,
+            "at": boundary_at,
+            "id": boundary_revocation,
+            "ri": revocation_id,
+            "fp": certificate_fingerprint,
+            "a": effective_after,
+            "b": effective_before,
+            "sa": snapshot_at,
+            "si": snapshot_id,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _encode_revocation_cursor(
+    tenant_id: str,
+    workload_id: str,
+    trust_root_id: str,
+    boundary_at: str,
+    boundary_revocation: str,
+    *,
+    revocation_id: str,
+    certificate_fingerprint: str,
+    effective_after: str,
+    effective_before: str,
+    snapshot_at: str,
+    snapshot_id: str,
+) -> str:
+    """Build an opaque, scope- and filter-bound exclusive revocation cursor."""
+    payload = _revocation_cursor_payload(
+        tenant_id,
+        workload_id,
+        trust_root_id,
+        boundary_at,
+        boundary_revocation,
+        revocation_id=revocation_id,
+        certificate_fingerprint=certificate_fingerprint,
+        effective_after=effective_after,
+        effective_before=effective_before,
+        snapshot_at=snapshot_at,
+        snapshot_id=snapshot_id,
+    )
+    mac = hmac.new(_cursor_secret(), payload, hashlib.sha256).digest()
+    return b64url_encode(payload + mac)
+
+
+def _decode_revocation_cursor(
+    token: str,
+    tenant_id: str,
+    workload_id: str,
+    trust_root_id: str,
+    *,
+    revocation_id: str,
+    certificate_fingerprint: str,
+    effective_after: str,
+    effective_before: str,
+) -> tuple[str, str, str, str] | None:
+    """Validate a revocation cursor and return its exclusive boundary.
+
+    Returns ``(effective_at, revocation_id, snapshot_at, snapshot_id)``
+    on success or ``None`` for a malformed/forged token, a cursor of
+    another kind (rewrap, grant audit or compliance audit events), or one
+    minted for any other scope, filter combination or snapshot. The
+    beginning-of-range marker (``""``) never reaches this function.
+    """
+    if not _CURSOR_RE.fullmatch(token):
+        return None
+    try:
+        raw = b64url_decode(token)
+    except ValueError:
+        return None
+    # The MAC is a fixed 32-byte suffix; the JSON payload precedes it.
+    if len(raw) <= 32:
+        return None
+    payload, mac = raw[:-32], raw[-32:]
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    if decoded.get("k") != _REVOCATION_CURSOR_KIND:
+        return None
+    boundary_at = decoded.get("at")
+    boundary_revocation = decoded.get("id")
+    if not isinstance(boundary_at, str) or boundary_at == "":
+        return None
+    if not isinstance(boundary_revocation, str) or not _UUID_RE.fullmatch(
+        boundary_revocation
+    ):
+        return None
+    snapshot_at = decoded.get("sa")
+    snapshot_id = decoded.get("si")
+    # A resume cursor always names the snapshot high-water mark
+    # established by the range's first query.
+    if not isinstance(snapshot_at, str) or snapshot_at == "":
+        return None
+    if not isinstance(snapshot_id, str) or not _UUID_RE.fullmatch(snapshot_id):
+        return None
+    expected_mac = hmac.new(
+        _cursor_secret(),
+        _revocation_cursor_payload(
+            tenant_id,
+            workload_id,
+            trust_root_id,
+            boundary_at,
+            boundary_revocation,
+            revocation_id=revocation_id,
+            certificate_fingerprint=certificate_fingerprint,
+            effective_after=effective_after,
+            effective_before=effective_before,
+            snapshot_at=snapshot_at,
+            snapshot_id=snapshot_id,
+        ),
+        hashlib.sha256,
+    ).digest()
+    if not hmac.compare_digest(mac, expected_mac):
+        return None
+    # Defense in depth: the MAC already covers every field, but confirm
+    # the scope and each active filter explicitly.
+    if not hmac.compare_digest(str(decoded.get("t", "")), tenant_id):
+        return None
+    if not hmac.compare_digest(str(decoded.get("w", "")), workload_id):
+        return None
+    if not hmac.compare_digest(str(decoded.get("r", "")), trust_root_id):
+        return None
+    for key, expected in (
+        ("ri", revocation_id),
+        ("fp", certificate_fingerprint),
+        ("a", effective_after),
+        ("b", effective_before),
+    ):
+        if not hmac.compare_digest(str(decoded.get(key, "")), expected):
+            return None
+    return boundary_at, boundary_revocation, snapshot_at, snapshot_id
+
+
 #: Fixed page size for the read-only compliance audit-event listing. As
 #: with the grant audit, the page size is an internal constant and never
 #: part of the request or response contract.
@@ -731,6 +898,17 @@ AUDIT_EVENT_PAGE_SIZE = 100
 #: rewrap-batch cursor nor a release-grant audit cursor (all authenticated
 #: with the same secret) can ever be replayed here.
 _AUDIT_EVENT_CURSOR_KIND = "compliance-audit-events-v1"
+
+#: Fixed page size for the read-only revocation registry listing. As with
+#: the other audit listings, the page size is internal and never part of
+#: the request or response contract.
+REVOCATION_PAGE_SIZE = 100
+
+#: Discriminator embedded in revocation-registry cursors so a rewrap,
+#: release-grant audit or compliance audit-event cursor (all authenticated
+#: with the same secret) can never be replayed against the revocation
+#: listing, and vice versa.
+_REVOCATION_CURSOR_KIND = "certificate-revocations-v1"
 
 
 class CreateChallengeRequest(BaseModel):
@@ -3372,6 +3550,355 @@ def create_app(
             json.dumps(
                 {
                     "events": events,
+                    "next_cursor": next_cursor,
+                    "complete": complete,
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
+
+    @app.get("/v1/revocations")
+    def list_certificate_revocations(
+        request: Request,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        trust_root_id: str = Query(...),
+        revocation_id: str | None = Query(default=None),
+        certificate_fingerprint: str | None = Query(default=None),
+        effective_after: str | None = Query(default=None),
+        effective_before: str | None = Query(default=None),
+        cursor: str | None = Query(default=None),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return a read-only, cursor-stable page of registrations.
+
+        The range is fixed by the mandatory tenant, workload and trust
+        root and may be narrowed by an explicit registration id, a
+        certificate fingerprint, and an inclusive effective-at window.
+        Ordering is stable ``(effective_at, revocation_id)`` ascending
+        with an exclusive keyset cursor. The cursor carries its own kind
+        tag, is HMAC-authenticated, and is bound to the scope, every
+        active filter *and* the fixed snapshot established by the
+        range's first (cursor-less) query, so it can be neither forged
+        nor replayed against a different scope/filter/snapshot, and a
+        cursor from any other cursor family is rejected. The first
+        query's page is a replayable snapshot: registrations committed
+        afterwards never enter a replayed page and surface only in a
+        fresh first query. The handler issues only SELECTs — it never
+        creates an audit row, computes a certificate's current status,
+        or mutates a registration.
+        """
+        # --- request shape (all 422, no storage touched) ----------------
+        allowed_params = {
+            "tenant_id",
+            "workload_id",
+            "trust_root_id",
+            "revocation_id",
+            "certificate_fingerprint",
+            "effective_after",
+            "effective_before",
+            "cursor",
+        }
+        if set(request.query_params.keys()) - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+        if not trust_root_id.strip() or not _UUID_RE.fullmatch(trust_root_id):
+            raise HTTPException(status_code=422, detail="invalid trust root identifier")
+
+        revocation_filter: str | None = None
+        if revocation_id is not None:
+            if not revocation_id.strip() or not _UUID_RE.fullmatch(revocation_id):
+                raise HTTPException(
+                    status_code=422, detail="invalid revocation identifier"
+                )
+            revocation_filter = revocation_id
+
+        fingerprint_filter: str | None = None
+        if certificate_fingerprint is not None:
+            if not certificate_fingerprint.strip():
+                raise HTTPException(
+                    status_code=422,
+                    detail="certificate_fingerprint must be unpadded base64url of 32 bytes",
+                )
+            try:
+                fingerprint_filter = _certificate_fingerprint_format(
+                    certificate_fingerprint
+                )
+            except ValueError:
+                raise HTTPException(
+                    status_code=422,
+                    detail="certificate_fingerprint must be unpadded base64url of 32 bytes",
+                )
+
+        def _time_bound(value: str | None, name: str) -> tuple[str, datetime | None]:
+            if value is None:
+                return "", None
+            if not value.strip():
+                raise HTTPException(
+                    status_code=422, detail=f"{name} must be UTC RFC3339"
+                )
+            try:
+                parsed = _parse_utc_rfc3339(value)
+            except ValueError:
+                raise HTTPException(
+                    status_code=422, detail=f"{name} must be UTC RFC3339"
+                )
+            # Normalize the spelling embedded into the cursor so two
+            # equivalent UTC spellings cannot mint different cursor domains.
+            return _rfc3339(parsed), parsed
+
+        after_raw, after_dt = _time_bound(effective_after, "effective_after")
+        before_raw, before_dt = _time_bound(effective_before, "effective_before")
+        # The window is closed on both ends; equality is a valid
+        # single-instant window and the start must not follow the end.
+        if after_dt is not None and before_dt is not None and after_dt > before_dt:
+            raise HTTPException(
+                status_code=422,
+                detail="effective_after must not be later than effective_before",
+            )
+
+        # Omitted cursor or an explicit empty string starts before the
+        # smallest registration and fixes the range's replayable snapshot.
+        # Whitespace, malformed, forged, cross-scope, cross-filter,
+        # cross-snapshot or foreign-kind cursors are indistinguishable 422s.
+        boundary_dt: datetime | None = None
+        boundary_revocation: str | None = None
+        snapshot_dt: datetime | None = None
+        if cursor is not None and cursor != "":
+            if not cursor.strip() or not _CURSOR_RE.fullmatch(cursor):
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            decoded_boundary = _decode_revocation_cursor(
+                cursor,
+                tenant_id,
+                workload_id,
+                trust_root_id,
+                revocation_id=revocation_filter or "",
+                certificate_fingerprint=fingerprint_filter or "",
+                effective_after=after_raw,
+                effective_before=before_raw,
+            )
+            if decoded_boundary is None:
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            boundary_at_raw, boundary_revocation, snapshot_at_raw, _ = decoded_boundary
+            try:
+                boundary_dt = _parse_utc_rfc3339(boundary_at_raw)
+                snapshot_dt = _parse_utc_rfc3339(snapshot_at_raw)
+            except ValueError:
+                raise HTTPException(status_code=422, detail="invalid cursor")
+
+        # --- read-only scan ---------------------------------------------
+        try:
+            with session_factory() as session:
+                # The explicitly named trust root must exist in exactly
+                # this tenant and workload; an unknown or cross-scope
+                # root is an indistinguishable 404 (it is an explicit
+                # resource selector, not a mere range bound).
+                root = session.scalar(
+                    select(TrustRoot.root_id).where(
+                        TrustRoot.root_id == trust_root_id,
+                        TrustRoot.tenant_id == tenant_id,
+                        TrustRoot.workload_id == workload_id,
+                    )
+                )
+                if root is None:
+                    raise HTTPException(status_code=404, detail="trust root not found")
+
+                # An explicitly named registration id or fingerprint must
+                # resolve inside exactly this scope and trust root; either
+                # way an unknown/cross-scope value is the same 404, so no
+                # difference between "unknown" and "belongs elsewhere" is
+                # ever revealed.
+                if revocation_filter is not None:
+                    named = session.get(CertificateRevocation, revocation_filter)
+                    if (
+                        named is None
+                        or named.tenant_id != tenant_id
+                        or named.workload_id != workload_id
+                        or named.trust_root_id != trust_root_id
+                    ):
+                        raise HTTPException(
+                            status_code=404, detail="revocation not found"
+                        )
+                if fingerprint_filter is not None:
+                    matched = session.scalar(
+                        select(CertificateRevocation.revocation_id)
+                        .where(
+                            CertificateRevocation.tenant_id == tenant_id,
+                            CertificateRevocation.workload_id == workload_id,
+                            CertificateRevocation.trust_root_id == trust_root_id,
+                            CertificateRevocation.certificate_fingerprint
+                            == fingerprint_filter,
+                        )
+                        .limit(1)
+                    )
+                    if matched is None:
+                        # Do not reveal whether the fingerprint is unknown
+                        # or registered under another scope/root.
+                        raise HTTPException(
+                            status_code=404, detail="revocation not found"
+                        )
+
+                def _filtered(stmt):
+                    if revocation_filter is not None:
+                        stmt = stmt.where(
+                            CertificateRevocation.revocation_id == revocation_filter
+                        )
+                    if fingerprint_filter is not None:
+                        stmt = stmt.where(
+                            CertificateRevocation.certificate_fingerprint
+                            == fingerprint_filter
+                        )
+                    if after_dt is not None:
+                        stmt = stmt.where(
+                            CertificateRevocation.effective_at >= after_dt
+                        )
+                    if before_dt is not None:
+                        stmt = stmt.where(
+                            CertificateRevocation.effective_at <= before_dt
+                        )
+                    return stmt
+
+                if snapshot_dt is None:
+                    # First query of the range: fix a replayable snapshot
+                    # as the greatest ``(created_at, revocation_id)`` among
+                    # currently committed, in-range rows. Registrations
+                    # committed afterwards lie beyond the high-water mark
+                    # and never enter this snapshot's pages.
+                    hwm_stmt = _filtered(
+                        select(
+                            CertificateRevocation.created_at,
+                            CertificateRevocation.revocation_id,
+                        ).where(
+                            CertificateRevocation.tenant_id == tenant_id,
+                            CertificateRevocation.workload_id == workload_id,
+                            CertificateRevocation.trust_root_id == trust_root_id,
+                        )
+                    )
+                    hwm_row = session.execute(
+                        hwm_stmt.order_by(
+                            CertificateRevocation.created_at.desc(),
+                            CertificateRevocation.revocation_id.desc(),
+                        ).limit(1)
+                    ).first()
+                    if hwm_row is None:
+                        # No in-range registration at snapshot time: the
+                        # fixed first page is empty and already complete;
+                        # later commits belong to fresh first queries.
+                        rows = []
+                        hwm_created_at = None
+                        hwm_revocation = ""
+                    else:
+                        hwm_created_at, hwm_revocation = hwm_row
+                        snapshot_dt = hwm_created_at
+                else:
+                    # The snapshot high-water mark travels inside the
+                    # cursor (HMAC-verified above); its id component is
+                    # read alongside for the inclusive tie predicate.
+                    hwm_created_at = snapshot_dt
+                    hwm_revocation = decoded_boundary[3]
+
+                if hwm_created_at is not None:
+                    stmt = _filtered(
+                        select(CertificateRevocation).where(
+                            CertificateRevocation.tenant_id == tenant_id,
+                            CertificateRevocation.workload_id == workload_id,
+                            CertificateRevocation.trust_root_id == trust_root_id,
+                            # Inclusive snapshot high-water mark.
+                            or_(
+                                CertificateRevocation.created_at < hwm_created_at,
+                                and_(
+                                    CertificateRevocation.created_at
+                                    == hwm_created_at,
+                                    CertificateRevocation.revocation_id
+                                    <= hwm_revocation,
+                                ),
+                            ),
+                        )
+                    )
+                    if boundary_dt is not None:
+                        # Exclusive (effective_at, revocation_id) keyset.
+                        stmt = stmt.where(
+                            or_(
+                                CertificateRevocation.effective_at > boundary_dt,
+                                and_(
+                                    CertificateRevocation.effective_at
+                                    == boundary_dt,
+                                    CertificateRevocation.revocation_id
+                                    > boundary_revocation,
+                                ),
+                            )
+                        )
+                    stmt = stmt.order_by(
+                        CertificateRevocation.effective_at.asc(),
+                        CertificateRevocation.revocation_id.asc(),
+                    ).limit(REVOCATION_PAGE_SIZE + 1)
+                    # One extra row is the "more follows" probe. The scan
+                    # is a single read-only statement: a storage failure
+                    # aborts the whole request with a 500 rather than
+                    # returning a partial page.
+                    rows = list(session.scalars(stmt))
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("certificate revocation query failed")
+            raise HTTPException(
+                status_code=500, detail="revocation registry unavailable"
+            )
+
+        if not rows:
+            page = []
+            has_more = False
+        else:
+            has_more = len(rows) > REVOCATION_PAGE_SIZE
+            page = rows[:REVOCATION_PAGE_SIZE]
+
+        revocations = [
+            {
+                # Field order follows the registration success response.
+                "revocation_id": row.revocation_id,
+                "trust_root_id": row.trust_root_id,
+                "certificate_fingerprint": row.certificate_fingerprint,
+                "effective_at": _rfc3339(row.effective_at),
+            }
+            for row in page
+        ]
+
+        if has_more:
+            last = page[-1]
+            next_cursor = _encode_revocation_cursor(
+                tenant_id,
+                workload_id,
+                trust_root_id,
+                _rfc3339(last.effective_at),
+                last.revocation_id,
+                revocation_id=revocation_filter or "",
+                certificate_fingerprint=fingerprint_filter or "",
+                effective_after=after_raw,
+                effective_before=before_raw,
+                snapshot_at=_rfc3339(hwm_created_at),
+                snapshot_id=hwm_revocation,
+            )
+            complete = False
+        else:
+            next_cursor = ""
+            complete = True
+
+        # Compact container (list, next_cursor, complete — the same shape
+        # as the compliance audit query) with a single terminating newline.
+        # Every entry value is a string and complete is a boolean, so no
+        # floats, -0.0 or non-finite values can appear.
+        body = (
+            json.dumps(
+                {
+                    "revocations": revocations,
                     "next_cursor": next_cursor,
                     "complete": complete,
                 },
