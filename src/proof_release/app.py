@@ -9,7 +9,10 @@ import math
 import os
 import re
 import secrets
+import threading
 import uuid
+import queue
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -51,6 +54,10 @@ from proof_release.db import (
     REWRAP_RESULT_REWRAP_FAILED,
     REWRAP_RESULT_REWRAPPED,
     REWRAP_RESULT_SKIPPED,
+    REWRAP_JOB_STATUS_FAILED,
+    REWRAP_JOB_STATUS_QUEUED,
+    REWRAP_JOB_STATUS_RUNNING,
+    REWRAP_JOB_STATUS_SUCCEEDED,
     VERIFICATION_RESULT_ACCEPTED,
     VERIFICATION_RESULT_REJECTED,
     WORKLOAD_IDENTITY_STATUS_ACTIVE,
@@ -78,6 +85,7 @@ from proof_release.db import (
     ReleaseGrant,
     RewrapBatch,
     RewrapBatchItem,
+    RewrapJob,
     TrustRoot,
     WorkloadIdentityClaim,
     WorkloadIdentityProfile,
@@ -1338,6 +1346,36 @@ class CreateRewrapBatchRequest(BaseModel):
         return value
 
 
+class CreateRewrapJobRequest(BaseModel):
+    """Submit a persistent, asynchronously advanced rewrap job.
+
+    Same field contract as the one-shot batch (two required non-blank
+    scope strings, an optional 1..200 limit defaulting to 50, an optional
+    opaque scope-bound cursor); the difference is that a job is persisted
+    and advanced in the background after a ``202`` rather than inline.
+    """
+
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    limit: StrictInt = Field(
+        default=REWRAP_BATCH_DEFAULT_LIMIT,
+        ge=REWRAP_BATCH_MIN_LIMIT,
+        le=REWRAP_BATCH_MAX_LIMIT,
+    )
+    cursor: StrictStr | None = None
+
+    _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
+
+    @field_validator("cursor")
+    @classmethod
+    def _cursor_shape(cls, value: str | None) -> str | None:
+        if value is None or value == "":
+            return None
+        if not value.strip() or not _CURSOR_RE.fullmatch(value):
+            raise ValueError("cursor is not a valid rewrap cursor")
+        return value
+
+
 def _migrate_additive(engine) -> None:
     """Apply forward-only additive column additions to pre-existing databases."""
     if engine.dialect.name != "sqlite":
@@ -1516,10 +1554,551 @@ def create_app(
                 raise HTTPException(status_code=500, detail="rate limit unavailable")
         return None
 
-    app = FastAPI(title="Remote Attestation Data Release")
+    # ------------------------------------------------------------------
+    # Persistent asynchronous rewrap jobs
+    # ------------------------------------------------------------------
+
+    class RewrapJobRunner:
+        """Background machinery that advances persistent rewrap jobs.
+        A job is durable progress state. Advancement is page driven and
+        every envelope is an independent commit, so a crash can lose at
+        most the uncommitted attempt on one envelope; the job resumes from
+        its last committed ``next_cursor``. A claim token makes
+        advancement mutually exclusive across threads and processes
+        (two POSTs, or a live process and a recovery sweep): only the
+        runner holding the token for a job runs it, and every status
+        transition is additionally guarded so queued/running can never be
+        entered twice. The claim is held for the whole run and released
+        when the job settles or the runner is shutting down between pages.
+        """
+
+        #: Sentinel returned by _process_one when this runner no longer
+        #: owns the claim mid-envelope: distinct from a result code so the
+        #: page loop does not mistake it for a failure it caused.
+        _CLAIM_LOST = object()
+
+        def __init__(self, session_factory, *, max_workers: int = 4) -> None:
+            self._session_factory = session_factory
+            self._max_workers = max_workers
+            # Bounded pool of daemon workers sharing one FIFO: jobs queued
+            # while every worker is busy wait in durable ``queued`` state
+            # until one frees — submissions are never dropped in memory
+            # and survive as rows regardless. Workers are created by
+            # start() (application lifespan), not in __init__, so an app
+            # built without its lifespan (tests) advances nothing on its
+            # own and the durable rows stay exactly as committed.
+            self._queue: queue.SimpleQueue[tuple[str, bool] | None] = (
+                queue.SimpleQueue()
+            )
+            self._workers: list[threading.Thread] = []
+            self._started = threading.Event()
+            self._shutdown = threading.Event()
+            # Claim tokens held by this process's runner threads, keyed by
+            # job id. A plain dict is sufficient for single-key access; all
+            # real mutual exclusion is the guarded UPDATE in the database.
+            self._claim_tokens: dict[str, str] = {}
+            # Optional test/observability hook invoked exactly once after a
+            # runner has claimed a job (queued/running -> running committed),
+            # outside any database transaction. Production leaves it None.
+            self.post_claim = None
+
+        def start(self) -> None:
+            """Spawn the worker pool (idempotent)."""
+            if self._started.is_set() or self._shutdown.is_set():
+                return
+            self._started.set()
+            for index in range(self._max_workers):
+                worker = threading.Thread(
+                    target=self._worker_loop,
+                    name=f"rewrap-job-{index}",
+                    daemon=True,
+                )
+                worker.start()
+                self._workers.append(worker)
+
+        def _worker_loop(self) -> None:
+            while True:
+                item = self._queue.get()
+                if item is None:
+                    return
+                job_id, retry = item
+                if self._shutdown.is_set():
+                    # Shutdown began while this id was queued: leave the
+                    # durable row untouched for the next process's sweep
+                    # rather than starting a new run.
+                    continue
+                self._run_guarded(job_id, retry=retry)
+
+        def shutdown(self) -> None:
+            # Let in-flight jobs reach their next independent commit
+            # boundary; queued-but-unstarted ids die with the process but
+            # their durable queued/running/failed rows are resumed by the
+            # next process's startup sweep.
+            self._shutdown.set()
+            for _ in self._workers:
+                self._queue.put(None)
+            for worker in self._workers:
+                worker.join()
+            self._workers = []
+            self._started.clear()
+
+        #: Statuses resumed by a fresh process at startup. A ``failed``
+        #: job is parked, not dead: its cursor sits before the failing
+        #: envelope, and a restart re-attempts it from there. Only a
+        #: restart makes that retry — a live runner never does — so the
+        #: job remains recoverable until its scope is fully scanned.
+        _RECOVERABLE_STATUSES = (
+            REWRAP_JOB_STATUS_QUEUED,
+            REWRAP_JOB_STATUS_RUNNING,
+            REWRAP_JOB_STATUS_FAILED,
+        )
+
+        def recover_and_start(self) -> None:
+            """Start the pool, clear stale claims, then resume every open job.
+
+            Queued/running rows left by a dead process may carry its claim
+            token, which can never be satisfied again, so it is cleared
+            before the sweep. Failed jobs parked at their failing envelope
+            are enqueued as retries: claim moves failed -> running and the
+            job resumes from the parked cursor.
+            """
+            self.start()
+            with self._session_factory() as session:
+                session.execute(
+                    update(RewrapJob)
+                    .where(
+                        RewrapJob.status.in_(
+                            (REWRAP_JOB_STATUS_QUEUED, REWRAP_JOB_STATUS_RUNNING)
+                        )
+                    )
+                    .values(claim_token=None)
+                )
+                session.commit()
+                open_jobs = session.execute(
+                    select(RewrapJob.job_id, RewrapJob.status).where(
+                        RewrapJob.status.in_(self._RECOVERABLE_STATUSES)
+                    )
+                ).all()
+            for job_id, status in open_jobs:
+                self.submit(job_id, retry=status == REWRAP_JOB_STATUS_FAILED)
+
+        def submit(self, job_id: str, *, retry: bool = False) -> None:
+            # Enqueue only while the pool is alive. An app built without
+            # its lifespan (tests) enqueues nothing: the durable row waits
+            # for an explicit runner call or a later process's startup
+            # recovery sweep. ``retry`` belongs to that sweep's
+            # failed -> running re-attempt; a live submission never retries
+            # a failed job.
+            if self._started.is_set() and not self._shutdown.is_set():
+                self._queue.put((job_id, retry))
+
+        def _run_guarded(self, job_id: str, *, retry: bool = False) -> None:
+            try:
+                self.run(job_id, retry=retry)
+            except Exception:
+                # A runner must never die silently: the exception is
+                # logged and the job is left claimed/running; the next
+                # process's startup recovery resumes it from the last
+                # committed cursor.
+                logger.exception("rewrap job %s runner failed", job_id)
+                with suppress(Exception):
+                    self._release_claim(job_id)
+
+        # -- claim / status transitions ---------------------------------
+
+        def _claim(self, job_id: str, *, retry: bool = False) -> bool:
+            """Atomically become the exclusive runner of ``job_id``.
+
+            A live submission claims a queued job or takes over an
+            unclaimed running job (in-process recovery). A startup sweep
+            may additionally move a parked ``failed`` job back to running
+            (``retry=True``) to re-attempt it from the parked cursor.
+            Returns ``False`` when the job is succeeded or already
+            claimed.
+            """
+            claimable = (
+                self._RECOVERABLE_STATUSES
+                if retry
+                else (REWRAP_JOB_STATUS_QUEUED, REWRAP_JOB_STATUS_RUNNING)
+            )
+            token = b64url_encode(secrets.token_bytes(CAPABILITY_BYTES))
+            now = _utcnow()
+            with self._session_factory() as session:
+                claimed = session.execute(
+                    update(RewrapJob)
+                    .where(
+                        RewrapJob.job_id == job_id,
+                        RewrapJob.status.in_(claimable),
+                        RewrapJob.claim_token.is_(None),
+                    )
+                    .values(
+                        status=REWRAP_JOB_STATUS_RUNNING,
+                        claim_token=token,
+                        updated_at=now,
+                    )
+                    .execution_options(synchronize_session=False)
+                ).rowcount
+                session.commit()
+            if claimed == 1:
+                # Remember the token so this runner releases only its own
+                # claim; the guarded UPDATE above is the real exclusion.
+                self._claim_tokens[job_id] = token
+                return True
+            return False
+
+        def _owns(self, session, job_id: str) -> bool:
+            token = self._claim_tokens.get(job_id)
+            if token is None:
+                return False
+            row = session.scalar(
+                select(RewrapJob.claim_token).where(RewrapJob.job_id == job_id)
+            )
+            return row is not None and hmac.compare_digest(row, token)
+
+        def _release_claim(self, job_id: str) -> None:
+            token = self._claim_tokens.pop(job_id, None)
+            if token is None:
+                return
+            with self._session_factory() as session:
+                session.execute(
+                    update(RewrapJob)
+                    .where(
+                        RewrapJob.job_id == job_id,
+                        RewrapJob.claim_token == token,
+                    )
+                    .values(claim_token=None, updated_at=_utcnow())
+                    .execution_options(synchronize_session=False)
+                )
+                session.commit()
+
+        # -- advancement ------------------------------------------------
+
+        def run(self, job_id: str, *, retry: bool = False) -> None:
+            if not self._claim(job_id, retry=retry):
+                # Succeeded, already advanced by another runner, or a
+                # failed job presented to a non-retry claim.
+                return
+            if self.post_claim is not None:
+                self.post_claim(job_id)
+            try:
+                while True:
+                    terminal = self._advance_page(job_id)
+                    if terminal is not None:
+                        # succeeded or failed: the terminal transition was
+                        # committed inside _advance_page and the claim
+                        # cleared there.
+                        return
+                    if self._shutdown.is_set():
+                        # Stop between pages at a fully committed boundary.
+                        # Release the in-process claim; the row stays
+                        # running and the next process's startup sweep
+                        # clears any stale claim before resuming it.
+                        self._release_claim(job_id)
+                        return
+            finally:
+                self._claim_tokens.pop(job_id, None)
+
+        def _advance_page(self, job_id: str) -> str | None:
+            """Process up to ``limit`` envelopes from the current cursor.
+
+            Returns the terminal status when the job settles
+            (``succeeded``/``failed``), or ``None`` when a full page was
+            handled and the runner should page again.
+            """
+            with self._session_factory() as session:
+                if not self._owns(session, job_id):
+                    return None
+                job = session.get(RewrapJob, job_id)
+                if job is None or job.status not in (
+                    REWRAP_JOB_STATUS_QUEUED,
+                    REWRAP_JOB_STATUS_RUNNING,
+                ):
+                    return job.status if job else None
+                tenant_id = job.tenant_id
+                workload_id = job.workload_id
+                limit = job.limit
+                boundary = (
+                    _decode_cursor(job.next_cursor, tenant_id, workload_id)
+                    if job.next_cursor
+                    else ""
+                )
+                if boundary is None:
+                    # A stored cursor must always verify; if it does not
+                    # the row is corrupt and the job cannot safely move.
+                    logger.error("rewrap job %s has an unverifiable cursor", job_id)
+                    self._settle_failed(session, job, job.next_cursor)
+                    return REWRAP_JOB_STATUS_FAILED
+                try:
+                    rows = list(
+                        session.scalars(
+                            select(DataEnvelope)
+                            .where(
+                                DataEnvelope.tenant_id == tenant_id,
+                                DataEnvelope.workload_id == workload_id,
+                                DataEnvelope.data_id > boundary,
+                            )
+                            .order_by(DataEnvelope.data_id.asc())
+                            .limit(limit + 1)
+                        )
+                    )
+                except Exception:
+                    session.rollback()
+                    logger.error("rewrap job %s scan failed", job_id)
+                    raise
+
+            has_more = len(rows) > limit
+            # Snapshot the values the worker needs before this read
+            # session closes; later writes use independent sessions.
+            page = [
+                (
+                    row.tenant_id,
+                    row.workload_id,
+                    row.data_id,
+                    row.key_version,
+                    row.wrapped_key,
+                )
+                for row in rows[:limit]
+            ]
+
+            for envelope in page:
+                processed = self._process_one(job_id, envelope)
+                if processed is None:
+                    # Committed at an independent boundary: shutdown can
+                    # take effect here and resume from next_cursor later.
+                    if self._shutdown.is_set():
+                        return None
+                    continue
+                if processed is RewrapJobRunner._CLAIM_LOST:
+                    # Another runner owns or settled the job; stop without
+                    # touching it.
+                    return None
+                # This runner settled the job as failed.
+                return REWRAP_JOB_STATUS_FAILED
+            # Whole page reached without a failure.
+            with self._session_factory() as session:
+                if not self._owns(session, job_id):
+                    return None
+                job = session.get(RewrapJob, job_id)
+                now = _utcnow()
+                if not has_more:
+                    # The limit+1 probe found nothing beyond this page, so
+                    # the scope has been fully scanned: settle exactly once.
+                    settled = session.execute(
+                        update(RewrapJob)
+                        .where(
+                            RewrapJob.job_id == job_id,
+                            RewrapJob.status == REWRAP_JOB_STATUS_RUNNING,
+                        )
+                        .values(
+                            status=REWRAP_JOB_STATUS_SUCCEEDED,
+                            complete=True,
+                            next_cursor="",
+                            claim_token=None,
+                            updated_at=now,
+                        )
+                        .execution_options(synchronize_session=False)
+                    ).rowcount
+                    if settled != 1:
+                        session.rollback()
+                        raise RuntimeError(
+                            "rewrap job success settlement did not settle"
+                        )
+                    session.commit()
+                    return REWRAP_JOB_STATUS_SUCCEEDED
+                # Full page and more may follow: just bump updated_at.
+                job.updated_at = now
+                session.commit()
+            return None
+
+        def _process_one(self, job_id: str, envelope) -> str | None:
+            """Independently commit one envelope; non-None result = failure.
+
+            ``envelope`` is the detached snapshot tuple
+            ``(tenant_id, workload_id, data_id, key_version, wrapped_key)``
+            produced by the page scan.
+            """
+            tenant_id, workload_id, data_id, stored_version, wrapped_key = envelope
+
+            with self._session_factory() as session:
+                if not self._owns(session, job_id):
+                    return RewrapJobRunner._CLAIM_LOST
+                job = session.get(RewrapJob, job_id)
+                if job is None or job.status not in (
+                    REWRAP_JOB_STATUS_QUEUED,
+                    REWRAP_JOB_STATUS_RUNNING,
+                ):
+                    return RewrapJobRunner._CLAIM_LOST
+
+                # Re-resolve the keyring per envelope: a keyring that
+                # becomes unusable mid-job fails the job on the envelope
+                # that could not be handled.
+                try:
+                    keyring = load_keyring()
+                except MasterKeyError:
+                    logger.error("master keyring unavailable during rewrap job")
+                    self._settle_failed(session, job, job.next_cursor)
+                    return REWRAP_RESULT_KEYRING
+
+                current_version = keyring.current_version
+                audit_old_version = stored_version
+                if stored_version == current_version:
+                    result = REWRAP_RESULT_SKIPPED
+                    new_version = stored_version
+                else:
+                    try:
+                        unwrapping_key = keyring.key_for(stored_version)
+                        new_wrapped_key = rewrap_data_key(
+                            unwrapping_key,
+                            keyring.current_key(),
+                            wrapped_key,
+                        )
+                    except MasterKeyError:
+                        logger.error(
+                            "master key version %s unavailable during rewrap job",
+                            stored_version,
+                        )
+                        self._settle_failed(session, job, job.next_cursor)
+                        return REWRAP_RESULT_MISSING_KEY
+                    except Exception:
+                        logger.error("rewrap job single-envelope rewrap failed")
+                        self._settle_failed(session, job, job.next_cursor)
+                        return REWRAP_RESULT_REWRAP_FAILED
+
+                    # Guarded update, mirroring the batch and
+                    # single-envelope paths: only a row still at the
+                    # version we unwrapped can rotate. A concurrent winner
+                    # leaves current-version material, recorded as a skip.
+                    outcome = session.execute(
+                        update(DataEnvelope)
+                        .where(
+                            DataEnvelope.tenant_id == tenant_id,
+                            DataEnvelope.workload_id == workload_id,
+                            DataEnvelope.data_id == data_id,
+                            DataEnvelope.key_version == stored_version,
+                        )
+                        .values(
+                            key_version=current_version,
+                            wrapped_key=new_wrapped_key,
+                        )
+                        .execution_options(synchronize_session=False)
+                    )
+                    if outcome.rowcount != 1:
+                        session.rollback()
+                        fresh = session.scalar(
+                            select(DataEnvelope)
+                            .where(
+                                DataEnvelope.tenant_id == tenant_id,
+                                DataEnvelope.workload_id == workload_id,
+                                DataEnvelope.data_id == data_id,
+                            )
+                            .execution_options(populate_existing=True)
+                        )
+                        if fresh is not None and fresh.key_version == current_version:
+                            result = REWRAP_RESULT_SKIPPED
+                            new_version = current_version
+                            audit_old_version = current_version
+                            job = session.get(RewrapJob, job_id)
+                        else:
+                            job = session.get(RewrapJob, job_id)
+                            self._settle_failed(session, job, job.next_cursor)
+                            return REWRAP_RESULT_REWRAP_FAILED
+                    else:
+                        result = REWRAP_RESULT_REWRAPPED
+                        new_version = current_version
+
+                # Independent per-envelope commit: the material change,
+                # the existing rewrap audit event and the job's progress
+                # land together and durably before the next envelope.
+                item_occurred_at = _utcnow()
+                event_status = (
+                    AUDIT_EVENT_STATUS_REWRAPPED
+                    if result == REWRAP_RESULT_REWRAPPED
+                    else AUDIT_EVENT_STATUS_SKIPPED
+                )
+                session.add(
+                    AuditEvent(
+                        event_id=str(uuid.uuid4()),
+                        tenant_id=tenant_id,
+                        workload_id=workload_id,
+                        event_type=AUDIT_EVENT_TYPE_REWRAP,
+                        grant_id=None,
+                        decision_id=None,
+                        data_id=data_id,
+                        status=event_status,
+                        capability_sha256=None,
+                        occurred_at=item_occurred_at,
+                    )
+                )
+                job = session.get(RewrapJob, job_id)
+                job.processed += 1
+                if result == REWRAP_RESULT_REWRAPPED:
+                    job.rewrapped += 1
+                else:
+                    job.skipped += 1
+                job.next_cursor = (
+                    _encode_cursor(tenant_id, workload_id, data_id)
+                    if data_id
+                    else ""
+                )
+                job.updated_at = item_occurred_at
+                try:
+                    session.commit()
+                except Exception:
+                    session.rollback()
+                    logger.error("rewrap job progress commit failed")
+                    raise
+                return None
+
+        def _settle_failed(self, session, job, resume_cursor: str) -> None:
+            """Move a running job to ``failed`` and park the resume cursor.
+
+            The failed envelope itself is never modified and its failure
+            is not counted as processed: ``failed`` increases by one and
+            ``next_cursor`` stays immediately before it, so recovery
+            re-attempts exactly that envelope first.
+            """
+            now = _utcnow()
+            settled = session.execute(
+                update(RewrapJob)
+                .where(
+                    RewrapJob.job_id == job.job_id,
+                    RewrapJob.status == REWRAP_JOB_STATUS_RUNNING,
+                )
+                .values(
+                    status=REWRAP_JOB_STATUS_FAILED,
+                    failed=RewrapJob.failed + 1,
+                    next_cursor=resume_cursor,
+                    complete=False,
+                    claim_token=None,
+                    updated_at=now,
+                )
+                .execution_options(synchronize_session=False)
+            ).rowcount
+            if settled != 1:
+                session.rollback()
+                raise RuntimeError("rewrap job failure settlement did not settle")
+            session.commit()
+
+    # Per-app runner state is allocated when the app is built, but the
+    # background threads start only with the application lifespan (and a
+    # recovery sweep runs first, clearing claims left by dead processes).
+    runner = RewrapJobRunner(session_factory)
+
+    @asynccontextmanager
+    async def _rewrap_jobs_lifespan(app: FastAPI):
+        # Tests that build the app without entering the lifespan never run
+        # the sweep or the pool; production (uvicorn) always enters it.
+        runner.recover_and_start()
+        try:
+            yield
+        finally:
+            runner.shutdown()
+
+    app = FastAPI(title="Remote Attestation Data Release", lifespan=_rewrap_jobs_lifespan)
     app.state.engine = engine
     app.state.session_factory = session_factory
     app.state.verifier_registry = registry
+    app.state.rewrap_job_runner = runner
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -4931,6 +5510,19 @@ def create_app(
         ).encode("utf-8")
         return Response(content=body, media_type="application/json")
 
+    def _compact_json_line(payload: dict, *, status_code: int = 200) -> Response:
+        # As _compact_json, but terminated by exactly one newline — the
+        # wire form used by the asynchronous rewrap job endpoints.
+        body = (
+            json.dumps(
+                payload, separators=(",", ":"), allow_nan=False
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(
+            content=body, status_code=status_code, media_type="application/json"
+        )
+
     @app.post("/v1/rewrap-batches")
     def create_rewrap_batch(body: CreateRewrapBatchRequest) -> Response:
         # Authenticate the cursor against this exact scope before touching
@@ -5323,6 +5915,127 @@ def create_app(
             raise HTTPException(status_code=500, detail="rewrap batch unavailable")
 
         return _compact_json(payload)
+
+    # -- persistent asynchronous rewrap jobs ------------------------------
+
+    @app.post("/v1/rewrap-jobs", status_code=202)
+    def create_rewrap_job(body: CreateRewrapJobRequest) -> Response:
+        # Authenticate the cursor against this exact scope before touching
+        # the keyring or storage: a forged, tampered or cross-scope cursor
+        # is a client error indistinguishable from any other bad field.
+        start_boundary = (
+            _decode_cursor(body.cursor, body.tenant_id, body.workload_id)
+            if body.cursor
+            else ""
+        )
+        if start_boundary is None:
+            raise HTTPException(status_code=422, detail="invalid cursor")
+
+        # A wholly unusable keyring is a server configuration failure: no
+        # job row may exist as evidence of the call and no envelope moves.
+        try:
+            load_keyring()
+        except MasterKeyError as exc:
+            logger.error("master key configuration unavailable: %s", exc)
+            raise HTTPException(status_code=500, detail="encryption unavailable")
+
+        job_id = str(uuid.uuid4())
+        now = _utcnow()
+        # The echo/wire cursor: beginning-of-scope normalizes to the empty
+        # string; any other value is the verified token verbatim.
+        start_cursor = body.cursor or ""
+        try:
+            with session_factory() as session:
+                session.add(
+                    RewrapJob(
+                        job_id=job_id,
+                        tenant_id=body.tenant_id,
+                        workload_id=body.workload_id,
+                        limit=body.limit,
+                        cursor=start_cursor,
+                        next_cursor=start_cursor,
+                        status=REWRAP_JOB_STATUS_QUEUED,
+                        processed=0,
+                        rewrapped=0,
+                        skipped=0,
+                        failed=0,
+                        complete=False,
+                        claim_token=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                session.commit()
+        except Exception:
+            logger.error("rewrap job write failed")
+            raise HTTPException(status_code=500, detail="rewrap job unavailable")
+
+        # Durable acceptance first, background advancement second: even if
+        # this process dies before a worker picks it up, the queued row is
+        # resumed by the next process's startup sweep.
+        app.state.rewrap_job_runner.submit(job_id)
+
+        return _compact_json_line(
+            {
+                "job_id": job_id,
+                "status": REWRAP_JOB_STATUS_QUEUED,
+                "limit": body.limit,
+                "cursor": start_cursor,
+                "created_at": _rfc3339(now),
+                "updated_at": _rfc3339(now),
+            },
+            status_code=202,
+        )
+
+    @app.get("/v1/rewrap-jobs/")
+    def rewrap_job_identifier_required() -> Response:
+        # An empty path segment is a missing job identifier: a 422 client
+        # error rather than a routing-level 404.
+        raise HTTPException(status_code=422, detail="invalid job identifier")
+
+    @app.get("/v1/rewrap-jobs/{job_id}")
+    def get_rewrap_job(
+        job_id: str,
+        tenant_id: str = Query(..., min_length=1),
+        workload_id: str = Query(..., min_length=1),
+    ) -> Response:
+        # The path identifier must be a syntactically valid job id;
+        # missing/blank scope query parameters are the same 422 class.
+        if not job_id.strip() or not _UUID_RE.fullmatch(job_id.lower()):
+            raise HTTPException(status_code=422, detail="invalid job identifier")
+        job_id = job_id.strip().lower()
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        try:
+            with session_factory() as session:
+                job = session.get(RewrapJob, job_id)
+                if (
+                    job is None
+                    or job.tenant_id != tenant_id
+                    or job.workload_id != workload_id
+                ):
+                    # Unknown and cross-scope jobs are indistinguishable.
+                    raise HTTPException(status_code=404, detail="rewrap job not found")
+                payload = {
+                    "job_id": job.job_id,
+                    "status": job.status,
+                    "processed": job.processed,
+                    "rewrapped": job.rewrapped,
+                    "skipped": job.skipped,
+                    "failed": job.failed,
+                    "next_cursor": job.next_cursor,
+                    "complete": bool(job.complete),
+                    "created_at": _rfc3339(job.created_at),
+                    "updated_at": _rfc3339(job.updated_at),
+                }
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("rewrap job lookup failed")
+            raise HTTPException(status_code=500, detail="rewrap job unavailable")
+
+        return _compact_json_line(payload)
 
     return app
 

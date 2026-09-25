@@ -74,6 +74,26 @@ REWRAP_RESULT_CODES = frozenset(
 )
 
 
+#: Lifecycle statuses of a persistent asynchronous rewrap job. A job is
+#: born ``queued``; its background runner (or a post-restart recovery
+#: sweep) moves it to ``running`` exactly once, and it settles exactly
+#: once to ``succeeded`` (every envelope in scope was reached) or
+#: ``failed`` (the keyring went bad, a historical key was missing, or a
+#: single envelope failed). A terminal status is never changed.
+REWRAP_JOB_STATUS_QUEUED = "queued"
+REWRAP_JOB_STATUS_RUNNING = "running"
+REWRAP_JOB_STATUS_SUCCEEDED = "succeeded"
+REWRAP_JOB_STATUS_FAILED = "failed"
+REWRAP_JOB_STATUS_CODES = frozenset(
+    {
+        REWRAP_JOB_STATUS_QUEUED,
+        REWRAP_JOB_STATUS_RUNNING,
+        REWRAP_JOB_STATUS_SUCCEEDED,
+        REWRAP_JOB_STATUS_FAILED,
+    }
+)
+
+
 #: Finite, service-defined set of compliance audit-event types. ``grant``
 #: events trace the one-time release-grant lifecycle; ``rewrap`` events
 #: trace per-envelope key rotation performed by rewrap batches.
@@ -606,6 +626,67 @@ class RewrapBatchItem(Base):
     # One of REWRAP_RESULT_*; a fixed, service-defined code only.
     result: Mapped[str] = mapped_column(String(16))
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class RewrapJob(Base):
+    """One persistent, asynchronously advanced envelope rewrap job.
+
+    Unlike a one-shot rewrap batch, a job is durable state: it is created
+    ``queued`` and advanced in the background (and by a post-restart
+    recovery sweep) until every envelope of its scope has been reached or
+    the first per-envelope failure leaves it ``failed`` with its resume
+    cursor parked immediately before the failing envelope. Every page
+    commits envelopes independently, so a crash loses only the in-flight
+    envelope attempt and the job resumes from its last committed cursor.
+
+    The row stores only identifiers, the scope, the fixed page size,
+    opaque cursor strings, counters, status and timestamps — never any
+    envelope material, payload or key. Per-envelope outcomes reuse the
+    append-only :class:`AuditEvent` rewrap events; this row is only the
+    job's progress record.
+    """
+
+    __tablename__ = "rewrap_jobs"
+    __table_args__ = (
+        Index(
+            "ix_rewrap_jobs_status",
+            "status",
+        ),
+    )
+
+    job_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # Requested page size (1..200); fixed for the life of the job.
+    limit: Mapped[int] = mapped_column(Integer)
+    # Exclusive data_id boundary the job was submitted from; empty string
+    # for the beginning of the scope. Never NULL.
+    cursor: Mapped[str] = mapped_column(String(256))
+    # Resume position: exclusive boundary after the last successfully
+    # processed envelope; empty string at the beginning and at the end.
+    # On failure it stays immediately before the failing envelope.
+    next_cursor: Mapped[str] = mapped_column(String(256))
+    # One of REWRAP_JOB_STATUS_*; queued -> running -> succeeded|failed,
+    # each transition made at most once with a guarded UPDATE.
+    status: Mapped[str] = mapped_column(String(16), default="queued")
+    # Cumulative counters across every page the job has advanced.
+    processed: Mapped[int] = mapped_column(Integer, default=0)
+    rewrapped: Mapped[int] = mapped_column(Integer, default=0)
+    skipped: Mapped[int] = mapped_column(Integer, default=0)
+    failed: Mapped[int] = mapped_column(Integer, default=0)
+    # True exactly once the scope has been fully scanned (status
+    # succeeded); false while queued, running or failed.
+    complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Opaque token held by the runner currently advancing the job; NULL
+    # when the job is queued, between pages/processes, or terminal. A
+    # guarded UPDATE (claim_token IS NULL) makes advancement mutually
+    # exclusive across threads/processes; a startup sweep NULLs the
+    # stale claims left by a dead process before recovery begins.
+    claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    # Bumped on every status/progress commit; equal to created_at until
+    # the background runner makes its first transition.
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
 class AuditEvent(Base):
