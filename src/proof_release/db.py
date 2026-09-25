@@ -184,6 +184,46 @@ class TrustRoot(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
+class Revocation(Base):
+    """A certificate revocation registration scoped to one trust root.
+
+    The row names a single certificate by the SHA-256 fingerprint of its
+    DER encoding (unpadded base64url, exactly 32 decoded bytes) under one
+    configured trust root, together with the explicit UTC instant from
+    which the revocation takes effect. A registration is visible to X.509
+    evidence verification only once ``effective_at`` has passed; until
+    then it is inert. Uniqueness is per trust root: the same fingerprint
+    under a different root is an independent registration.
+
+    Only identifiers, the scope, the fingerprint string and timestamps are
+    stored — never certificate material itself.
+    """
+
+    __tablename__ = "revocations"
+    # A fingerprint is registered at most once per trust root. The
+    # constraint is what makes concurrent duplicate registrations settle
+    # with exactly one winner.
+    __table_args__ = (
+        UniqueConstraint(
+            "root_id", "cert_fingerprint", name="uq_revocation_root_fingerprint"
+        ),
+    )
+
+    revocation_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # The trust root this registration is isolated to.
+    root_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("trust_roots.root_id"), index=True
+    )
+    # SHA-256 of the certificate's DER encoding, unpadded base64url
+    # (43 characters for the 32-byte digest).
+    cert_fingerprint: Mapped[str] = mapped_column(String(44))
+    # Explicit UTC instant from which the registration takes effect.
+    effective_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class Policy(Base):
     """A versioned release policy scoped to a tenant and workload.
 
