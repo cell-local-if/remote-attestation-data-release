@@ -87,6 +87,7 @@ from proof_release.db import (
     RewrapBatch,
     RewrapBatchItem,
     RewrapJob,
+    RewrapJobIdempotencyRecord,
     TrustRoot,
     WorkloadIdentityClaim,
     WorkloadIdentityProfile,
@@ -169,6 +170,18 @@ _CURSOR_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
+
+#: Name of the optional request header carrying a caller-chosen
+#: idempotency key for an asynchronous rewrap job submission.
+IDEMPOTENCY_HEADER = "Idempotency-Key"
+#: Inclusive bounds on the key length.
+IDEMPOTENCY_KEY_MIN_LEN = 1
+IDEMPOTENCY_KEY_MAX_LEN = 64
+#: A key is 1..64 *visible* ASCII characters: printable, non-whitespace
+#: (0x21..0x7E), so spaces, tabs, control characters and non-ASCII bytes
+#: are rejected at the boundary. Length is enforced separately so an
+#: over-long value gets the same 422.
+_IDEMPOTENCY_KEY_RE = re.compile(r"^[\x21-\x7e]+$")
 
 
 def _utcnow() -> datetime:
@@ -297,6 +310,88 @@ def _decode_cursor(
     if not isinstance(boundary, str):
         return None
     return boundary
+
+
+def _idempotency_key_from_headers(headers) -> str | None:
+    """Extract and validate the optional ``Idempotency-Key`` header.
+
+    Returns the key verbatim (visible ASCII already excludes surrounding
+    whitespace), or ``None`` when the header is absent. Raises a 422
+    :class:`HTTPException` when the header occurs more than once or its
+    value is not 1..64 visible ASCII characters. Validation here is
+    deliberately shape-only and independent of the body so that an
+    illegal key is rejected before any job write or envelope progress,
+    without writing an audit record or consuming grant-rate-limit budget.
+    """
+    values = headers.getlist(IDEMPOTENCY_HEADER)
+    if not values:
+        return None
+    if len(values) > 1:
+        raise HTTPException(status_code=422, detail="invalid idempotency key")
+    value = values[0]
+    if (
+        not IDEMPOTENCY_KEY_MIN_LEN
+        <= len(value)
+        <= IDEMPOTENCY_KEY_MAX_LEN
+        or not _IDEMPOTENCY_KEY_RE.fullmatch(value)
+    ):
+        raise HTTPException(status_code=422, detail="invalid idempotency key")
+    return value
+
+
+def _rewrap_job_request_fingerprint(
+    tenant_id: str, workload_id: str, limit: int, start_cursor: str
+) -> str:
+    """Stable SHA-256 fingerprint of a normalized job submission.
+
+    Covers the scope (tenant and workload), the effective batch size and
+    the normalized start position: an absent cursor and an explicit empty
+    cursor are the same beginning, so both spellings collide as one
+    request rather than two. Only non-sensitive request fields are
+    hashed; the digest is what a same-key replay must match.
+    """
+    canonical = json.dumps(
+        {
+            "tenant_id": tenant_id,
+            "workload_id": workload_id,
+            "limit": limit,
+            "cursor": start_cursor,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _rewrap_job_idempotency_decision(
+    session,
+    tenant_id: str,
+    workload_id: str,
+    idempotency_key: str,
+    fingerprint: str,
+) -> Response | None:
+    """Resolve a request against a previously committed idempotency record.
+
+    Returns a ready-to-send verbatim replay ``202`` when a record for the
+    same key exists *and* its fingerprint matches, ``None`` when no record
+    exists yet (the caller is the first submission), or raises a stable
+    ``409`` when the key was first saved for different request content.
+    The stored row is never modified by any of these outcomes.
+    """
+    existing = session.get(
+        RewrapJobIdempotencyRecord,
+        (tenant_id, workload_id, idempotency_key),
+    )
+    if existing is None:
+        return None
+    if not hmac.compare_digest(existing.request_fingerprint, fingerprint):
+        raise HTTPException(status_code=409, detail="idempotency key conflict")
+    return Response(
+        content=existing.saved_response,
+        status_code=202,
+        media_type="application/json",
+    )
 
 
 def _parse_utc_rfc3339(value: str) -> datetime:
@@ -6061,7 +6156,7 @@ def create_app(
     # -- persistent asynchronous rewrap jobs ------------------------------
 
     @app.post("/v1/rewrap-jobs", status_code=202)
-    def create_rewrap_job(body: CreateRewrapJobRequest) -> Response:
+    def create_rewrap_job(request: Request, body: CreateRewrapJobRequest) -> Response:
         # Authenticate the cursor against this exact scope before touching
         # the keyring or storage: a forged, tampered or cross-scope cursor
         # is a client error indistinguishable from any other bad field.
@@ -6073,8 +6168,52 @@ def create_app(
         if start_boundary is None:
             raise HTTPException(status_code=422, detail="invalid cursor")
 
+        # The echo/wire cursor: beginning-of-scope normalizes to the empty
+        # string; any other value is the verified token verbatim. A missing
+        # cursor and an explicit empty cursor are the same start position.
+        start_cursor = body.cursor or ""
+
+        # The optional idempotency key is validated only after the body has
+        # passed its own validation (so it can never mask a bad field,
+        # limit or cursor) and before any write, audit record or budget
+        # reservation: a repeated header or an illegal value is a pure 422.
+        idempotency_key = _idempotency_key_from_headers(request.headers)
+        fingerprint = (
+            _rewrap_job_request_fingerprint(
+                body.tenant_id, body.workload_id, body.limit, start_cursor
+            )
+            if idempotency_key is not None
+            else None
+        )
+
+        if idempotency_key is not None:
+            # A previously committed submission under this key settles the
+            # request entirely from its saved record: a matching fingerprint
+            # replays the original 202 verbatim (same job id, cursor and
+            # timestamps), a differing one is a stable 409. Neither touches
+            # the keyring or creates a job, so a keyring that later becomes
+            # unusable can never turn a replay into a 500.
+            try:
+                with session_factory() as session:
+                    replay = _rewrap_job_idempotency_decision(
+                        session,
+                        body.tenant_id,
+                        body.workload_id,
+                        idempotency_key,
+                        fingerprint,
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                logger.error("rewrap job idempotency lookup failed")
+                raise HTTPException(status_code=500, detail="rewrap job unavailable")
+            if replay is not None:
+                return replay
+
         # A wholly unusable keyring is a server configuration failure: no
         # job row may exist as evidence of the call and no envelope moves.
+        # This runs only for requests that still have to create a job, so a
+        # replay of an already-accepted request never re-checks it.
         try:
             load_keyring()
         except MasterKeyError as exc:
@@ -6083,50 +6222,106 @@ def create_app(
 
         job_id = str(uuid.uuid4())
         now = _utcnow()
-        # The echo/wire cursor: beginning-of-scope normalizes to the empty
-        # string; any other value is the verified token verbatim.
-        start_cursor = body.cursor or ""
+        saved_body = (
+            json.dumps(
+                {
+                    "job_id": job_id,
+                    "status": REWRAP_JOB_STATUS_QUEUED,
+                    "limit": body.limit,
+                    "cursor": start_cursor,
+                    "created_at": _rfc3339(now),
+                    "updated_at": _rfc3339(now),
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
         try:
             with session_factory() as session:
-                session.add(
-                    RewrapJob(
-                        job_id=job_id,
-                        tenant_id=body.tenant_id,
-                        workload_id=body.workload_id,
-                        limit=body.limit,
-                        cursor=start_cursor,
-                        next_cursor=start_cursor,
-                        status=REWRAP_JOB_STATUS_QUEUED,
-                        processed=0,
-                        rewrapped=0,
-                        skipped=0,
-                        failed=0,
-                        complete=False,
-                        claim_token=None,
-                        created_at=now,
-                        updated_at=now,
+                try:
+                    session.add(
+                        RewrapJob(
+                            job_id=job_id,
+                            tenant_id=body.tenant_id,
+                            workload_id=body.workload_id,
+                            limit=body.limit,
+                            cursor=start_cursor,
+                            next_cursor=start_cursor,
+                            status=REWRAP_JOB_STATUS_QUEUED,
+                            processed=0,
+                            rewrapped=0,
+                            skipped=0,
+                            failed=0,
+                            complete=False,
+                            claim_token=None,
+                            created_at=now,
+                            updated_at=now,
+                        )
                     )
-                )
-                session.commit()
+                    if idempotency_key is not None:
+                        # The record commits in the *same* transaction as
+                        # the job row, so a crash leaves neither a job
+                        # without its record nor a record without a job.
+                        session.add(
+                            RewrapJobIdempotencyRecord(
+                                tenant_id=body.tenant_id,
+                                workload_id=body.workload_id,
+                                idempotency_key=idempotency_key,
+                                job_id=job_id,
+                                request_fingerprint=fingerprint,
+                                saved_response=saved_body,
+                                created_at=now,
+                            )
+                        )
+                    session.commit()
+                except IntegrityError:
+                    # A concurrent first submission won the key. Roll back
+                    # this transaction and settle against the winner's
+                    # committed record: same content replays its 202,
+                    # different content is a 409. Without a key this is an
+                    # ordinary write failure and falls through to 500.
+                    session.rollback()
+                    if idempotency_key is None:
+                        raise
+                    try:
+                        replay = _rewrap_job_idempotency_decision(
+                            session,
+                            body.tenant_id,
+                            body.workload_id,
+                            idempotency_key,
+                            fingerprint,
+                        )
+                    except HTTPException:
+                        raise
+                    except Exception:
+                        logger.error("rewrap job idempotency lookup failed")
+                        raise HTTPException(
+                            status_code=500, detail="rewrap job unavailable"
+                        )
+                    if replay is None:
+                        # The winner has not become visible; treat this as
+                        # a storage failure rather than minting a second
+                        # job.
+                        logger.error("rewrap job idempotency winner not visible")
+                        raise HTTPException(
+                            status_code=500, detail="rewrap job unavailable"
+                        )
+                    return replay
+        except HTTPException:
+            raise
         except Exception:
             logger.error("rewrap job write failed")
             raise HTTPException(status_code=500, detail="rewrap job unavailable")
 
         # Durable acceptance first, background advancement second: even if
         # this process dies before a worker picks it up, the queued row is
-        # resumed by the next process's startup sweep.
+        # resumed by the next process's startup sweep. Only the transaction
+        # that actually created the row submits it; a replay returns above.
         app.state.rewrap_job_runner.submit(job_id)
 
-        return _compact_json_line(
-            {
-                "job_id": job_id,
-                "status": REWRAP_JOB_STATUS_QUEUED,
-                "limit": body.limit,
-                "cursor": start_cursor,
-                "created_at": _rfc3339(now),
-                "updated_at": _rfc3339(now),
-            },
-            status_code=202,
+        return Response(
+            content=saved_body, status_code=202, media_type="application/json"
         )
 
     @app.get("/v1/rewrap-jobs")

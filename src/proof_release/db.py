@@ -689,6 +689,53 @@ class RewrapJob(Base):
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
+class RewrapJobIdempotencyRecord(Base):
+    """Idempotency record for one asynchronous rewrap job submission.
+
+    A row exists for exactly one first, valid, committed submission that
+    carried an ``Idempotency-Key`` header within one
+    ``(tenant_id, workload_id)`` scope. The composite primary key is what
+    makes concurrent submissions of the same key settle as exactly one
+    job plus stable replays: a losing concurrent insert aborts and then
+    observes the winner's committed row. The request fingerprint pins the
+    normalized submission (effective batch size and start cursor); a
+    later submission under the same key with different content is a 409
+    and never changes this row.
+
+    The record is inserted in the *same* transaction as its job, so a
+    crash can never leave a job without its record or a record without a
+    job, and a retry after recovery cannot create a duplicate. The saved
+    response is the verbatim body of the first ``202`` acceptance: a
+    replay returns it byte-for-byte — the original job id, cursor and
+    timestamps — regardless of how the job has since advanced or whether
+    the keyring later becomes unusable.
+
+    Only the scope, the caller's opaque (validated) key, the fingerprint,
+    a job id, the non-sensitive acceptance body and a timestamp are
+    stored — never payloads, capabilities, keys or certificate material.
+    Submissions without an idempotency key create no row here.
+    """
+
+    __tablename__ = "rewrap_job_idempotency_records"
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # Caller-supplied key, validated at the boundary as 1..64 visible
+    # ASCII characters; unique only within its scope.
+    idempotency_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # The job created by the first committed submission under this key.
+    # Written in the same transaction as the job row.
+    job_id: Mapped[str] = mapped_column(String(36), index=True)
+    # SHA-256 hex of the canonical fingerprint of the normalized first
+    # request (scope, effective limit, normalized start cursor); a
+    # same-key submission whose fingerprint differs is a stable 409.
+    request_fingerprint: Mapped[str] = mapped_column(String(64))
+    # The verbatim 202 response body returned by the first submission,
+    # returned byte-for-byte on every replay.
+    saved_response: Mapped[bytes] = mapped_column(LargeBinary)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class AuditEvent(Base):
     """Append-only, tenant-scoped compliance audit event.
 
