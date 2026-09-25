@@ -103,6 +103,18 @@ AUDIT_EVENT_STATUS_CODES = frozenset(
 )
 
 
+#: Finite, service-defined set of trust root lifecycle statuses. A trust
+#: root is born active and is retired exactly once; retirement leaves the
+#: row in place (and the certificate still reserved against duplicate
+#: creation) but removes it from X.509 evidence verification: a chain
+#: anchored to a retired root settles as rejected before any revocation,
+#: identity or signature check. A retired root is never made active again.
+TRUST_ROOT_STATUS_ACTIVE = "active"
+TRUST_ROOT_STATUS_RETIRED = "retired"
+TRUST_ROOT_STATUS_CODES = frozenset(
+    {TRUST_ROOT_STATUS_ACTIVE, TRUST_ROOT_STATUS_RETIRED}
+)
+
 #: Finite, service-defined set of workload identity profile lifecycle
 #: statuses. A profile is born active and is revoked exactly once; revocation
 #: leaves the row in place (still queryable) but removes it from the X.509
@@ -192,7 +204,16 @@ class TrustRoot(Base):
     root_pem: Mapped[str] = mapped_column(Text)
     # SHA-256 of the DER encoding, used for exact duplicate detection.
     cert_sha256: Mapped[str] = mapped_column(String(64))
+    # One of TRUST_ROOT_STATUS_*; active -> retired exactly once.
+    status: Mapped[str] = mapped_column(
+        String(16), default=TRUST_ROOT_STATUS_ACTIVE
+    )
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    # Set exactly once, by the winning active -> retired transition; a
+    # repeated retire observes the stored value and never rewrites it.
+    retired_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
 
 
 class CertificateRevocation(Base):

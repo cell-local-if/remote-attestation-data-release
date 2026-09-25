@@ -49,6 +49,8 @@ from proof_release.db import (
     REWRAP_RESULT_REWRAP_FAILED,
     REWRAP_RESULT_REWRAPPED,
     REWRAP_RESULT_SKIPPED,
+    TRUST_ROOT_STATUS_ACTIVE,
+    TRUST_ROOT_STATUS_RETIRED,
     VERIFICATION_RESULT_ACCEPTED,
     VERIFICATION_RESULT_REJECTED,
     WORKLOAD_IDENTITY_STATUS_ACTIVE,
@@ -1002,6 +1004,22 @@ class TrustRootCreatedResponse(BaseModel):
     created_at: str
 
 
+class RetireTrustRootRequest(BaseModel):
+    """Scope naming the trust root to retire; nothing else is accepted.
+
+    The body carries exactly the two scope strings — unknown fields are
+    rejected rather than dropped, so a client learns immediately that the
+    service did not act on them.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+
+    _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
+
+
 class CreateRevocationRequest(BaseModel):
     tenant_id: StrictStr = Field(min_length=1)
     workload_id: StrictStr = Field(min_length=1)
@@ -1330,6 +1348,10 @@ def _migrate_additive(engine) -> None:
         "release_grants": (
             ("revoked_at", "DATETIME"),
         ),
+        "trust_roots": (
+            ("status", "VARCHAR(16)"),
+            ("retired_at", "DATETIME"),
+        ),
         "workload_identity_profiles": (
             ("status", "VARCHAR(16)"),
             ("updated_at", "DATETIME"),
@@ -1364,6 +1386,12 @@ def _migrate_additive(engine) -> None:
             if table == "workload_identity_claims":
                 conn.execute(
                     text("UPDATE workload_identity_claims SET seq = 0 WHERE seq IS NULL")
+                )
+            if table == "trust_roots":
+                # Trust roots created before retirement existed are all active.
+                conn.execute(
+                    text("UPDATE trust_roots SET status = :active WHERE status IS NULL"),
+                    {"active": TRUST_ROOT_STATUS_ACTIVE},
                 )
             # Legacy databases may carry a free-form verification_detail
             # column written by older versions, which can hold arbitrary
@@ -1724,6 +1752,15 @@ def create_app(
             # rolls back and the evidence stays received, so it can be
             # re-verified once the registry recovers.
             revoked = False
+            # Set when the chain anchors to a trust root that has already
+            # been retired: the evidence settles as rejected before the
+            # revocation check, the identity gate and the signature
+            # verifier — the verifier is never invoked for it. Only a
+            # retirement committed before this settlement counts; the
+            # anchor row lock (below) serializes verification against the
+            # retire transition, so a retirement that commits later can
+            # never retroactively rewrite a settled conclusion.
+            anchor_retired = False
             # Identity gating state, populated only for an X.509 chain
             # that parses and anchors to a configured trust root. When set,
             # the anchor's workload identity profiles are consulted after
@@ -1741,19 +1778,38 @@ def create_app(
                     # The verifier performs the actual byte-identical
                     # anchoring check; this only maps the anchor to the
                     # trust-root id registrations are scoped under and
-                    # serializes with concurrent registrations. None means
-                    # unconfigured: the verifier rejects on its own and no
-                    # revocation lookup happens.
-                    anchor = session.scalar(
-                        select(TrustRoot)
-                        .where(
-                            TrustRoot.tenant_id == body.tenant_id,
-                            TrustRoot.workload_id == body.workload_id,
-                            TrustRoot.cert_sha256 == anchor_digest,
+                    # serializes with concurrent registrations and
+                    # retirements. None means unconfigured: the verifier
+                    # rejects on its own and no revocation lookup happens.
+                    # A failure to read the anchor (including its
+                    # retirement status) is a 500: the transaction rolls
+                    # back, the evidence stays received and can be
+                    # re-verified once the registry recovers.
+                    try:
+                        anchor = session.scalar(
+                            select(TrustRoot)
+                            .where(
+                                TrustRoot.tenant_id == body.tenant_id,
+                                TrustRoot.workload_id == body.workload_id,
+                                TrustRoot.cert_sha256 == anchor_digest,
+                            )
+                            .with_for_update()
                         )
-                        .with_for_update()
-                    )
-                    if anchor is not None:
+                    except Exception:
+                        session.rollback()
+                        logger.error(
+                            "trust root registry query failed for evidence %s",
+                            evidence.evidence_id,
+                        )
+                        raise HTTPException(
+                            status_code=500,
+                            detail="trust root registry unavailable",
+                        )
+                    if anchor is not None and (
+                        anchor.status == TRUST_ROOT_STATUS_RETIRED
+                    ):
+                        anchor_retired = True
+                    elif anchor is not None:
                         now = _utcnow()
                         fingerprints = [
                             b64url_encode(
@@ -1797,7 +1853,7 @@ def create_app(
                         # compared against claims.
                         identity_anchor_id = anchor.root_id
                         identity_leaf = chain_certificates[0]
-            if revoked:
+            if revoked or anchor_retired:
                 accepted = False
             else:
                 verification_context = VerificationContext(
@@ -2012,6 +2068,114 @@ def create_app(
             workload_id=body.workload_id,
             name=body.name,
             created_at=_rfc3339(now),
+        )
+
+    @app.post("/v1/trust-roots/{root_id}/retire")
+    def retire_trust_root(root_id: str, body: RetireTrustRootRequest) -> Response:
+        """Retire a configured trust root (terminal active -> retired).
+
+        Field and format validation is completed by the request model
+        before this handler runs (422 with no state written); a path
+        identifier that is blank or not a canonical UUID is likewise a 422
+        and no trust root is read or modified. The named trust root must
+        exist in exactly the request's tenant and workload; an unknown or
+        cross-scope root is an indistinguishable 404. The first valid
+        request atomically flips the root to retired and records the first
+        retirement time; a repeat is a stable 409 that rewrites nothing and
+        appends no audit or other state record. Concurrent retires settle
+        as at most one success plus 409s. A write or commit failure rolls the
+        transaction back completely (500), leaving the prior status and
+        timestamps intact. The response is compact JSON carrying only the
+        retirement result — root_id, status and retired_at, in that order.
+        """
+        if not root_id.strip() or not _UUID_RE.fullmatch(root_id):
+            raise HTTPException(
+                status_code=422, detail="root_id must be a canonical UUID"
+            )
+        now = _utcnow()
+        with session_factory() as session:
+            try:
+                # Lock the trust-root row for the full transition. X.509
+                # verification takes the same lock while reading the
+                # anchor's status, so a retirement either commits before an
+                # evidence settles (and that verification rejects) or waits
+                # until after it settles (and never applies retroactively).
+                # SQLite ignores FOR UPDATE but already serializes all
+                # writers via BEGIN IMMEDIATE.
+                trust_root = session.scalar(
+                    select(TrustRoot)
+                    .where(
+                        TrustRoot.root_id == root_id,
+                        TrustRoot.tenant_id == body.tenant_id,
+                        TrustRoot.workload_id == body.workload_id,
+                    )
+                    .with_for_update()
+                )
+                if trust_root is None:
+                    # Do not reveal whether an out-of-scope trust root exists.
+                    raise HTTPException(status_code=404, detail="trust root not found")
+                if trust_root.status == TRUST_ROOT_STATUS_RETIRED:
+                    # A repeated retire changes nothing: the recorded
+                    # retirement time stands and no record is appended.
+                    raise HTTPException(
+                        status_code=409, detail="trust root already retired"
+                    )
+                # Atomic claim: only one concurrent request can flip
+                # active -> retired; the loser reports a stable 409.
+                outcome = session.execute(
+                    update(TrustRoot)
+                    .where(
+                        TrustRoot.root_id == root_id,
+                        TrustRoot.status != TRUST_ROOT_STATUS_RETIRED,
+                    )
+                    .values(
+                        status=TRUST_ROOT_STATUS_RETIRED,
+                        retired_at=now,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                if outcome.rowcount != 1:
+                    session.rollback()
+                    raise HTTPException(
+                        status_code=409, detail="trust root already retired"
+                    )
+                try:
+                    session.commit()
+                except Exception:
+                    # Any write/commit failure rolls the (single-row)
+                    # transaction back completely, so the original status
+                    # and timestamps survive untouched.
+                    session.rollback()
+                    logger.error("trust root retirement write failed")
+                    raise HTTPException(
+                        status_code=500, detail="trust root retirement failed"
+                    )
+            except HTTPException:
+                # 404/409 judgements and the controlled 500 above keep their
+                # status; a read-only judgement has written nothing.
+                raise
+            except Exception:
+                # A failure during the locked lookup (e.g. an unavailable
+                # registry) is likewise a full rollback and a sanitized 500.
+                session.rollback()
+                logger.error("trust root retirement failed")
+                raise HTTPException(
+                    status_code=500, detail="trust root retirement failed"
+                )
+        body_bytes = (
+            json.dumps(
+                {
+                    "root_id": root_id,
+                    "status": TRUST_ROOT_STATUS_RETIRED,
+                    "retired_at": _rfc3339(now),
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(
+            content=body_bytes, status_code=200, media_type="application/json"
         )
 
     @app.post("/v1/revocations", status_code=201)
