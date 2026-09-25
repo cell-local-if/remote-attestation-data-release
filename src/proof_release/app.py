@@ -12,7 +12,7 @@ import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import Response
 from pydantic import (
     BaseModel,
@@ -2087,6 +2087,18 @@ def create_app(
             content=body_bytes, status_code=201, media_type="application/json"
         )
 
+    async def _require_empty_query_body(request: Request) -> None:
+        """Reject a read-only query carrying any request body (422).
+
+        The identity-profile query is ranged entirely by query
+        parameters, so a body is never meaningful. The body is read
+        directly (rather than trusting Content-Length, which chunked or
+        HTTP/2 clients may omit) and anything non-empty — including
+        whitespace or non-JSON — is rejected before any state is read.
+        """
+        if await request.body() != b"":
+            raise HTTPException(status_code=422, detail="query body must be empty")
+
     @app.get("/v1/workload-identities")
     def list_workload_identities(
         request: Request,
@@ -2094,17 +2106,18 @@ def create_app(
         workload_id: str = Query(...),
         trust_root_id: str = Query(...),
         profile_id: str | None = Query(default=None),
+        _empty_body: None = Depends(_require_empty_query_body),
     ) -> Response:
         """Return the workload identity profiles in one scope.
 
-        The request body is always empty and the scope comes entirely
-        from query parameters: mandatory non-blank tenant, workload and
-        trust root (a canonical UUID), plus an optional canonical
-        profile UUID. Results are sorted by creation time and then
-        profile id; an empty range is an empty array. An explicitly
-        named profile that is unknown or outside the scope is a 404
-        rather than an empty-looking array. The handler issues only
-        reads and observes committed state.
+        The request body is always empty (enforced by the dependency
+        above) and the scope comes entirely from query parameters:
+        mandatory non-blank tenant, workload and trust root (a canonical
+        UUID), plus an optional canonical profile UUID. Results are
+        sorted by creation time and then profile id; an empty range is
+        an empty array. An explicitly named profile that is unknown or
+        outside the scope is a 404 rather than an empty-looking array.
+        The handler issues only reads and observes committed state.
         """
         allowed_params = {"tenant_id", "workload_id", "trust_root_id", "profile_id"}
         if set(request.query_params.keys()) - allowed_params:
@@ -2232,11 +2245,12 @@ def create_app(
         plus claim rows) is one atomic commit, so any failure leaves the
         old set, status and timestamps exactly as they were.
         """
-        # A path identifier that is missing, blank or not a canonical
-        # lowercase UUID is a field/format error, never a lookup.
-        if not profile_id.strip() or not _UUID_RE.fullmatch(profile_id):
+        # A path identifier that is missing, blank, whitespace-padded or
+        # not a canonical lowercase UUID is a field/format error, never a
+        # lookup. The raw value must match exactly — canonical form is
+        # never derived by trimming surrounding whitespace.
+        if not _UUID_RE.fullmatch(profile_id):
             raise HTTPException(status_code=422, detail="invalid profile identifier")
-        profile_id = profile_id.strip()
 
         raw_claims = [
             (claim.issuer, claim.subject, claim.uri) for claim in body.claims
@@ -2259,6 +2273,16 @@ def create_app(
             ):
                 raise HTTPException(
                     status_code=404, detail="workload identity profile not found"
+                )
+            if original.status == WORKLOAD_IDENTITY_STATUS_REVOKED:
+                # A revoked profile is terminal: its last committed claim
+                # set is retained for queries but may never be replaced,
+                # even with an identical set. Judged after the 404 scope
+                # check so an out-of-scope revoked profile stays
+                # indistinguishable from an unknown one.
+                raise HTTPException(
+                    status_code=409,
+                    detail="workload identity profile already revoked",
                 )
             original_fingerprint = original.claims_fingerprint
 
@@ -2289,6 +2313,14 @@ def create_app(
                     # trust root exists.
                     raise HTTPException(
                         status_code=404, detail="workload identity profile not found"
+                    )
+                if profile.status == WORKLOAD_IDENTITY_STATUS_REVOKED:
+                    # Re-check under the write lock: a concurrent revoke
+                    # may have committed after the scope pre-read. A
+                    # revoked profile is terminal and never replaced.
+                    raise HTTPException(
+                        status_code=409,
+                        detail="workload identity profile already revoked",
                     )
 
                 def _current_result(current: WorkloadIdentityProfile) -> Response:
@@ -2350,6 +2382,11 @@ def create_app(
                         WorkloadIdentityProfile.profile_id == profile_id,
                         WorkloadIdentityProfile.claims_fingerprint
                         == original_fingerprint,
+                        # Belt and braces alongside the status check above:
+                        # a revoked profile may never be replaced even if a
+                        # revoke races this transaction.
+                        WorkloadIdentityProfile.status
+                        == WORKLOAD_IDENTITY_STATUS_ACTIVE,
                     )
                     .values(
                         claims_fingerprint=claims_fingerprint,
@@ -2367,6 +2404,7 @@ def create_app(
                     winner = session.get(WorkloadIdentityProfile, profile_id)
                     if (
                         winner is not None
+                        and winner.status == WORKLOAD_IDENTITY_STATUS_ACTIVE
                         and winner.claims_fingerprint == claims_fingerprint
                     ):
                         return _current_result(winner)
@@ -2461,9 +2499,11 @@ def create_app(
         failure returns 500 after a full rollback, leaving the profile,
         its status and its revocation time unchanged.
         """
-        if not profile_id.strip() or not _UUID_RE.fullmatch(profile_id):
+        # A path identifier that is missing, blank, whitespace-padded or
+        # not a canonical lowercase UUID is a field/format error; the raw
+        # value must match exactly.
+        if not _UUID_RE.fullmatch(profile_id):
             raise HTTPException(status_code=422, detail="invalid profile identifier")
-        profile_id = profile_id.strip()
 
         revoked_at = _utcnow()
         with session_factory() as session:

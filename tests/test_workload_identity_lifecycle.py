@@ -358,6 +358,40 @@ def test_query_unknown_query_parameter_returns_422(client, root_id):
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize("body", [b'{"unexpected": 1}', b"   ", b"null", b"[]"])
+def test_query_with_non_empty_body_returns_422(client, root_id, body):
+    # The range comes entirely from query parameters; any body is a
+    # malformed query rejected before any state is read.
+    response = client.request(
+        "GET",
+        "/v1/workload-identities",
+        params={
+            "tenant_id": TENANT,
+            "workload_id": WORKLOAD,
+            "trust_root_id": root_id,
+        },
+        content=body,
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 422
+
+
+def test_query_empty_body_is_accepted(client, root_id, chain):
+    _register(client, root_id, [_claim(chain["leaf_cert"])])
+    response = client.request(
+        "GET",
+        "/v1/workload-identities",
+        params={
+            "tenant_id": TENANT,
+            "workload_id": WORKLOAD,
+            "trust_root_id": root_id,
+        },
+        content=b"",
+    )
+    assert response.status_code == 200
+    assert len(response.json()) == 1
+
+
 # --- update -----------------------------------------------------------------
 
 
@@ -482,12 +516,71 @@ def test_update_unknown_or_cross_scope_profile_returns_404(client, root_id, chai
     assert cross_root.status_code == 404
 
 
+def test_update_revoked_profile_returns_409_and_changes_nothing(
+    client, root_id, chain
+):
+    claim = [_claim(chain["leaf_cert"])]
+    registered = _register(client, root_id, claim).json()
+    # Give the profile an updated_at before revoking, so the test also
+    # proves a failed update never rewrites it.
+    updated = _update(
+        client,
+        registered["profile_id"],
+        root_id,
+        [_claim(chain["leaf_cert"], uri=OTHER_URI)],
+    ).json()
+    assert _revoke(client, registered["profile_id"], root_id).status_code == 200
+
+    # Neither a new set nor the revoked profile's own current set may be
+    # written: the terminal set is retained verbatim.
+    for target in (
+        [_claim(chain["leaf_cert"], uri=THIRD_URI)],
+        [_claim(chain["leaf_cert"], uri=OTHER_URI)],
+    ):
+        response = _update(
+            client, registered["profile_id"], root_id, target
+        )
+        assert response.status_code == 409
+        queried = _query(
+            client, root_id, profile=registered["profile_id"]
+        ).json()[0]
+        assert queried["status"] == "revoked"
+        assert queried["claims"] == [
+            _claim(chain["leaf_cert"], uri=OTHER_URI)
+        ]
+    with client.app.state.session_factory() as session:
+        profile = session.get(
+            WorkloadIdentityProfile, registered["profile_id"]
+        )
+        assert profile.status == "revoked"
+        assert profile.updated_at.isoformat() == updated["updated_at"]
+        assert profile.revoked_at is not None
+
+
+def test_update_revoked_profile_cross_scope_is_404_not_409(client, root_id, chain):
+    # The scope judgement precedes the terminal-state judgement, so an
+    # out-of-scope revoked profile never reveals its existence.
+    registered = _register(
+        client, root_id, [_claim(chain["leaf_cert"])]
+    ).json()
+    assert _revoke(client, registered["profile_id"], root_id).status_code == 200
+    assert _update(
+        client,
+        registered["profile_id"],
+        root_id,
+        [_claim(chain["leaf_cert"])],
+        tenant=OTHER_TENANT,
+    ).status_code == 404
+
+
 @pytest.mark.parametrize(
     "profile_id",
     [
         "not-a-uuid",
         "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
         "",
+        "%20",
+        "%09",
     ],
 )
 def test_update_invalid_path_identifier_returns_422(
@@ -500,6 +593,22 @@ def test_update_invalid_path_identifier_returns_422(
             "workload_id": WORKLOAD,
             "trust_root_id": root_id,
             "claims": [_claim(chain["leaf_cert"])],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_update_whitespace_padded_path_identifier_returns_422(
+    client, root_id, chain
+):
+    registered = _register(client, root_id, [_claim(chain["leaf_cert"])]).json()
+    response = client.put(
+        f"/v1/workload-identities/%20{registered['profile_id']}%20",
+        json={
+            "tenant_id": TENANT,
+            "workload_id": WORKLOAD,
+            "trust_root_id": root_id,
+            "claims": [_claim(chain["leaf_cert"], uri=OTHER_URI)],
         },
     )
     assert response.status_code == 422
@@ -730,6 +839,60 @@ def test_concurrent_distinct_updates_only_one_takes_effect(app, root_id, chain):
         assert session.scalars(select(WorkloadIdentityProfile)).all().__len__() == 1
 
 
+def test_concurrent_update_and_revoke_leave_revoked_set_untouched(
+    app, root_id, chain
+):
+    client = TestClient(app)
+    profile_id = _register(
+        client, root_id, [_claim(chain["leaf_cert"], uri=LEAF_URI)]
+    ).json()["profile_id"]
+    target = [_claim(chain["leaf_cert"], uri=OTHER_URI)]
+
+    def update():
+        return TestClient(app).put(
+            f"/v1/workload-identities/{profile_id}",
+            json={
+                "tenant_id": TENANT,
+                "workload_id": WORKLOAD,
+                "trust_root_id": root_id,
+                "claims": target,
+            },
+        )
+
+    def revoke():
+        return TestClient(app).request(
+            "DELETE",
+            f"/v1/workload-identities/{profile_id}",
+            json={
+                "tenant_id": TENANT,
+                "workload_id": WORKLOAD,
+                "trust_root_id": root_id,
+            },
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        updaters = [pool.submit(update) for _ in range(10)]
+        revokers = [pool.submit(revoke) for _ in range(4)]
+        results = [f.result() for f in updaters + revokers]
+
+    # The profile ends revoked. If a revoke wins, every update is a 409
+    # and the original set is retained; if an update wins first, exactly
+    # one update returns 200 and the revoke still wins the terminal
+    # state with the updated set. In no case is a revoked profile later
+    # replaced by another update.
+    with app.state.session_factory() as session:
+        profile = session.get(WorkloadIdentityProfile, profile_id)
+        assert profile.status == "revoked"
+        assert profile.revoked_at is not None
+        claims = session.scalars(
+            select(WorkloadIdentityClaim).where(
+                WorkloadIdentityClaim.profile_id == profile_id
+            )
+        ).all()
+        assert len(claims) == 1
+    assert all(r.status_code in (200, 409) for r in results)
+
+
 # --- revoke -----------------------------------------------------------------
 
 
@@ -817,7 +980,15 @@ def test_revoke_unknown_or_cross_scope_returns_404(client, root_id, chain):
     ).status_code == 404
 
 
-@pytest.mark.parametrize("profile_id", ["not-a-uuid", "ABCDEFAB-ABCD-ABCD-ABCD-ABCDEFABCDEF"])
+@pytest.mark.parametrize(
+    "profile_id",
+    [
+        "not-a-uuid",
+        "ABCDEFAB-ABCD-ABCD-ABCD-ABCDEFABCDEF",
+        "%20",
+        "%09",
+    ],
+)
 def test_revoke_invalid_path_identifier_returns_422(
     client, root_id, chain, profile_id
 ):
@@ -831,6 +1002,29 @@ def test_revoke_invalid_path_identifier_returns_422(
         },
     )
     assert response.status_code == 422
+
+
+def test_revoke_whitespace_padded_path_identifier_returns_422(
+    client, root_id, chain
+):
+    registered = _register(client, root_id, [_claim(chain["leaf_cert"])]).json()
+    response = client.request(
+        "DELETE",
+        f"/v1/workload-identities/%09{registered['profile_id']}%09",
+        json={
+            "tenant_id": TENANT,
+            "workload_id": WORKLOAD,
+            "trust_root_id": root_id,
+        },
+    )
+    assert response.status_code == 422
+    # The profile must still be active: a malformed path never revokes.
+    assert (
+        _query(client, root_id, profile=registered["profile_id"]).json()[0][
+            "status"
+        ]
+        == "active"
+    )
 
 
 def test_revoke_empty_path_segment_returns_422(client, root_id):
