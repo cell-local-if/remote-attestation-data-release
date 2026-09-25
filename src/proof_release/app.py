@@ -54,6 +54,7 @@ from proof_release.db import (
     REWRAP_RESULT_REWRAP_FAILED,
     REWRAP_RESULT_REWRAPPED,
     REWRAP_RESULT_SKIPPED,
+    REWRAP_JOB_STATUS_CODES,
     REWRAP_JOB_STATUS_FAILED,
     REWRAP_JOB_STATUS_QUEUED,
     REWRAP_JOB_STATUS_RUNNING,
@@ -901,6 +902,137 @@ def _decode_revocation_cursor(
     return boundary_at, boundary_revocation, snapshot_at, snapshot_id
 
 
+def _rewrap_job_history_cursor_payload(
+    tenant_id: str,
+    workload_id: str,
+    boundary: str,
+    *,
+    job_id: str,
+    status: str,
+    created_after: str,
+    created_before: str,
+) -> bytes:
+    """Canonical byte payload authenticated inside a job-history cursor.
+
+    The cursor marks an exclusive job_id position and every active filter
+    is part of the signed payload, so a cursor minted for one filter set
+    cannot be replayed against another. The kind tag distinguishes these
+    cursors from the rewrap-batch, grant-audit, audit-event and
+    revocation families even though all share the same HMAC secret.
+    """
+    return json.dumps(
+        {
+            "k": _REWRAP_JOB_HISTORY_CURSOR_KIND,
+            "t": tenant_id,
+            "w": workload_id,
+            "j": boundary,
+            "ji": job_id,
+            "s": status,
+            "a": created_after,
+            "b": created_before,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _encode_rewrap_job_history_cursor(
+    tenant_id: str,
+    workload_id: str,
+    boundary: str,
+    *,
+    job_id: str,
+    status: str,
+    created_after: str,
+    created_before: str,
+) -> str:
+    """Build an opaque, scope- and filter-bound exclusive job cursor."""
+    payload = _rewrap_job_history_cursor_payload(
+        tenant_id,
+        workload_id,
+        boundary,
+        job_id=job_id,
+        status=status,
+        created_after=created_after,
+        created_before=created_before,
+    )
+    mac = hmac.new(_cursor_secret(), payload, hashlib.sha256).digest()
+    return b64url_encode(payload + mac)
+
+
+def _decode_rewrap_job_history_cursor(
+    token: str,
+    tenant_id: str,
+    workload_id: str,
+    *,
+    job_id: str,
+    status: str,
+    created_after: str,
+    created_before: str,
+) -> str | None:
+    """Validate a job-history cursor and return its exclusive job boundary.
+
+    Returns ``None`` for a malformed/forged token, a cursor of another
+    kind (rewrap batch, grant audit, audit events or revocations), or one
+    minted for any other scope or filter combination. The
+    beginning-of-range marker (``""``) never reaches this function: it is
+    handled by the caller.
+    """
+    if not _CURSOR_RE.fullmatch(token):
+        return None
+    try:
+        raw = b64url_decode(token)
+    except ValueError:
+        return None
+    # The MAC is a fixed 32-byte suffix; the JSON payload precedes it.
+    if len(raw) <= 32:
+        return None
+    payload, mac = raw[:-32], raw[-32:]
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    if decoded.get("k") != _REWRAP_JOB_HISTORY_CURSOR_KIND:
+        return None
+    boundary = decoded.get("j")
+    # A resume cursor always names the last returned job; an empty
+    # boundary is only valid as the implicit start, which is not encoded.
+    if not isinstance(boundary, str) or not _UUID_RE.fullmatch(boundary):
+        return None
+    expected_mac = hmac.new(
+        _cursor_secret(),
+        _rewrap_job_history_cursor_payload(
+            tenant_id,
+            workload_id,
+            boundary,
+            job_id=job_id,
+            status=status,
+            created_after=created_after,
+            created_before=created_before,
+        ),
+        hashlib.sha256,
+    ).digest()
+    if not hmac.compare_digest(mac, expected_mac):
+        return None
+    # Defense in depth: the MAC already covers every field, but confirm
+    # the scope and each active filter explicitly.
+    if not hmac.compare_digest(str(decoded.get("t", "")), tenant_id):
+        return None
+    if not hmac.compare_digest(str(decoded.get("w", "")), workload_id):
+        return None
+    for key, expected in (
+        ("ji", job_id),
+        ("s", status),
+        ("a", created_after),
+        ("b", created_before),
+    ):
+        if not hmac.compare_digest(str(decoded.get(key, "")), expected):
+            return None
+    return boundary
+
+
 #: Fixed page size for the read-only compliance audit-event listing. As
 #: with the grant audit, the page size is an internal constant and never
 #: part of the request or response contract.
@@ -921,6 +1053,17 @@ REVOCATION_PAGE_SIZE = 100
 #: with the same secret) can never be replayed against the revocation
 #: listing, and vice versa.
 _REVOCATION_CURSOR_KIND = "certificate-revocations-v1"
+
+#: Fixed page size for the read-only rewrap job history listing. As with
+#: the other audit listings, the page size is internal and never part of
+#: the request or response contract.
+REWRAP_JOB_HISTORY_PAGE_SIZE = 100
+
+#: Discriminator embedded in rewrap job history cursors so a rewrap-batch,
+#: release-grant audit, compliance audit-event or revocation cursor (all
+#: authenticated with the same secret) can never be replayed against the
+#: job history listing, and vice versa.
+_REWRAP_JOB_HISTORY_CURSOR_KIND = "rewrap-job-history-v1"
 
 
 class CreateChallengeRequest(BaseModel):
@@ -5985,6 +6128,203 @@ def create_app(
                 "updated_at": _rfc3339(now),
             },
             status_code=202,
+        )
+
+    @app.get("/v1/rewrap-jobs")
+    def list_rewrap_jobs(
+        request: Request,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        job_id: str | None = Query(default=None),
+        status: str | None = Query(default=None),
+        created_after: str | None = Query(default=None),
+        created_before: str | None = Query(default=None),
+        cursor: str | None = Query(default=None),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return a read-only, cursor-stable history page of rewrap jobs.
+
+        The page is scoped by the mandatory tenant/workload and may be
+        narrowed by an exact job identifier, a job status and an
+        inclusive created-at window. Ordering is job_id ascending with an
+        exclusive keyset cursor; the cursor is HMAC-authenticated and
+        bound to the scope *and* every active filter, so it cannot be
+        forged or replayed against a different scope or filter set. The
+        handler only ever issues SELECTs — jobs are written by the
+        submission endpoint and the background runner, never here — so a
+        query observes only committed state and returns no half page.
+        """
+        # --- request shape (all 422, no storage touched) ----------------
+        allowed_params = {
+            "tenant_id",
+            "workload_id",
+            "job_id",
+            "status",
+            "created_after",
+            "created_before",
+            "cursor",
+        }
+        if set(request.query_params.keys()) - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        # job_id is a canonical lowercase UUID; surrounding whitespace,
+        # uppercase letters and any other spelling are format errors.
+        job_filter: str | None = None
+        if job_id is not None:
+            if not job_id.strip() or not _UUID_RE.fullmatch(job_id):
+                raise HTTPException(status_code=422, detail="invalid job identifier")
+            job_filter = job_id
+
+        if status is not None:
+            if not status.strip() or status not in REWRAP_JOB_STATUS_CODES:
+                raise HTTPException(status_code=422, detail="invalid status")
+        status_filter = status if status is not None else ""
+
+        # Timestamp filters: absent means unbounded; an explicit empty or
+        # whitespace value is an illegal format (422), not "unbounded".
+        # Parsed bounds are embedded into the cursor in normalized
+        # RFC3339/UTC form so equivalent spellings cannot mint two
+        # different cursor domains.
+        def _time_bound(value: str | None, name: str) -> tuple[str, datetime | None]:
+            if value is None:
+                return "", None
+            if not value.strip():
+                raise HTTPException(
+                    status_code=422, detail=f"{name} must be UTC RFC3339"
+                )
+            try:
+                parsed = _parse_utc_rfc3339(value)
+            except ValueError:
+                raise HTTPException(
+                    status_code=422, detail=f"{name} must be UTC RFC3339"
+                )
+            return _rfc3339(parsed), parsed
+
+        after_raw, after_dt = _time_bound(created_after, "created_after")
+        before_raw, before_dt = _time_bound(created_before, "created_before")
+        # The lower bound must not be later than the upper bound. Equality
+        # is a valid (single-instant) window.
+        if after_dt is not None and before_dt is not None and after_dt > before_dt:
+            raise HTTPException(
+                status_code=422,
+                detail="created_after must not be later than created_before",
+            )
+
+        # An omitted cursor or an explicit empty string means the
+        # beginning of the scope (before the smallest job id). A
+        # whitespace-only or otherwise malformed value is a 422, as is a
+        # forged, tampered, cross-scope, cross-filter or foreign-family
+        # cursor.
+        if cursor is None or cursor == "":
+            boundary = ""
+        else:
+            if not cursor.strip() or not _CURSOR_RE.fullmatch(cursor):
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            boundary = _decode_rewrap_job_history_cursor(
+                cursor,
+                tenant_id,
+                workload_id,
+                job_id=job_filter or "",
+                status=status_filter,
+                created_after=after_raw,
+                created_before=before_raw,
+            )
+            if boundary is None:
+                raise HTTPException(status_code=422, detail="invalid cursor")
+
+        # --- read-only history scan -------------------------------------
+        try:
+            with session_factory() as session:
+                # An explicitly named job must exist in exactly this
+                # scope; an unknown or cross-scope identifier is a 404
+                # rather than an empty-looking page.
+                if job_filter is not None:
+                    named = session.get(RewrapJob, job_filter)
+                    if (
+                        named is None
+                        or named.tenant_id != tenant_id
+                        or named.workload_id != workload_id
+                    ):
+                        raise HTTPException(
+                            status_code=404, detail="rewrap job not found"
+                        )
+
+                stmt = select(RewrapJob).where(
+                    RewrapJob.tenant_id == tenant_id,
+                    RewrapJob.workload_id == workload_id,
+                )
+                if job_filter is not None:
+                    stmt = stmt.where(RewrapJob.job_id == job_filter)
+                if status_filter:
+                    stmt = stmt.where(RewrapJob.status == status_filter)
+                if after_dt is not None:
+                    stmt = stmt.where(RewrapJob.created_at >= after_dt)
+                if before_dt is not None:
+                    stmt = stmt.where(RewrapJob.created_at <= before_dt)
+                stmt = (
+                    stmt.where(RewrapJob.job_id > boundary)
+                    .order_by(RewrapJob.job_id.asc())
+                    .limit(REWRAP_JOB_HISTORY_PAGE_SIZE + 1)
+                )
+                # One extra row is the "more follows" probe. The scan is a
+                # single read-only statement: a storage failure aborts the
+                # whole request with a 500 rather than returning a partial
+                # page.
+                rows = list(session.scalars(stmt))
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("rewrap job history query failed")
+            raise HTTPException(
+                status_code=500, detail="rewrap job history unavailable"
+            )
+
+        has_more = len(rows) > REWRAP_JOB_HISTORY_PAGE_SIZE
+        page = rows[:REWRAP_JOB_HISTORY_PAGE_SIZE]
+
+        # Same field order and types as the single-job progress query.
+        jobs = [
+            {
+                "job_id": row.job_id,
+                "status": row.status,
+                "processed": row.processed,
+                "rewrapped": row.rewrapped,
+                "skipped": row.skipped,
+                "failed": row.failed,
+                "next_cursor": row.next_cursor,
+                "complete": bool(row.complete),
+                "created_at": _rfc3339(row.created_at),
+                "updated_at": _rfc3339(row.updated_at),
+            }
+            for row in page
+        ]
+
+        if has_more:
+            next_cursor = _encode_rewrap_job_history_cursor(
+                tenant_id,
+                workload_id,
+                page[-1].job_id,
+                job_id=job_filter or "",
+                status=status_filter,
+                created_after=after_raw,
+                created_before=before_raw,
+            )
+            complete = False
+        else:
+            next_cursor = ""
+            complete = True
+
+        return _compact_json_line(
+            {
+                "jobs": jobs,
+                "next_cursor": next_cursor,
+                "complete": complete,
+            }
         )
 
     @app.get("/v1/rewrap-jobs/")
