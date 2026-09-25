@@ -706,6 +706,40 @@ def test_failed_registration_write_leaves_no_record(app, client, root_id, chain)
         assert session.scalars(select(CertificateRevocation)).all() == []
 
 
+def test_failed_registration_read_returns_500_and_leaves_no_record(
+    app, client, root_id, chain
+):
+    engine = app.state.engine
+
+    def fail_lookup(conn, cursor, statement, parameters, context, executemany):
+        if "FROM trust_roots" in statement:
+            raise RuntimeError("simulated storage failure")
+
+    event.listen(engine, "before_cursor_execute", fail_lookup)
+    try:
+        response = _register(
+            client,
+            root_id,
+            fingerprint(chain["leaf_cert"]),
+            "2020-01-01T00:00:00Z",
+        )
+        assert response.status_code == 500
+    finally:
+        event.remove(engine, "before_cursor_execute", fail_lookup)
+
+    # Full rollback: no half record, and once storage recovers the same
+    # registration succeeds exactly once.
+    with app.state.session_factory() as session:
+        assert session.scalars(select(CertificateRevocation)).all() == []
+    recovered = _register(
+        client,
+        root_id,
+        fingerprint(chain["leaf_cert"]),
+        "2020-01-01T00:00:00Z",
+    )
+    assert recovered.status_code == 201
+
+
 # --- scope of behavior: X.509 only ------------------------------------------
 
 

@@ -491,3 +491,36 @@ class AuditEvent(Base):
     )
     # Commit time of the recorded transition; the stable listing key.
     occurred_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+
+
+class RateLimitCounter(Base):
+    """Persistent per-scope admission counter for one UTC natural minute.
+
+    One row exists per ``(tenant_id, workload_id, window_start)`` triple,
+    where ``window_start`` is the UTC minute (a datetime with seconds and
+    sub-seconds truncated to zero) during which the counted business
+    requests arrived. Consume, revoke and payload release share the same
+    row, so the budget is shared across all three entry points. The count
+    is durable: it is committed before the request enters any business
+    judgement and therefore survives restarts and is never refunded when a
+    later judgement returns 404/401/409/410/500. A new minute starts a new
+    row, which both restores the quota automatically and isolates scopes
+    strictly — quotas are never borrowed across scopes or minutes.
+    """
+
+    __tablename__ = "rate_limit_counters"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "window_start",
+            name="uq_rate_limit_counter_scope_window",
+        ),
+    )
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # UTC minute boundary at which the window starts, truncated to seconds.
+    window_start: Mapped[datetime] = mapped_column(UTCDateTime(), primary_key=True)
+    # Number of admitted (budget-consuming) requests during this window.
+    count: Mapped[int] = mapped_column(Integer, default=0)

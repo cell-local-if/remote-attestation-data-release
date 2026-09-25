@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 
+from proof_release import app as app_module
 from proof_release.app import create_app
 from proof_release.db import ReleaseGrant
 
@@ -414,7 +415,11 @@ def test_grant_survives_restart(tmp_path, monkeypatch):
     assert response.json()["consumed"] is True
 
 
-def test_concurrent_consume_only_one_succeeds(app):
+def test_concurrent_consume_only_one_succeeds(app, monkeypatch):
+    # This test exercises the one-time settlement race, not the shared
+    # per-minute budget; raise the limiter so all sixteen bursts are
+    # admitted and only the atomic transition decides winners.
+    monkeypatch.setattr(app_module, "GRANT_BUDGET_PER_MINUTE", 64)
     client = TestClient(app)
     decision, _ = _decision(client)
     grant = _grant(client, decision["decision_id"]).json()

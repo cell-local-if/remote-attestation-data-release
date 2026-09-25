@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 
+from proof_release import app as app_module
 from proof_release.app import create_app
 from proof_release.db import DataEnvelope, ReleaseGrant
 from proof_release.envelopes import b64url_encode
@@ -451,7 +452,10 @@ def test_release_rejects_non_object_body(client):
     ).status_code == 422
 
 
-def test_concurrent_releases_only_one_succeeds(app):
+def test_concurrent_releases_only_one_succeeds(app, monkeypatch):
+    # This test exercises the one-time settlement race, not the shared
+    # per-minute budget; raise the limiter so every burst is admitted.
+    monkeypatch.setattr(app_module, "GRANT_BUDGET_PER_MINUTE", 64)
     client = TestClient(app)
     grant = _setup(client)
     url = f"/v1/release/{grant['grant_id']}"
@@ -472,7 +476,9 @@ def test_concurrent_releases_only_one_succeeds(app):
     assert statuses.count(409) == 15
 
 
-def test_concurrent_release_and_consume_share_single_win(app):
+def test_concurrent_release_and_consume_share_single_win(app, monkeypatch):
+    # Settlement-race test, not the shared per-minute budget: admit all.
+    monkeypatch.setattr(app_module, "GRANT_BUDGET_PER_MINUTE", 64)
     client = TestClient(app)
     grant = _setup(client)
     release_body = {

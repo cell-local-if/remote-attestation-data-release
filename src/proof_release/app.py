@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -59,6 +60,7 @@ from proof_release.db import (
     Decision,
     Evidence,
     Policy,
+    RateLimitCounter,
     ReleaseGrant,
     RewrapBatch,
     RewrapBatchItem,
@@ -104,6 +106,17 @@ REWRAP_BATCH_DEFAULT_LIMIT = 50
 REWRAP_BATCH_MIN_LIMIT = 1
 REWRAP_BATCH_MAX_LIMIT = 200
 
+#: Shared per-(tenant, workload) budget for the three one-time-grant
+#: entry points — grant consumption, grant revocation and payload release.
+#: At most this many requests whose basic fields have validated may enter
+#: business judgement during one UTC natural minute. The counter is
+#: persistent, the quota is shared across all three paths, and a slot is
+#: consumed before the request is judged (so a later 404/401/409/410/500
+#: never refunds it). A module-level constant rather than configuration so
+#: the contract is fixed; tests that exercise settlement atomicity with
+#: larger bursts raise it in-process.
+GRANT_BUDGET_PER_MINUTE = 5
+
 #: Fixed page size for the read-only release-grant audit listing. The
 #: listing is cursor-driven; the page size is an internal constant and is
 #: never part of the request or response contract.
@@ -139,6 +152,43 @@ def _utcnow() -> datetime:
 
 def _rfc3339(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat()
+
+
+def _utc_minute_window(now: datetime) -> datetime:
+    """Return the UTC natural-minute boundary containing ``now``.
+
+    Seconds and sub-second fields are truncated, so every instant within a
+    UTC calendar minute maps to the same window start.
+    """
+    return now.replace(second=0, microsecond=0)
+
+
+def _seconds_until_next_minute(now: datetime) -> int:
+    """Whole seconds from ``now`` to the next UTC minute boundary, ceil, ≥1.
+
+    The value is a positive integer computed at response time: an exact
+    boundary reports 60 and any later instant in the same minute reports a
+    smaller value, so repeated 429s may carry decreasing values without
+    extending the window.
+    """
+    remaining = (60 - now.second) - (now.microsecond / 1_000_000)
+    return max(1, int(math.ceil(remaining)))
+
+
+def _too_many_requests_response(now: datetime) -> Response:
+    """Build the compact 429 body: one positive-int field plus a newline."""
+    body = (
+        json.dumps(
+            {"retry_after_seconds": _seconds_until_next_minute(now)},
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    return Response(
+        content=body, status_code=429, media_type="application/json"
+    )
+
 
 
 def _nonce_digest(nonce: str) -> str:
@@ -991,6 +1041,84 @@ def create_app(
     session_factory = sessionmaker(bind=engine, expire_on_commit=False)
     registry = verifier_registry or default_registry
 
+    def _consume_grant_budget(tenant_id: str, workload_id: str) -> Response | None:
+        """Reserve one slot of the shared per-scope, per-UTC-minute budget.
+
+        Called only after request fields and the path grant identifier have
+        passed basic validation. Returns ``None`` when the request is
+        admitted (one durable slot consumed for the current UTC minute) or a
+        ready 429 response when the minute's budget is exhausted. The
+        reservation is committed in its own transaction *before* any business
+        judgement runs, so a later 404/401/409/410/500 never refunds it and
+        the quota survives restarts; a rejection writes nothing. A counter
+        read or write that cannot be completed is a 500 and the caller never
+        enters judgement.
+        """
+        now = _utcnow()
+        window_start = _utc_minute_window(now)
+        with session_factory() as session:
+            try:
+                admitted = False
+                for _ in range(2):
+                    # Lock the scope's minute row when one exists. SQLite
+                    # ignores FOR UPDATE but every write transaction already
+                    # begins as BEGIN IMMEDIATE, serializing concurrent
+                    # reservations process-wide; on locking backends the row
+                    # lock orders them.
+                    row = session.scalar(
+                        select(RateLimitCounter)
+                        .where(
+                            RateLimitCounter.tenant_id == tenant_id,
+                            RateLimitCounter.workload_id == workload_id,
+                            RateLimitCounter.window_start == window_start,
+                        )
+                        .with_for_update()
+                    )
+                    if row is None:
+                        # The first valid request of the minute initializes
+                        # the counter at one. A concurrent initializer on a
+                        # locking backend may win the unique constraint; that
+                        # race is retried as an increment below.
+                        session.add(
+                            RateLimitCounter(
+                                tenant_id=tenant_id,
+                                workload_id=workload_id,
+                                window_start=window_start,
+                                count=1,
+                            )
+                        )
+                        try:
+                            session.flush()
+                        except IntegrityError:
+                            session.rollback()
+                            continue
+                        admitted = True
+                        break
+                    if row.count >= GRANT_BUDGET_PER_MINUTE:
+                        # Budget exhausted: no write, no audit, no state
+                        # change; recompute the retry hint at response time.
+                        session.rollback()
+                        return _too_many_requests_response(_utcnow())
+                    row.count = row.count + 1
+                    admitted = True
+                    break
+                if not admitted:
+                    # Defensive: the unique-insert retry loop failed to
+                    # settle, which the single retry above makes unreachable.
+                    session.rollback()
+                    logger.error("grant rate-limit reservation could not settle")
+                    raise HTTPException(
+                        status_code=500, detail="rate limit unavailable"
+                    )
+                session.commit()
+            except HTTPException:
+                raise
+            except Exception:
+                session.rollback()
+                logger.error("grant rate-limit counter unavailable")
+                raise HTTPException(status_code=500, detail="rate limit unavailable")
+        return None
+
     app = FastAPI(title="Remote Attestation Data Release")
     app.state.engine = engine
     app.state.session_factory = session_factory
@@ -1462,67 +1590,83 @@ def create_app(
         revocation_id = str(uuid.uuid4())
         now = _utcnow()
         with session_factory() as session:
-            # Lock the trust-root row for the full registration. X.509
-            # verification takes the same lock while checking the registry,
-            # so a registration either commits before the evidence settles
-            # (and the verification observes it) or waits until after it
-            # settles (and never retroactively changes the conclusion).
-            # SQLite ignores FOR UPDATE but already serializes all writers
-            # via BEGIN IMMEDIATE.
-            trust_root = session.scalar(
-                select(TrustRoot)
-                .where(
-                    TrustRoot.root_id == body.trust_root_id,
-                    TrustRoot.tenant_id == body.tenant_id,
-                    TrustRoot.workload_id == body.workload_id,
-                )
-                .with_for_update()
-            )
-            if trust_root is None:
-                # Do not reveal whether an out-of-scope trust root exists.
-                raise HTTPException(status_code=404, detail="trust root not found")
-            existing = session.scalar(
-                select(CertificateRevocation.revocation_id).where(
-                    CertificateRevocation.tenant_id == body.tenant_id,
-                    CertificateRevocation.workload_id == body.workload_id,
-                    CertificateRevocation.trust_root_id == body.trust_root_id,
-                    CertificateRevocation.certificate_fingerprint
-                    == body.certificate_fingerprint,
-                )
-            )
-            if existing is not None:
-                # Repeat registrations never merge or overwrite: a second
-                # effective time for the same (root, fingerprint) is
-                # rejected rather than replacing the first.
-                raise HTTPException(
-                    status_code=409,
-                    detail="certificate already revoked for this trust root",
-                )
-            session.add(
-                CertificateRevocation(
-                    revocation_id=revocation_id,
-                    tenant_id=body.tenant_id,
-                    workload_id=body.workload_id,
-                    trust_root_id=body.trust_root_id,
-                    certificate_fingerprint=body.certificate_fingerprint,
-                    effective_at=effective_at,
-                    created_at=now,
-                )
-            )
             try:
-                session.commit()
-            except IntegrityError:
-                # A concurrent request registered the same fingerprint
-                # first; the unique constraint guarantees at most one row
-                # and the loser reports a stable 409.
-                session.rollback()
-                raise HTTPException(
-                    status_code=409,
-                    detail="certificate already revoked for this trust root",
+                # Lock the trust-root row for the full registration. X.509
+                # verification takes the same lock while checking the registry,
+                # so a registration either commits before the evidence settles
+                # (and the verification observes it) or waits until after it
+                # settles (and never retroactively changes the conclusion).
+                # SQLite ignores FOR UPDATE but already serializes all writers
+                # via BEGIN IMMEDIATE.
+                trust_root = session.scalar(
+                    select(TrustRoot)
+                    .where(
+                        TrustRoot.root_id == body.trust_root_id,
+                        TrustRoot.tenant_id == body.tenant_id,
+                        TrustRoot.workload_id == body.workload_id,
+                    )
+                    .with_for_update()
                 )
+                if trust_root is None:
+                    # Do not reveal whether an out-of-scope trust root exists.
+                    raise HTTPException(status_code=404, detail="trust root not found")
+                existing = session.scalar(
+                    select(CertificateRevocation.revocation_id).where(
+                        CertificateRevocation.tenant_id == body.tenant_id,
+                        CertificateRevocation.workload_id == body.workload_id,
+                        CertificateRevocation.trust_root_id == body.trust_root_id,
+                        CertificateRevocation.certificate_fingerprint
+                        == body.certificate_fingerprint,
+                    )
+                )
+                if existing is not None:
+                    # Repeat registrations never merge or overwrite: a second
+                    # effective time for the same (root, fingerprint) is
+                    # rejected rather than replacing the first.
+                    raise HTTPException(
+                        status_code=409,
+                        detail="certificate already revoked for this trust root",
+                    )
+                session.add(
+                    CertificateRevocation(
+                        revocation_id=revocation_id,
+                        tenant_id=body.tenant_id,
+                        workload_id=body.workload_id,
+                        trust_root_id=body.trust_root_id,
+                        certificate_fingerprint=body.certificate_fingerprint,
+                        effective_at=effective_at,
+                        created_at=now,
+                    )
+                )
+                try:
+                    session.commit()
+                except IntegrityError:
+                    # A concurrent request registered the same fingerprint
+                    # first; the unique constraint guarantees at most one row
+                    # and the loser reports a stable 409.
+                    session.rollback()
+                    raise HTTPException(
+                        status_code=409,
+                        detail="certificate already revoked for this trust root",
+                    )
+                except Exception:
+                    # Any other commit/write failure rolls the (single-row)
+                    # transaction back completely, so no half record survives.
+                    session.rollback()
+                    logger.error("certificate revocation write failed")
+                    raise HTTPException(
+                        status_code=500, detail="revocation registration failed"
+                    )
+            except HTTPException:
+                # 404/409 judgements and the controlled 500 above keep their
+                # status; a read-only judgement has written nothing.
+                raise
             except Exception:
+                # A failure during the locked lookups (e.g. an unavailable
+                # registry) is likewise a full rollback and a sanitized 500:
+                # the insert can never have happened on this path.
                 session.rollback()
-                logger.error("certificate revocation write failed")
+                logger.error("certificate revocation registration failed")
                 raise HTTPException(
                     status_code=500, detail="revocation registration failed"
                 )
@@ -2320,6 +2464,12 @@ def create_app(
         )
         return Response(content=body, media_type="application/json")
 
+    @app.post("/v1/release-grants//consume")
+    def consume_release_grant_identifier_required() -> Response:
+        # An empty path segment is a missing grant identifier: a 422 client
+        # error rather than a routing-level 404, and it never consumes budget.
+        raise HTTPException(status_code=422, detail="invalid grant identifier")
+
     @app.post(
         "/v1/release-grants/{grant_id}/consume",
         response_model=ReleaseGrantConsumedResponse,
@@ -2327,6 +2477,20 @@ def create_app(
     def consume_release_grant(
         grant_id: str, body: ConsumeReleaseGrantRequest
     ) -> ReleaseGrantConsumedResponse:
+        # Grant ids are canonical lowercase UUIDs; a syntactically illegal
+        # path identifier is a 422 field error indistinguishable from any
+        # other bad input, never a lookup, and never consumes budget.
+        if not grant_id.strip() or not _UUID_RE.fullmatch(grant_id.lower()):
+            raise HTTPException(status_code=422, detail="invalid grant identifier")
+        grant_id = grant_id.strip().lower()
+
+        # Basic field/format validation (the request model and the path
+        # check above) has passed: reserve one shared per-scope minute slot
+        # before any business judgement. A 429 or a counter failure surfaces
+        # here and changes no grant, payload or audit state.
+        limited = _consume_grant_budget(body.tenant_id, body.workload_id)
+        if limited is not None:
+            return limited
         digest = _nonce_digest(body.capability)
         now = _utcnow()
         with session_factory() as session:
@@ -2423,6 +2587,12 @@ def create_app(
             raise HTTPException(status_code=422, detail="invalid grant identifier")
         grant_id = grant_id.strip().lower()
 
+        # Field/format validation has passed (request model plus the path
+        # check): reserve one shared per-scope minute slot before any
+        # business judgement. A 429 or a counter failure changes no state.
+        limited = _consume_grant_budget(body.tenant_id, body.workload_id)
+        if limited is not None:
+            return limited
         digest = _nonce_digest(body.capability)
         now = _utcnow()
         with session_factory() as session:
@@ -2512,21 +2682,39 @@ def create_app(
             revoked_at=_rfc3339(now),
         )
 
+    @app.post("/v1/release/")
+    def release_payload_identifier_required() -> Response:
+        # An empty path segment is a missing grant identifier: a 422 client
+        # error rather than a routing-level 404, and it never consumes budget.
+        raise HTTPException(status_code=422, detail="invalid grant identifier")
+
     @app.post("/v1/release/{grant_id}")
     def release_payload(grant_id: str, body: ReleasePayloadRequest) -> Response:
         """Release one protected payload against a one-time grant.
 
         Judgement order is fixed: unknown/cross-scope grant or data item
         (404), capability mismatch (401), expiry (410), already consumed or
-        revoked (409). Field/format problems are rejected with 422 by the
-        request model before this handler runs. The one-time state is the
-        very same release_grants row used by the consume and revoke
+        revoked (409). Field/format problems — including a missing, blank or
+        syntactically illegal path grant identifier — are rejected with 422
+        before this handler's judgement and never consume budget. The shared
+        per-scope minute budget is reserved after that basic validation and
+        before the 404/401/410/409/500 judgements below. The one-time state
+        is the very same release_grants row used by the consume and revoke
         endpoints: the data key is unwrapped and the payload
         authenticated-decrypted *before* the pending -> consumed transition
         is committed, so any keyring or decryption failure leaves the grant
         pending and writes no consumption audit, and a revocation that
         settles first makes this path observe 409 without releasing.
         """
+        # A syntactically illegal path identifier is a 422 field error, not
+        # a lookup, and never consumes budget or touches storage.
+        if not grant_id.strip() or not _UUID_RE.fullmatch(grant_id.lower()):
+            raise HTTPException(status_code=422, detail="invalid grant identifier")
+        grant_id = grant_id.strip().lower()
+
+        limited = _consume_grant_budget(body.tenant_id, body.workload_id)
+        if limited is not None:
+            return limited
         digest = _nonce_digest(body.capability)
         now = _utcnow()
         with session_factory() as session:

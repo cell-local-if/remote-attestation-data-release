@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 
+from proof_release import app as app_module
 from proof_release.app import create_app
 from proof_release.db import ReleaseGrant
 from proof_release.envelopes import b64url_encode
@@ -618,7 +619,9 @@ def test_revoke_valid_uuid_path_unknown_row_returns_404(client):
 # ---------------------------------------------------------------------------
 
 
-def test_concurrent_revokes_only_one_succeeds(app):
+def test_concurrent_revokes_only_one_succeeds(app, monkeypatch):
+    # Settlement-race test, not the shared per-minute budget: admit all.
+    monkeypatch.setattr(app_module, "GRANT_BUDGET_PER_MINUTE", 64)
     client = TestClient(app)
     grant = _setup(client)
     url = f"/v1/release-grants/{grant['grant_id']}/revoke"
@@ -644,7 +647,9 @@ def test_concurrent_revokes_only_one_succeeds(app):
         assert session.query(ReleaseGrant).count() == 1
 
 
-def test_concurrent_revoke_and_consume_single_win(app):
+def test_concurrent_revoke_and_consume_single_win(app, monkeypatch):
+    # Settlement-race test, not the shared per-minute budget: admit all.
+    monkeypatch.setattr(app_module, "GRANT_BUDGET_PER_MINUTE", 64)
     client = TestClient(app)
     grant = _setup(client)
     revoke_body = {
@@ -679,7 +684,9 @@ def test_concurrent_revoke_and_consume_single_win(app):
         assert session.query(ReleaseGrant).count() == 1
 
 
-def test_concurrent_revoke_and_release_single_win(app):
+def test_concurrent_revoke_and_release_single_win(app, monkeypatch):
+    # Settlement-race test, not the shared per-minute budget: admit all.
+    monkeypatch.setattr(app_module, "GRANT_BUDGET_PER_MINUTE", 64)
     client = TestClient(app)
     grant = _setup(client)
     revoke_body = {

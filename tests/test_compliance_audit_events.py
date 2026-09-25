@@ -780,12 +780,15 @@ def test_query_writes_no_state(app, client):
 # --- concurrency -----------------------------------------------------------
 
 
-def test_concurrent_settlement_then_replay_remains_stable(app):
+def test_concurrent_settlement_then_replay_remains_stable(app, monkeypatch):
+    # Settlement/audit-ordering test, not the shared per-minute budget:
+    # admit all six concurrent settlements.
+    import proof_release.app as app_module
+
+    monkeypatch.setattr(app_module, "GRANT_BUDGET_PER_MINUTE", 64)
     client = TestClient(app)
     decision = _decision(client)
     grants = [_mint(client, decision["decision_id"], data_id=f"d{i}") for i in range(6)]
-
-    import proof_release.app as app_module
 
     app_module.AUDIT_EVENT_PAGE_SIZE = 3
     try:
