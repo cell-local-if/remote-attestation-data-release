@@ -14,10 +14,18 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import Response
-from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    StrictStr,
+    field_validator,
+)
 from sqlalchemy import (
     and_,
     create_engine,
+    delete,
     event,
     func,
     or_,
@@ -43,6 +51,8 @@ from proof_release.db import (
     REWRAP_RESULT_SKIPPED,
     VERIFICATION_RESULT_ACCEPTED,
     VERIFICATION_RESULT_REJECTED,
+    WORKLOAD_IDENTITY_STATUS_ACTIVE,
+    WORKLOAD_IDENTITY_STATUS_REVOKED,
     AUDIT_EVENT_STATUS_CONSUMED,
     AUDIT_EVENT_STATUS_PENDING,
     AUDIT_EVENT_STATUS_REVOKED,
@@ -383,6 +393,22 @@ def _canonical_claim_set(
         separators=(",", ":"),
     ).encode("utf-8")
     return ordered, hashlib.sha256(canonical).hexdigest()
+
+
+def _identity_json(payload) -> Response:
+    """Compact identity-response JSON with a single terminating newline.
+
+    Every value is a string, list, boolean or UTC timestamp string (plus
+    ``null`` for absent timestamps): no floats, ``-0.0`` or non-finite
+    values can ever appear (``allow_nan=False`` makes that explicit).
+    """
+    body = (
+        json.dumps(
+            payload, separators=(",", ":"), allow_nan=False, ensure_ascii=False
+        ).encode("utf-8")
+        + b"\n"
+    )
+    return Response(content=body, media_type="application/json")
 
 
 def _leaf_identity_strings(
@@ -821,8 +847,11 @@ class IdentityClaimModel(BaseModel):
 
     Every field is a required non-blank string; values are stored verbatim
     as the non-sensitive comparison strings used against a leaf
-    certificate's RFC4514 issuer/subject DNs and SAN URI.
+    certificate's RFC4514 issuer/subject DNs and SAN URI. Any additional
+    field is rejected as a client error rather than silently ignored.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     issuer: StrictStr = Field(min_length=1)
     subject: StrictStr = Field(min_length=1)
@@ -832,6 +861,10 @@ class IdentityClaimModel(BaseModel):
 
 
 class RegisterWorkloadIdentityRequest(BaseModel):
+    # Unknown fields are rejected rather than dropped, so a client learns
+    # immediately that the service did not act on them.
+    model_config = ConfigDict(extra="forbid")
+
     tenant_id: StrictStr = Field(min_length=1)
     workload_id: StrictStr = Field(min_length=1)
     # Canonical lowercase UUID of a trust root in exactly this scope.
@@ -849,6 +882,45 @@ class RegisterWorkloadIdentityRequest(BaseModel):
         if not value:
             raise ValueError("claims must contain at least one identity claim")
         return value
+
+
+class UpdateWorkloadIdentityRequest(BaseModel):
+    """Whole-set replacement of a profile's claims (PUT semantics).
+
+    The body carries the scope, trust root and the complete new claim
+    list; every field has the same shape and strictness as on
+    registration, and unknown fields are rejected.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    trust_root_id: StrictStr = Field(min_length=1)
+    claims: list[IdentityClaimModel]
+
+    _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
+    _trust_root_shape = field_validator("trust_root_id")(_canonical_uuid)
+
+    @field_validator("claims")
+    @classmethod
+    def _claims_non_empty(cls, value: list[IdentityClaimModel]) -> list[IdentityClaimModel]:
+        if not value:
+            raise ValueError("claims must contain at least one identity claim")
+        return value
+
+
+class RevokeWorkloadIdentityRequest(BaseModel):
+    """Scope and anchor naming the profile to revoke."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    trust_root_id: StrictStr = Field(min_length=1)
+
+    _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
+    _trust_root_shape = field_validator("trust_root_id")(_canonical_uuid)
 
 
 class CreatePolicyRequest(BaseModel):
@@ -1080,6 +1152,14 @@ def _migrate_additive(engine) -> None:
         "release_grants": (
             ("revoked_at", "DATETIME"),
         ),
+        "workload_identity_profiles": (
+            ("status", "VARCHAR(16)"),
+            ("updated_at", "DATETIME"),
+            ("revoked_at", "DATETIME"),
+        ),
+        "workload_identity_claims": (
+            ("seq", "INTEGER"),
+        ),
     }
     with engine.begin() as conn:
         for table, columns in additions.items():
@@ -1092,6 +1172,21 @@ def _migrate_additive(engine) -> None:
                     conn.execute(
                         text(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
                     )
+            # Backfills for columns added to pre-existing rows: profiles
+            # created before the lifecycle existed are all active, and
+            # legacy claims take a single shared ordering position.
+            if table == "workload_identity_profiles":
+                conn.execute(
+                    text(
+                        "UPDATE workload_identity_profiles "
+                        "SET status = :active WHERE status IS NULL"
+                    ),
+                    {"active": WORKLOAD_IDENTITY_STATUS_ACTIVE},
+                )
+            if table == "workload_identity_claims":
+                conn.execute(
+                    text("UPDATE workload_identity_claims SET seq = 0 WHERE seq IS NULL")
+                )
             # Legacy databases may carry a free-form verification_detail
             # column written by older versions, which can hold arbitrary
             # plugin-supplied text (potentially raw evidence or secrets).
@@ -1558,29 +1653,40 @@ def create_app(
             # Workload identity gate, X.509 only, consulted only after the
             # chain, signature, validity and revocation checks have passed
             # (the verifier accepted) and only when the chain anchors to a
-            # configured trust root. Every committed identity profile under
-            # that trust root is read here; verification observes only
-            # committed profiles — registration holds the same trust-root
-            # lock, so a profile that has not committed before this point
-            # can neither affect this settlement nor be applied later to a
-            # settled evidence.
+            # configured trust root. Every committed, *active* identity
+            # profile under that trust root is read here; verification
+            # observes only committed profiles — registration and update
+            # hold the same trust-root lock, so a profile that has not
+            # committed before this point can neither affect this
+            # settlement nor be applied later to a settled evidence, and a
+            # revoked profile no longer participates at all (it remains
+            # queryable through the lifecycle endpoints).
             #
-            # * No profile exists for the anchor: the verifier's verdict is
-            #   unchanged (backward compatible).
-            # * One or more profiles exist: the leaf's parsed issuer DN,
-            #   subject DN and a SAN URI must all equal, as parsed strings,
-            #   the corresponding fields of at least one claim of at least
-            #   one profile ("any claim of any profile hits"); otherwise the
-            #   evidence is rejected.
+            # * No active profile exists for the anchor: the verifier's
+            #   verdict is unchanged (backward compatible; this includes
+            #   an anchor whose profiles were all revoked).
+            # * One or more active profiles exist: the leaf's parsed
+            #   issuer DN, subject DN and a SAN URI must all equal, as
+            #   parsed strings, the corresponding fields of at least one
+            #   claim of at least one profile ("any claim of any profile
+            #   hits"); otherwise the evidence is rejected.
             # A query failure is a 500 before any settlement write, so the
             # evidence stays received and can be retried after recovery.
             if accepted and identity_anchor_id is not None:
                 try:
                     profile_claims = session.scalars(
-                        select(WorkloadIdentityClaim).where(
+                        select(WorkloadIdentityClaim)
+                        .join(
+                            WorkloadIdentityProfile,
+                            WorkloadIdentityProfile.profile_id
+                            == WorkloadIdentityClaim.profile_id,
+                        )
+                        .where(
                             WorkloadIdentityClaim.tenant_id == body.tenant_id,
                             WorkloadIdentityClaim.workload_id == body.workload_id,
                             WorkloadIdentityClaim.trust_root_id == identity_anchor_id,
+                            WorkloadIdentityProfile.status
+                            == WORKLOAD_IDENTITY_STATUS_ACTIVE,
                         )
                     ).all()
                 except Exception:
@@ -1911,10 +2017,11 @@ def create_app(
                         workload_id=body.workload_id,
                         trust_root_id=body.trust_root_id,
                         claims_fingerprint=claims_fingerprint,
+                        status=WORKLOAD_IDENTITY_STATUS_ACTIVE,
                         created_at=now,
                     )
                 )
-                for issuer, subject, uri in claims:
+                for seq, (issuer, subject, uri) in enumerate(claims):
                     session.add(
                         WorkloadIdentityClaim(
                             claim_id=str(uuid.uuid4()),
@@ -1925,6 +2032,7 @@ def create_app(
                             issuer=issuer,
                             subject=subject,
                             uri=uri,
+                            seq=seq,
                         )
                     )
                 try:
@@ -1978,6 +2086,482 @@ def create_app(
         return Response(
             content=body_bytes, status_code=201, media_type="application/json"
         )
+
+    @app.get("/v1/workload-identities")
+    def list_workload_identities(
+        request: Request,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        trust_root_id: str = Query(...),
+        profile_id: str | None = Query(default=None),
+    ) -> Response:
+        """Return the workload identity profiles in one scope.
+
+        The request body is always empty and the scope comes entirely
+        from query parameters: mandatory non-blank tenant, workload and
+        trust root (a canonical UUID), plus an optional canonical
+        profile UUID. Results are sorted by creation time and then
+        profile id; an empty range is an empty array. An explicitly
+        named profile that is unknown or outside the scope is a 404
+        rather than an empty-looking array. The handler issues only
+        reads and observes committed state.
+        """
+        allowed_params = {"tenant_id", "workload_id", "trust_root_id", "profile_id"}
+        if set(request.query_params.keys()) - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+        if not trust_root_id.strip() or not _UUID_RE.fullmatch(trust_root_id):
+            raise HTTPException(status_code=422, detail="invalid trust root identifier")
+        profile_filter: str | None = None
+        if profile_id is not None:
+            if not profile_id.strip() or not _UUID_RE.fullmatch(profile_id):
+                raise HTTPException(
+                    status_code=422, detail="invalid profile identifier"
+                )
+            profile_filter = profile_id
+
+        try:
+            with session_factory() as session:
+                # An explicitly named profile must match the scope and
+                # trust root; an unknown or cross-scope profile is a 404.
+                # An unknown trust root with no profile filter simply
+                # matches an empty range.
+                if profile_filter is not None:
+                    named = session.get(WorkloadIdentityProfile, profile_filter)
+                    if (
+                        named is None
+                        or named.tenant_id != tenant_id
+                        or named.workload_id != workload_id
+                        or named.trust_root_id != trust_root_id
+                    ):
+                        raise HTTPException(
+                            status_code=404, detail="workload identity profile not found"
+                        )
+
+                stmt = select(WorkloadIdentityProfile).where(
+                    WorkloadIdentityProfile.tenant_id == tenant_id,
+                    WorkloadIdentityProfile.workload_id == workload_id,
+                    WorkloadIdentityProfile.trust_root_id == trust_root_id,
+                )
+                if profile_filter is not None:
+                    stmt = stmt.where(
+                        WorkloadIdentityProfile.profile_id == profile_filter
+                    )
+                stmt = stmt.order_by(
+                    WorkloadIdentityProfile.created_at.asc(),
+                    WorkloadIdentityProfile.profile_id.asc(),
+                )
+                profiles = list(session.scalars(stmt))
+                claims_by_profile: dict[str, list[WorkloadIdentityClaim]] = {}
+                if profiles:
+                    claim_rows = session.scalars(
+                        select(WorkloadIdentityClaim).where(
+                            WorkloadIdentityClaim.profile_id.in_(
+                                [profile.profile_id for profile in profiles]
+                            )
+                        )
+                    ).all()
+                    for claim in claim_rows:
+                        claims_by_profile.setdefault(claim.profile_id, []).append(claim)
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("workload identity profile query failed")
+            raise HTTPException(
+                status_code=500, detail="workload identity registry unavailable"
+            )
+
+        # Query elements keep the creation-response fields and add the
+        # lifecycle status; revoked profiles remain listed here even
+        # though they no longer gate X.509 verification.
+        result = []
+        for profile in profiles:
+            claims = sorted(
+                claims_by_profile.get(profile.profile_id, []),
+                key=lambda claim: claim.seq,
+            )
+            result.append(
+                {
+                    "profile_id": profile.profile_id,
+                    "tenant_id": profile.tenant_id,
+                    "workload_id": profile.workload_id,
+                    "trust_root_id": profile.trust_root_id,
+                    "claims": [
+                        {
+                            "issuer": claim.issuer,
+                            "subject": claim.subject,
+                            "uri": claim.uri,
+                        }
+                        for claim in claims
+                    ],
+                    "status": profile.status,
+                    "created_at": _rfc3339(profile.created_at),
+                }
+            )
+        return _identity_json(result)
+
+    @app.put("/v1/workload-identities/")
+    def update_workload_identity_identifier_required() -> Response:
+        # An empty path segment is a missing profile identifier: a 422
+        # client error rather than a routing-level 404 or 405.
+        raise HTTPException(status_code=422, detail="invalid profile identifier")
+
+    @app.put("/v1/workload-identities/{profile_id}")
+    def update_workload_identity(
+        profile_id: str, body: UpdateWorkloadIdentityRequest
+    ) -> Response:
+        """Replace a profile's whole claim set (PUT semantics).
+
+        The path identifier must be a canonical UUID and the body has the
+        same shape and strictness as registration (scope, trust root and
+        a complete, non-empty claim list); any malformed input is a 422
+        that writes nothing. The named profile must exist in exactly the
+        body's scope and trust root (unknown/cross-scope is 404). A
+        request carrying the profile's own current set is an idempotent
+        no-op and returns the current result; a set already owned by a
+        different profile under the same trust root is a 409 and changes
+        nothing. Two updates raced from the same original set settle
+        once: the loser's guarded compare-and-swap matches no row and it
+        observes the winner — 200 with the current result when both
+        requested the same set, 409 for a different set — so only one
+        replacement ever takes effect. The profile id, ownership/scope
+        and ``created_at`` never change; the replacement (profile row
+        plus claim rows) is one atomic commit, so any failure leaves the
+        old set, status and timestamps exactly as they were.
+        """
+        # A path identifier that is missing, blank or not a canonical
+        # lowercase UUID is a field/format error, never a lookup.
+        if not profile_id.strip() or not _UUID_RE.fullmatch(profile_id):
+            raise HTTPException(status_code=422, detail="invalid profile identifier")
+        profile_id = profile_id.strip()
+
+        raw_claims = [
+            (claim.issuer, claim.subject, claim.uri) for claim in body.claims
+        ]
+        claims, claims_fingerprint = _canonical_claim_set(raw_claims)
+
+        # Capture the set the request is based on *before* opening the
+        # write transaction. Two concurrent requests both observe the
+        # same original fingerprint; only one compare-and-swap below can
+        # then match. Profiles and trust roots are never deleted and
+        # profile scope never changes, so this existence/scope judgement
+        # stays valid for the write that follows.
+        with session_factory() as read_session:
+            original = read_session.get(WorkloadIdentityProfile, profile_id)
+            if (
+                original is None
+                or original.tenant_id != body.tenant_id
+                or original.workload_id != body.workload_id
+                or original.trust_root_id != body.trust_root_id
+            ):
+                raise HTTPException(
+                    status_code=404, detail="workload identity profile not found"
+                )
+            original_fingerprint = original.claims_fingerprint
+
+        updated_at = _utcnow()
+        with session_factory() as session:
+            try:
+                # Take the same trust-root lock registration and X.509
+                # verification take, so an update is ordered against both:
+                # only an update committed before an evidence settles can
+                # affect it. SQLite serializes all writers via BEGIN
+                # IMMEDIATE regardless.
+                trust_root = session.scalar(
+                    select(TrustRoot)
+                    .where(
+                        TrustRoot.root_id == body.trust_root_id,
+                        TrustRoot.tenant_id == body.tenant_id,
+                        TrustRoot.workload_id == body.workload_id,
+                    )
+                    .with_for_update()
+                )
+                profile = session.get(WorkloadIdentityProfile, profile_id)
+                if trust_root is None or profile is None or (
+                    profile.tenant_id != body.tenant_id
+                    or profile.workload_id != body.workload_id
+                    or profile.trust_root_id != body.trust_root_id
+                ):
+                    # Do not reveal whether an out-of-scope profile or
+                    # trust root exists.
+                    raise HTTPException(
+                        status_code=404, detail="workload identity profile not found"
+                    )
+
+                def _current_result(current: WorkloadIdentityProfile) -> Response:
+                    current_claims = session.scalars(
+                        select(WorkloadIdentityClaim)
+                        .where(WorkloadIdentityClaim.profile_id == profile_id)
+                    ).all()
+                    result = {
+                        "profile_id": current.profile_id,
+                        "tenant_id": current.tenant_id,
+                        "workload_id": current.workload_id,
+                        "trust_root_id": current.trust_root_id,
+                        "claims": [
+                            {
+                                "issuer": claim.issuer,
+                                "subject": claim.subject,
+                                "uri": claim.uri,
+                            }
+                            for claim in sorted(current_claims, key=lambda c: c.seq)
+                        ],
+                        "created_at": _rfc3339(current.created_at),
+                    }
+                    # A no-op never mints a timestamp: updated_at is
+                    # present only when an earlier replacement set it.
+                    if current.updated_at is not None:
+                        result["updated_at"] = _rfc3339(current.updated_at)
+                    return _identity_json(result)
+
+                if profile.claims_fingerprint == claims_fingerprint:
+                    # Idempotent self-replacement: the current result is
+                    # returned verbatim and nothing is written, so
+                    # updated_at is never rewritten by a no-op.
+                    return _current_result(profile)
+
+                # A different profile under the same trust root (active or
+                # revoked) already owns this exact set; sets never merge.
+                owner = session.scalar(
+                    select(WorkloadIdentityProfile.profile_id).where(
+                        WorkloadIdentityProfile.trust_root_id == body.trust_root_id,
+                        WorkloadIdentityProfile.claims_fingerprint
+                        == claims_fingerprint,
+                        WorkloadIdentityProfile.profile_id != profile_id,
+                    )
+                )
+                if owner is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="workload identity profile already registered",
+                    )
+
+                # Compare-and-swap on the fingerprint captured before this
+                # transaction: the guarded UPDATE plus the delete/insert
+                # of claims is the single atomic replacement. A request
+                # whose original set has already been replaced by a
+                # concurrent winner matches no row.
+                outcome = session.execute(
+                    update(WorkloadIdentityProfile)
+                    .where(
+                        WorkloadIdentityProfile.profile_id == profile_id,
+                        WorkloadIdentityProfile.claims_fingerprint
+                        == original_fingerprint,
+                    )
+                    .values(
+                        claims_fingerprint=claims_fingerprint,
+                        updated_at=updated_at,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+
+                def _settlement_conflict() -> HTTPException:
+                    # Re-read the winner outside the failed transaction:
+                    # a request whose requested set has just been
+                    # installed receives that current result; any other
+                    # stale write is a conflict and changes nothing.
+                    session.rollback()
+                    winner = session.get(WorkloadIdentityProfile, profile_id)
+                    if (
+                        winner is not None
+                        and winner.claims_fingerprint == claims_fingerprint
+                    ):
+                        return _current_result(winner)
+                    return HTTPException(
+                        status_code=409,
+                        detail="workload identity profile was modified concurrently",
+                    )
+
+                if outcome.rowcount != 1:
+                    conflict = _settlement_conflict()
+                    if isinstance(conflict, Response):
+                        return conflict
+                    raise conflict
+                session.execute(
+                    delete(WorkloadIdentityClaim).where(
+                        WorkloadIdentityClaim.profile_id == profile_id
+                    )
+                )
+                for seq, (issuer, subject, uri) in enumerate(claims):
+                    session.add(
+                        WorkloadIdentityClaim(
+                            claim_id=str(uuid.uuid4()),
+                            profile_id=profile_id,
+                            tenant_id=body.tenant_id,
+                            workload_id=body.workload_id,
+                            trust_root_id=body.trust_root_id,
+                            issuer=issuer,
+                            subject=subject,
+                            uri=uri,
+                            seq=seq,
+                        )
+                    )
+                try:
+                    session.commit()
+                except IntegrityError:
+                    # A concurrent request installed the same (or a
+                    # colliding) set first; the unique constraint makes
+                    # at most one owner. The winner's current set may
+                    # already satisfy this request.
+                    conflict = _settlement_conflict()
+                    if isinstance(conflict, Response):
+                        return conflict
+                    raise conflict
+                except Exception:
+                    session.rollback()
+                    logger.error("workload identity profile update failed")
+                    raise HTTPException(
+                        status_code=500, detail="workload identity update failed"
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                session.rollback()
+                logger.error("workload identity profile update failed")
+                raise HTTPException(
+                    status_code=500, detail="workload identity update failed"
+                )
+        payload = {
+            "profile_id": profile_id,
+            "tenant_id": body.tenant_id,
+            "workload_id": body.workload_id,
+            "trust_root_id": body.trust_root_id,
+            "claims": [
+                {"issuer": issuer, "subject": subject, "uri": uri}
+                for issuer, subject, uri in claims
+            ],
+            "created_at": _rfc3339(profile.created_at),
+            "updated_at": _rfc3339(updated_at),
+        }
+        return _identity_json(payload)
+
+    @app.delete("/v1/workload-identities/")
+    def revoke_workload_identity_identifier_required() -> Response:
+        # An empty path segment is a missing profile identifier: a 422
+        # client error rather than a routing-level 404 or 405.
+        raise HTTPException(status_code=422, detail="invalid profile identifier")
+
+    @app.delete("/v1/workload-identities/{profile_id}")
+    def revoke_workload_identity(
+        profile_id: str, body: RevokeWorkloadIdentityRequest
+    ) -> Response:
+        """Revoke a workload identity profile.
+
+        The path identifier must be a canonical UUID and the body carries
+        only the scope and trust root; any missing, blank, wrong-typed or
+        unknown field is a 422 that writes nothing. An unknown profile or
+        one outside the body's scope/trust root is an indistinguishable
+        404. A repeat revoke returns 409 and never rewrites the stored
+        ``revoked_at``. The active -> revoked transition is one guarded
+        atomic update under the trust-root lock, so it is ordered against
+        registration, update and X.509 verification; a write or commit
+        failure returns 500 after a full rollback, leaving the profile,
+        its status and its revocation time unchanged.
+        """
+        if not profile_id.strip() or not _UUID_RE.fullmatch(profile_id):
+            raise HTTPException(status_code=422, detail="invalid profile identifier")
+        profile_id = profile_id.strip()
+
+        revoked_at = _utcnow()
+        with session_factory() as session:
+            try:
+                trust_root = session.scalar(
+                    select(TrustRoot)
+                    .where(
+                        TrustRoot.root_id == body.trust_root_id,
+                        TrustRoot.tenant_id == body.tenant_id,
+                        TrustRoot.workload_id == body.workload_id,
+                    )
+                    .with_for_update()
+                )
+                profile = session.get(WorkloadIdentityProfile, profile_id)
+                if trust_root is None or profile is None or (
+                    profile.tenant_id != body.tenant_id
+                    or profile.workload_id != body.workload_id
+                    or profile.trust_root_id != body.trust_root_id
+                ):
+                    raise HTTPException(
+                        status_code=404, detail="workload identity profile not found"
+                    )
+                if profile.status == WORKLOAD_IDENTITY_STATUS_REVOKED:
+                    # A repeated revoke is a conflict and never rewrites
+                    # the recorded revocation time.
+                    raise HTTPException(
+                        status_code=409, detail="workload identity profile already revoked"
+                    )
+                # Atomic settlement: only one caller can flip
+                # active -> revoked.
+                outcome = session.execute(
+                    update(WorkloadIdentityProfile)
+                    .where(
+                        WorkloadIdentityProfile.profile_id == profile_id,
+                        WorkloadIdentityProfile.status
+                        == WORKLOAD_IDENTITY_STATUS_ACTIVE,
+                    )
+                    .values(
+                        status=WORKLOAD_IDENTITY_STATUS_REVOKED,
+                        revoked_at=revoked_at,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                if outcome.rowcount != 1:
+                    session.rollback()
+                    fresh = session.get(WorkloadIdentityProfile, profile_id)
+                    if (
+                        fresh is not None
+                        and fresh.status == WORKLOAD_IDENTITY_STATUS_REVOKED
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="workload identity profile already revoked",
+                        )
+                    raise HTTPException(
+                        status_code=409,
+                        detail="workload identity profile revocation conflict",
+                    )
+                try:
+                    session.commit()
+                except Exception:
+                    session.rollback()
+                    logger.error("workload identity profile revocation failed")
+                    raise HTTPException(
+                        status_code=500, detail="workload identity revocation failed"
+                    )
+                final_claims = session.scalars(
+                    select(WorkloadIdentityClaim).where(
+                        WorkloadIdentityClaim.profile_id == profile_id
+                    )
+                ).all()
+                created_at = profile.created_at
+                prior_updated_at = profile.updated_at
+            except HTTPException:
+                raise
+            except Exception:
+                session.rollback()
+                logger.error("workload identity profile revocation failed")
+                raise HTTPException(
+                    status_code=500, detail="workload identity revocation failed"
+                )
+        payload = {
+            "profile_id": profile_id,
+            "tenant_id": body.tenant_id,
+            "workload_id": body.workload_id,
+            "trust_root_id": body.trust_root_id,
+            "claims": [
+                {"issuer": claim.issuer, "subject": claim.subject, "uri": claim.uri}
+                for claim in sorted(final_claims, key=lambda c: c.seq)
+            ],
+            "created_at": _rfc3339(created_at),
+            "revoked": True,
+            "revoked_at": _rfc3339(revoked_at),
+        }
+        # A replacement that happened before revocation stays visible.
+        if prior_updated_at is not None:
+            payload["updated_at"] = _rfc3339(prior_updated_at)
+        return _identity_json(payload)
 
     @app.post("/v1/policies", status_code=201, response_model=PolicyCreatedResponse)
     def create_policy(body: CreatePolicyRequest) -> PolicyCreatedResponse:

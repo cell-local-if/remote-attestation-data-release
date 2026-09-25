@@ -103,6 +103,17 @@ AUDIT_EVENT_STATUS_CODES = frozenset(
 )
 
 
+#: Finite, service-defined set of workload identity profile lifecycle
+#: statuses. A profile is born active and is revoked exactly once; revocation
+#: leaves the row in place (still queryable) but removes it from the X.509
+#: identity gate. A revoked profile is never made active again.
+WORKLOAD_IDENTITY_STATUS_ACTIVE = "active"
+WORKLOAD_IDENTITY_STATUS_REVOKED = "revoked"
+WORKLOAD_IDENTITY_STATUS_CODES = frozenset(
+    {WORKLOAD_IDENTITY_STATUS_ACTIVE, WORKLOAD_IDENTITY_STATUS_REVOKED}
+)
+
+
 class UTCDateTime(TypeDecorator):
     """Store datetimes as UTC and always return timezone-aware UTC values."""
 
@@ -249,17 +260,23 @@ class WorkloadIdentityProfile(Base):
     profile exists for the anchor — the evidence is rejected.
 
     Two profiles under the same trust root may not carry the identical
-    claim *set*. The set identity is the SHA-256 of the canonical
-    (sorted, compact) JSON of the normalized claims; a unique constraint
-    over ``(trust_root_id, claims_fingerprint)`` is what makes concurrent
-    duplicate registrations settle as one insert plus stable 409s, and
-    distinct claim sets are always independent rows that never overwrite
-    each other.
+    claim *set* while active. The set identity is the SHA-256 of the
+    canonical (sorted, compact) JSON of the normalized claims; a unique
+    constraint over ``(trust_root_id, claims_fingerprint)`` is what makes
+    concurrent duplicate registrations settle as one insert plus stable
+    409s, and distinct claim sets are always independent rows that never
+    overwrite each other. An update replaces the whole claim set inside
+    one atomic transaction (the profile's identity, ownership and
+    ``created_at`` never change); when a replacement collides with a
+    distinct profile the transaction rolls back and the old set stays in
+    force. Revocation sets ``status`` to ``revoked`` once; a revoked
+    profile remains queryable but never participates in X.509 gating.
 
     Only non-sensitive comparison strings are stored — the RFC4514 text of
     a certificate's issuer/subject distinguished names and SAN URI values —
-    plus identifiers, scope and a timestamp. No certificate material,
-    evidence, private keys or free-form secrets have a column here.
+    plus identifiers, scope, lifecycle timestamps and a status. No
+    certificate material, evidence, private keys or free-form secrets have
+    a column here.
     """
 
     __tablename__ = "workload_identity_profiles"
@@ -284,9 +301,24 @@ class WorkloadIdentityProfile(Base):
     # cross trust roots, tenants or workloads.
     trust_root_id: Mapped[str] = mapped_column(String(36), index=True)
     # SHA-256 hex of the canonical JSON of the normalized claim set, used
-    # for exact whole-set duplicate detection within one trust root.
+    # for exact whole-set duplicate detection within one trust root. It is
+    # replaced atomically on every successful update.
     claims_fingerprint: Mapped[str] = mapped_column(String(64))
+    # One of WORKLOAD_IDENTITY_STATUS_*; active -> revoked exactly once.
+    status: Mapped[str] = mapped_column(
+        String(16), default=WORKLOAD_IDENTITY_STATUS_ACTIVE
+    )
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    # Set by every successful claim-set replacement; NULL for profiles that
+    # have never been updated.
+    updated_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
+    # Set exactly once, by the active -> revoked transition; a repeated
+    # revoke observes the stored value and never rewrites it.
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
 
 
 class WorkloadIdentityClaim(Base):
@@ -298,8 +330,10 @@ class WorkloadIdentityClaim(Base):
     equal to ``issuer``, ``subject`` and ``uri`` respectively. All three
     are required (an identity claim is rejected at the API boundary
     otherwise). Rows are written in the same transaction as their parent
-    profile and never updated or deleted by the service. Only the
-    non-sensitive comparison strings are stored.
+    profile; an update deletes the old set and inserts the replacement set
+    in the same transaction as the profile change, and a revoked profile
+    keeps its (last committed) rows. Only the non-sensitive comparison
+    strings are stored.
     """
 
     __tablename__ = "workload_identity_claims"
@@ -312,6 +346,11 @@ class WorkloadIdentityClaim(Base):
             "issuer",
             "subject",
             "uri",
+        ),
+        Index(
+            "ix_workload_identity_claims_profile_seq",
+            "profile_id",
+            "seq",
         ),
     )
 
@@ -330,6 +369,10 @@ class WorkloadIdentityClaim(Base):
     subject: Mapped[str] = mapped_column(String(1024))
     # SAN URI value the leaf must carry.
     uri: Mapped[str] = mapped_column(String(2048))
+    # Zero-based position within the profile's de-duplicated claim list,
+    # giving responses a stable first-seen order without an ORDER BY on the
+    # long comparison strings.
+    seq: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class Policy(Base):
