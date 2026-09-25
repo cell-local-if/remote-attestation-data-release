@@ -358,6 +358,48 @@ def test_query_unknown_query_parameter_returns_422(client, root_id):
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize("raw", [b"{}", b'{"unexpected": 1}', b"xyz", b"   "])
+def test_query_non_empty_body_returns_422(client, root_id, raw):
+    # The range is fixed entirely by query parameters; any body — even
+    # malformed JSON or whitespace — is a client error before any read.
+    response = client.request(
+        "GET",
+        "/v1/workload-identities",
+        params={
+            "tenant_id": TENANT,
+            "workload_id": WORKLOAD,
+            "trust_root_id": root_id,
+        },
+        content=raw,
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 422
+
+
+def test_query_empty_body_and_no_body_are_accepted(client, root_id):
+    no_body = client.get(
+        "/v1/workload-identities",
+        params={
+            "tenant_id": TENANT,
+            "workload_id": WORKLOAD,
+            "trust_root_id": root_id,
+        },
+    )
+    assert no_body.status_code == 200
+    empty_body = client.request(
+        "GET",
+        "/v1/workload-identities",
+        params={
+            "tenant_id": TENANT,
+            "workload_id": WORKLOAD,
+            "trust_root_id": root_id,
+        },
+        content=b"",
+        headers={"content-type": "application/json"},
+    )
+    assert empty_body.status_code == 200
+
+
 # --- update -----------------------------------------------------------------
 
 

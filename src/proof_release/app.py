@@ -12,7 +12,7 @@ import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import Response
 from pydantic import (
     BaseModel,
@@ -409,6 +409,20 @@ def _identity_json(payload) -> Response:
         + b"\n"
     )
     return Response(content=body, media_type="application/json")
+
+
+async def _require_empty_body(request: Request) -> None:
+    """Reject a read-only query carrying any request body (422).
+
+    The workload-identity query range is fixed entirely by query
+    parameters, so any body — present, non-empty or malformed JSON — is a
+    client error judged before storage is touched. The raw bytes are read
+    only to test emptiness and then discarded: never parsed, echoed,
+    persisted or logged.
+    """
+    body = await request.body()
+    if body:
+        raise HTTPException(status_code=422, detail="request body must be empty")
 
 
 def _leaf_identity_strings(
@@ -2087,7 +2101,7 @@ def create_app(
             content=body_bytes, status_code=201, media_type="application/json"
         )
 
-    @app.get("/v1/workload-identities")
+    @app.get("/v1/workload-identities", dependencies=[Depends(_require_empty_body)])
     def list_workload_identities(
         request: Request,
         tenant_id: str = Query(...),
