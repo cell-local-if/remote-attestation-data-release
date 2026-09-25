@@ -87,6 +87,7 @@ from proof_release.db import (
     RewrapBatch,
     RewrapBatchItem,
     RewrapJob,
+    RewrapJobIdempotencyRecord,
     TrustRoot,
     WorkloadIdentityClaim,
     WorkloadIdentityProfile,
@@ -130,6 +131,20 @@ CAPABILITY_BYTES = 32
 REWRAP_BATCH_DEFAULT_LIMIT = 50
 REWRAP_BATCH_MIN_LIMIT = 1
 REWRAP_BATCH_MAX_LIMIT = 200
+
+#: Name of the optional request header carrying an idempotency key on the
+#: asynchronous rewrap job submission. A missing header preserves the
+#: original "one job per request" semantics; a present key must be 1..64
+#: visible ASCII characters and may appear exactly once.
+IDEMPOTENCY_KEY_HEADER = "idempotency-key"
+IDEMPOTENCY_KEY_MIN_LENGTH = 1
+IDEMPOTENCY_KEY_MAX_LENGTH = 64
+#: Visible ASCII only: 0x21..0x7E. Spaces, tabs and other control
+#: characters are deliberately excluded, so whitespace can never pad a
+#: key into validity.
+_IDEMPOTENCY_KEY_RE = re.compile(
+    rf"^[\x21-\x7e]{{{IDEMPOTENCY_KEY_MIN_LENGTH},{IDEMPOTENCY_KEY_MAX_LENGTH}}}$"
+)
 
 #: Shared per-(tenant, workload) budget for the three one-time-grant
 #: entry points — grant consumption, grant revocation and payload release.
@@ -297,6 +312,77 @@ def _decode_cursor(
     if not isinstance(boundary, str):
         return None
     return boundary
+
+
+def _read_idempotency_key(request: Request) -> tuple[bool, str | None]:
+    """Extract the optional ``Idempotency-Key`` header for a job submit.
+
+    Returns ``(present, value)``. ``present`` is False when the header is
+    absent entirely (the original one-job-per-request semantics apply and
+    no validation runs). When present, the header must occur exactly once
+    and its value must be 1..64 visible ASCII characters; a duplicated
+    header line, an empty value, surrounding whitespace, a non-ASCII or
+    control character, or an over-long value raises an indistinguishable
+    422 before any state is read or written.
+    """
+    raw_values = request.headers.getlist(IDEMPOTENCY_KEY_HEADER)
+    if not raw_values:
+        return False, None
+    if len(raw_values) != 1 or not _IDEMPOTENCY_KEY_RE.fullmatch(raw_values[0]):
+        raise HTTPException(status_code=422, detail="invalid idempotency key")
+    return True, raw_values[0]
+
+
+def _rewrap_job_request_fingerprint(
+    tenant_id: str, workload_id: str, limit: int, start_cursor: str
+) -> str:
+    """Hash the request shape that must match for a keyed replay.
+
+    Covers the scope, the effective page size and the normalized cursor
+    start (an omitted cursor and an explicit empty cursor both normalize
+    to ``""``; any other start is the verified token verbatim). Only this
+    non-sensitive shape is hashed — no payload, capability, key or
+    certificate material participates. Canonical JSON with sorted keys
+    makes equivalent requests hash identically.
+    """
+    payload = json.dumps(
+        {
+            "tenant_id": tenant_id,
+            "workload_id": workload_id,
+            "limit": limit,
+            "cursor": start_cursor,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _rewrap_job_acceptance_body(
+    job_id: str, limit: int, start_cursor: str, now: datetime
+) -> str:
+    """Render the exact compact 202 acceptance body, newline included.
+
+    This is the wire form stored verbatim by the first idempotency-keyed
+    submission and returned byte-for-byte on every later replay, so its
+    formatting must never depend on mutable state.
+    """
+    return (
+        json.dumps(
+            {
+                "job_id": job_id,
+                "status": REWRAP_JOB_STATUS_QUEUED,
+                "limit": limit,
+                "cursor": start_cursor,
+                "created_at": _rfc3339(now),
+                "updated_at": _rfc3339(now),
+            },
+            separators=(",", ":"),
+            allow_nan=False,
+            ensure_ascii=False,
+        )
+        + "\n"
+    )
 
 
 def _parse_utc_rfc3339(value: str) -> datetime:
@@ -6061,10 +6147,13 @@ def create_app(
     # -- persistent asynchronous rewrap jobs ------------------------------
 
     @app.post("/v1/rewrap-jobs", status_code=202)
-    def create_rewrap_job(body: CreateRewrapJobRequest) -> Response:
+    def create_rewrap_job(request: Request, body: CreateRewrapJobRequest) -> Response:
         # Authenticate the cursor against this exact scope before touching
         # the keyring or storage: a forged, tampered or cross-scope cursor
         # is a client error indistinguishable from any other bad field.
+        # Body field/limit validation already happened (422) before this
+        # handler ran, so it can never be masked by the idempotency-key
+        # checks below.
         start_boundary = (
             _decode_cursor(body.cursor, body.tenant_id, body.workload_id)
             if body.cursor
@@ -6073,60 +6162,215 @@ def create_app(
         if start_boundary is None:
             raise HTTPException(status_code=422, detail="invalid cursor")
 
-        # A wholly unusable keyring is a server configuration failure: no
-        # job row may exist as evidence of the call and no envelope moves.
-        try:
-            load_keyring()
-        except MasterKeyError as exc:
-            logger.error("master key configuration unavailable: %s", exc)
-            raise HTTPException(status_code=500, detail="encryption unavailable")
-
-        job_id = str(uuid.uuid4())
-        now = _utcnow()
         # The echo/wire cursor: beginning-of-scope normalizes to the empty
-        # string; any other value is the verified token verbatim.
+        # string; any other value is the verified token verbatim. An
+        # omitted cursor and an explicit empty cursor therefore normalize
+        # to the same start in both the job row and the fingerprint.
         start_cursor = body.cursor or ""
-        try:
-            with session_factory() as session:
-                session.add(
-                    RewrapJob(
-                        job_id=job_id,
-                        tenant_id=body.tenant_id,
-                        workload_id=body.workload_id,
-                        limit=body.limit,
-                        cursor=start_cursor,
-                        next_cursor=start_cursor,
-                        status=REWRAP_JOB_STATUS_QUEUED,
-                        processed=0,
-                        rewrapped=0,
-                        skipped=0,
-                        failed=0,
-                        complete=False,
-                        claim_token=None,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
-                session.commit()
-        except Exception:
-            logger.error("rewrap job write failed")
-            raise HTTPException(status_code=500, detail="rewrap job unavailable")
 
-        # Durable acceptance first, background advancement second: even if
-        # this process dies before a worker picks it up, the queued row is
-        # resumed by the next process's startup sweep.
+        # The idempotency key is optional and lives only in a header; the
+        # body contract is unchanged. A missing key preserves the original
+        # one-job-per-request semantics exactly. An illegal key (duplicated
+        # header, empty, non-visible-ASCII or longer than 64 characters) is
+        # rejected here, after the body/cursor checks and before any write,
+        # audit or envelope advancement.
+        idem_present, idempotency_key = _read_idempotency_key(request)
+
+        if not idem_present:
+            # A wholly unusable keyring is a server configuration failure:
+            # no job row may exist as evidence of the call and no envelope
+            # moves.
+            try:
+                load_keyring()
+            except MasterKeyError as exc:
+                logger.error("master key configuration unavailable: %s", exc)
+                raise HTTPException(status_code=500, detail="encryption unavailable")
+
+            job_id = str(uuid.uuid4())
+            now = _utcnow()
+            try:
+                with session_factory() as session:
+                    session.add(
+                        RewrapJob(
+                            job_id=job_id,
+                            tenant_id=body.tenant_id,
+                            workload_id=body.workload_id,
+                            limit=body.limit,
+                            cursor=start_cursor,
+                            next_cursor=start_cursor,
+                            status=REWRAP_JOB_STATUS_QUEUED,
+                            processed=0,
+                            rewrapped=0,
+                            skipped=0,
+                            failed=0,
+                            complete=False,
+                            claim_token=None,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+                    session.commit()
+            except Exception:
+                logger.error("rewrap job write failed")
+                raise HTTPException(status_code=500, detail="rewrap job unavailable")
+
+            # Durable acceptance first, background advancement second: even
+            # if this process dies before a worker picks it up, the queued
+            # row is resumed by the next process's startup sweep.
+            app.state.rewrap_job_runner.submit(job_id)
+
+            return _compact_json_line(
+                {
+                    "job_id": job_id,
+                    "status": REWRAP_JOB_STATUS_QUEUED,
+                    "limit": body.limit,
+                    "cursor": start_cursor,
+                    "created_at": _rfc3339(now),
+                    "updated_at": _rfc3339(now),
+                },
+                status_code=202,
+            )
+
+        fingerprint = _rewrap_job_request_fingerprint(
+            body.tenant_id, body.workload_id, body.limit, start_cursor
+        )
+
+        # Keyed submission. The idempotency record and the job row are one
+        # atomic commit: the lookup-then-insert runs in a single
+        # transaction, with the unique (scope, key) constraint plus the
+        # IntegrityError retry below settling concurrent identical
+        # submissions so at most one job is ever created per key.
+        job_id: str | None = None
+        acceptance_body: str | None = None
+        for _ in range(2):
+            with session_factory() as session:
+                try:
+                    existing = session.scalar(
+                        select(RewrapJobIdempotencyRecord).where(
+                            RewrapJobIdempotencyRecord.tenant_id
+                            == body.tenant_id,
+                            RewrapJobIdempotencyRecord.workload_id
+                            == body.workload_id,
+                            RewrapJobIdempotencyRecord.idempotency_key
+                            == idempotency_key,
+                        )
+                    )
+                    if existing is not None:
+                        # A replay never creates a job, never advances an
+                        # envelope and never re-checks the keyring: even if
+                        # the keyring later becomes unusable, the stored
+                        # 202 is returned verbatim. A same-key request with
+                        # a different scope-normalized shape is a stable
+                        # 409 that changes neither the original job nor its
+                        # saved response.
+                        if not hmac.compare_digest(
+                            existing.request_fingerprint, fingerprint
+                        ):
+                            raise HTTPException(
+                                status_code=409,
+                                detail="idempotency key reused with a different request",
+                            )
+                        return Response(
+                            content=existing.response_body.encode("utf-8"),
+                            status_code=202,
+                            media_type="application/json",
+                        )
+
+                    # First submission for this scope+key. A wholly
+                    # unusable keyring is a server failure; the check sits
+                    # inside the transaction so a failure rolls back (no
+                    # job, no idempotency record, no envelope moved).
+                    try:
+                        load_keyring()
+                    except MasterKeyError as exc:
+                        session.rollback()
+                        logger.error(
+                            "master key configuration unavailable: %s", exc
+                        )
+                        raise HTTPException(
+                            status_code=500, detail="encryption unavailable"
+                        )
+
+                    job_id = str(uuid.uuid4())
+                    now = _utcnow()
+                    acceptance_body = _rewrap_job_acceptance_body(
+                        job_id, body.limit, start_cursor, now
+                    )
+                    session.add(
+                        RewrapJob(
+                            job_id=job_id,
+                            tenant_id=body.tenant_id,
+                            workload_id=body.workload_id,
+                            limit=body.limit,
+                            cursor=start_cursor,
+                            next_cursor=start_cursor,
+                            status=REWRAP_JOB_STATUS_QUEUED,
+                            processed=0,
+                            rewrapped=0,
+                            skipped=0,
+                            failed=0,
+                            complete=False,
+                            claim_token=None,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+                    session.add(
+                        RewrapJobIdempotencyRecord(
+                            record_id=str(uuid.uuid4()),
+                            tenant_id=body.tenant_id,
+                            workload_id=body.workload_id,
+                            idempotency_key=idempotency_key,
+                            job_id=job_id,
+                            request_fingerprint=fingerprint,
+                            response_body=acceptance_body,
+                            created_at=now,
+                        )
+                    )
+                    try:
+                        # The job and its idempotency record commit
+                        # together: a crash can never leave a half job or a
+                        # record pointing at nothing.
+                        session.commit()
+                    except IntegrityError:
+                        # A concurrent request for the same scope+key
+                        # committed first. Reread its record and answer as
+                        # a replay (verbatim 202) or a conflict (409).
+                        session.rollback()
+                        continue
+                    except Exception:
+                        session.rollback()
+                        logger.error("rewrap job write failed")
+                        raise HTTPException(
+                            status_code=500, detail="rewrap job unavailable"
+                        )
+                    break
+                except HTTPException:
+                    raise
+                except Exception:
+                    # A storage failure during the lookup or insert is a
+                    # server failure: the context manager rolls the
+                    # transaction back, so neither a job row nor an
+                    # idempotency record is left behind and no envelope
+                    # moves.
+                    logger.error("rewrap job idempotent submission failed")
+                    raise HTTPException(
+                        status_code=500, detail="rewrap job unavailable"
+                    )
+        else:  # pragma: no cover - defensive: the reread always settles
+            logger.error("rewrap job idempotency race did not settle")
+            raise HTTPException(status_code=500, detail="rewrap job unavailable")
+        assert job_id is not None and acceptance_body is not None
+
+        # Durable acceptance first, background advancement second — exactly
+        # as on the keyless path. A replay never reaches this point, so a
+        # retry never re-enqueues or advances the job.
         app.state.rewrap_job_runner.submit(job_id)
 
-        return _compact_json_line(
-            {
-                "job_id": job_id,
-                "status": REWRAP_JOB_STATUS_QUEUED,
-                "limit": body.limit,
-                "cursor": start_cursor,
-                "created_at": _rfc3339(now),
-                "updated_at": _rfc3339(now),
-            },
+        return Response(
+            content=acceptance_body.encode("utf-8"),
             status_code=202,
+            media_type="application/json",
         )
 
     @app.get("/v1/rewrap-jobs")

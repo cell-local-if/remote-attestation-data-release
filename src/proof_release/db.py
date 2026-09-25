@@ -689,6 +689,56 @@ class RewrapJob(Base):
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
+class RewrapJobIdempotencyRecord(Base):
+    """The first accepted submission of an idempotency-keyed rewrap job.
+
+    At most one row exists per ``(tenant_id, workload_id,
+    idempotency_key)`` triple. The row is inserted in the same
+    transaction as the :class:`RewrapJob` it records, so a crash can
+    never leave a job without its idempotency record or vice versa; a
+    retried request finds the committed row and returns the stored
+    response verbatim without creating a second job or touching the
+    envelope cursor, regardless of the job's later lifecycle.
+
+    The stored fingerprint covers only non-sensitive request shape:
+    the scope, the effective page size and the normalized cursor start
+    (omitted and explicit-empty cursors normalize to the same start).
+    The stored response is the exact compact JSON body (including its
+    trailing newline) first returned to the caller. No payload,
+    capability, key or certificate material is ever stored here.
+    """
+
+    __tablename__ = "rewrap_job_idempotency_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "idempotency_key",
+            name="uq_rewrap_job_idempotency_scope_key",
+        ),
+    )
+
+    record_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # Caller-chosen key: 1..64 visible ASCII characters. Unique only
+    # within the (tenant, workload) scope; the same key in another scope
+    # is an independent row and never conflicts.
+    idempotency_key: Mapped[str] = mapped_column(String(64))
+    # Job recorded by the first legal submission; every later replay of
+    # this key answers with that same job's original acceptance.
+    job_id: Mapped[str] = mapped_column(String(36), index=True)
+    # Hex SHA-256 over the normalized request shape (scope, effective
+    # limit, normalized cursor start); used only to detect a same-key
+    # request with different content, which is a 409 that changes
+    # nothing.
+    request_fingerprint: Mapped[str] = mapped_column(String(64))
+    # The exact first 202 response body, stored verbatim (compact JSON
+    # plus its single trailing newline) and replayed byte-for-byte.
+    response_body: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class AuditEvent(Base):
     """Append-only, tenant-scoped compliance audit event.
 
