@@ -29,6 +29,7 @@ def build_certificate(
     ca,
     not_before=None,
     not_after=None,
+    extra_extensions=(),
 ):
     now = datetime.now(timezone.utc)
     builder = (
@@ -43,6 +44,8 @@ def build_certificate(
             x509.BasicConstraints(ca=ca, path_length=None), critical=True
         )
     )
+    for extension in extra_extensions:
+        builder = builder.add_extension(extension, critical=False)
     return builder.sign(issuer_key, hashes.SHA256())
 
 
@@ -63,11 +66,23 @@ def make_intermediate(root_cert, root_key, common_name="test-intermediate", **kw
     return key, cert
 
 
-def make_leaf(issuer_cert, issuer_key, common_name="test-leaf", **kwargs):
+def make_leaf(issuer_cert, issuer_key, common_name="test-leaf", *, uri=None, **kwargs):
     key = generate_key()
     kwargs.setdefault("ca", False)
+    extensions = []
+    if uri is not None:
+        extensions.append(
+            x509.SubjectAlternativeName(
+                [x509.UniformResourceIdentifier(uri)]
+            )
+        )
     cert = build_certificate(
-        common_name, key.public_key(), issuer_cert.subject, issuer_key, **kwargs
+        common_name,
+        key.public_key(),
+        issuer_cert.subject,
+        issuer_key,
+        extra_extensions=extensions,
+        **kwargs,
     )
     return key, cert
 

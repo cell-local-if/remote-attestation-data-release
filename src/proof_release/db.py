@@ -238,6 +238,100 @@ class CertificateRevocation(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
+class WorkloadIdentityProfile(Base):
+    """A workload identity profile anchored to one configured trust root.
+
+    A profile belongs to exactly one ``(tenant_id, workload_id,
+    trust_root_id)`` scope and carries an ordered set of identity claims.
+    During X.509 evidence verification a leaf certificate is admitted when
+    at least one of the trust root's profiles has at least one claim whose
+    parsed issuer, subject and URI all match the leaf; otherwise — when any
+    profile exists for the anchor — the evidence is rejected.
+
+    Two profiles under the same trust root may not carry the identical
+    claim *set*. The set identity is the SHA-256 of the canonical
+    (sorted, compact) JSON of the normalized claims; a unique constraint
+    over ``(trust_root_id, claims_fingerprint)`` is what makes concurrent
+    duplicate registrations settle as one insert plus stable 409s, and
+    distinct claim sets are always independent rows that never overwrite
+    each other.
+
+    Only non-sensitive comparison strings are stored — the RFC4514 text of
+    a certificate's issuer/subject distinguished names and SAN URI values —
+    plus identifiers, scope and a timestamp. No certificate material,
+    evidence, private keys or free-form secrets have a column here.
+    """
+
+    __tablename__ = "workload_identity_profiles"
+    __table_args__ = (
+        UniqueConstraint(
+            "trust_root_id",
+            "claims_fingerprint",
+            name="uq_workload_identity_profile_root_claimset",
+        ),
+        Index(
+            "ix_workload_identity_profiles_scope",
+            "tenant_id",
+            "workload_id",
+            "trust_root_id",
+        ),
+    )
+
+    profile_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # The configured trust root the profile is anchored to. Profiles never
+    # cross trust roots, tenants or workloads.
+    trust_root_id: Mapped[str] = mapped_column(String(36), index=True)
+    # SHA-256 hex of the canonical JSON of the normalized claim set, used
+    # for exact whole-set duplicate detection within one trust root.
+    claims_fingerprint: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class WorkloadIdentityClaim(Base):
+    """One identity claim within a workload identity profile.
+
+    A claim matches an X.509 leaf certificate when the certificate's
+    parsed issuer distinguished name, subject distinguished name and a
+    subjectAlternativeName URI are, as RFC4514/URI strings, byte-for-byte
+    equal to ``issuer``, ``subject`` and ``uri`` respectively. All three
+    are required (an identity claim is rejected at the API boundary
+    otherwise). Rows are written in the same transaction as their parent
+    profile and never updated or deleted by the service. Only the
+    non-sensitive comparison strings are stored.
+    """
+
+    __tablename__ = "workload_identity_claims"
+    __table_args__ = (
+        Index(
+            "ix_workload_identity_claims_lookup",
+            "tenant_id",
+            "workload_id",
+            "trust_root_id",
+            "issuer",
+            "subject",
+            "uri",
+        ),
+    )
+
+    claim_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    profile_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("workload_identity_profiles.profile_id"),
+        index=True,
+    )
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    trust_root_id: Mapped[str] = mapped_column(String(36), index=True)
+    # RFC4514 string of the leaf certificate issuer DN.
+    issuer: Mapped[str] = mapped_column(String(1024))
+    # RFC4514 string of the leaf certificate subject DN.
+    subject: Mapped[str] = mapped_column(String(1024))
+    # SAN URI value the leaf must carry.
+    uri: Mapped[str] = mapped_column(String(2048))
+
+
 class Policy(Base):
     """A versioned release policy scoped to a tenant and workload.
 

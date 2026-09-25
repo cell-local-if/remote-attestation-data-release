@@ -65,6 +65,8 @@ from proof_release.db import (
     RewrapBatch,
     RewrapBatchItem,
     TrustRoot,
+    WorkloadIdentityClaim,
+    WorkloadIdentityProfile,
 )
 from proof_release.envelopes import (
     MasterKeyError,
@@ -352,6 +354,58 @@ def _ordered_chain_certificates(evidence: str) -> list | None:
         except (ValueError, TypeError):
             return None
     return certificates
+
+
+def _canonical_claim_set(
+    claims: list[tuple[str, str, str]],
+) -> tuple[list[tuple[str, str, str]], str]:
+    """Normalize an identity claim set and fingerprint it as a set.
+
+    Claims are compared as an *unordered set*: duplicate claims collapse
+    and submission order is irrelevant, so registrations that name the
+    same claims in a different order or with repeats describe the same
+    profile. Returns the de-duplicated claims in first-seen order (for
+    storage/response) plus the SHA-256 hex of the canonical JSON of the
+    sorted set, which is the stable identity used for duplicate detection.
+    """
+    seen: set[tuple[str, str, str]] = set()
+    ordered: list[tuple[str, str, str]] = []
+    for claim in claims:
+        if claim not in seen:
+            seen.add(claim)
+            ordered.append(claim)
+    canonical = json.dumps(
+        [
+            {"issuer": issuer, "subject": subject, "uri": uri}
+            for issuer, subject, uri in sorted(ordered)
+        ],
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return ordered, hashlib.sha256(canonical).hexdigest()
+
+
+def _leaf_identity_strings(
+    certificate: x509.Certificate,
+) -> tuple[str, str, tuple[str, ...]]:
+    """Return a leaf certificate's parsed identity comparison strings.
+
+    The issuer and subject distinguished names are rendered as RFC4514
+    strings (the same text stored on registered claims), alongside every
+    URI subjectAlternativeName. Comparison is always on these parsed
+    strings, never on raw certificate bytes.
+    """
+    issuer = certificate.issuer.rfc4514_string()
+    subject = certificate.subject.rfc4514_string()
+    try:
+        san = certificate.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName
+        ).value
+    except x509.ExtensionNotFound:
+        uris: tuple[str, ...] = ()
+    else:
+        uris = tuple(san.get_values_for_type(x509.UniformResourceIdentifier))
+    return issuer, subject, uris
 
 
 def _grant_audit_cursor_payload(
@@ -760,6 +814,41 @@ class CreateRevocationRequest(BaseModel):
         _certificate_fingerprint_format
     )
     _effective_at_shape = field_validator("effective_at")(_utc_rfc3339_field)
+
+
+class IdentityClaimModel(BaseModel):
+    """One workload identity claim: the parsed issuer, subject and URI.
+
+    Every field is a required non-blank string; values are stored verbatim
+    as the non-sensitive comparison strings used against a leaf
+    certificate's RFC4514 issuer/subject DNs and SAN URI.
+    """
+
+    issuer: StrictStr = Field(min_length=1)
+    subject: StrictStr = Field(min_length=1)
+    uri: StrictStr = Field(min_length=1)
+
+    _non_blank = field_validator("issuer", "subject", "uri")(_require_non_blank)
+
+
+class RegisterWorkloadIdentityRequest(BaseModel):
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    # Canonical lowercase UUID of a trust root in exactly this scope.
+    trust_root_id: StrictStr = Field(min_length=1)
+    # At least one identity claim; an empty list is rejected. Each entry
+    # must carry all three non-blank string fields.
+    claims: list[IdentityClaimModel]
+
+    _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
+    _trust_root_shape = field_validator("trust_root_id")(_canonical_uuid)
+
+    @field_validator("claims")
+    @classmethod
+    def _claims_non_empty(cls, value: list[IdentityClaimModel]) -> list[IdentityClaimModel]:
+        if not value:
+            raise ValueError("claims must contain at least one identity claim")
+        return value
 
 
 class CreatePolicyRequest(BaseModel):
@@ -1362,6 +1451,13 @@ def create_app(
             # rolls back and the evidence stays received, so it can be
             # re-verified once the registry recovers.
             revoked = False
+            # Identity gating state, populated only for an X.509 chain
+            # that parses and anchors to a configured trust root. When set,
+            # the anchor's workload identity profiles are consulted after
+            # the verifier passes; left None when the chain cannot possibly
+            # verify (the verifier rejects on its own and no lookup runs).
+            identity_anchor_id: str | None = None
+            identity_leaf: x509.Certificate | None = None
             if evidence.evidence_format == X509_ATTESTED_NONCE_JSON:
                 chain_certificates = _ordered_chain_certificates(body.evidence)
                 if chain_certificates is not None:
@@ -1421,6 +1517,13 @@ def create_app(
                                 detail="revocation registry unavailable",
                             )
                         revoked = hit is not None
+                        # The chain parses and anchors to a configured
+                        # trust root: its identity profiles gate the
+                        # verifier's accept verdict. The leaf supplies the
+                        # parsed issuer, subject and SAN URI strings
+                        # compared against claims.
+                        identity_anchor_id = anchor.root_id
+                        identity_leaf = chain_certificates[0]
             if revoked:
                 accepted = False
             else:
@@ -1451,6 +1554,63 @@ def create_app(
                         type(exc).__name__,
                     )
                     raise HTTPException(status_code=500, detail="verification failed")
+
+            # Workload identity gate, X.509 only, consulted only after the
+            # chain, signature, validity and revocation checks have passed
+            # (the verifier accepted) and only when the chain anchors to a
+            # configured trust root. Every committed identity profile under
+            # that trust root is read here; verification observes only
+            # committed profiles — registration holds the same trust-root
+            # lock, so a profile that has not committed before this point
+            # can neither affect this settlement nor be applied later to a
+            # settled evidence.
+            #
+            # * No profile exists for the anchor: the verifier's verdict is
+            #   unchanged (backward compatible).
+            # * One or more profiles exist: the leaf's parsed issuer DN,
+            #   subject DN and a SAN URI must all equal, as parsed strings,
+            #   the corresponding fields of at least one claim of at least
+            #   one profile ("any claim of any profile hits"); otherwise the
+            #   evidence is rejected.
+            # A query failure is a 500 before any settlement write, so the
+            # evidence stays received and can be retried after recovery.
+            if accepted and identity_anchor_id is not None:
+                try:
+                    profile_claims = session.scalars(
+                        select(WorkloadIdentityClaim).where(
+                            WorkloadIdentityClaim.tenant_id == body.tenant_id,
+                            WorkloadIdentityClaim.workload_id == body.workload_id,
+                            WorkloadIdentityClaim.trust_root_id == identity_anchor_id,
+                        )
+                    ).all()
+                except Exception:
+                    session.rollback()
+                    logger.error(
+                        "workload identity profile query failed for evidence %s",
+                        evidence.evidence_id,
+                    )
+                    raise HTTPException(
+                        status_code=500,
+                        detail="workload identity registry unavailable",
+                    )
+                if profile_claims:
+                    leaf_issuer, leaf_subject, leaf_uris = _leaf_identity_strings(
+                        identity_leaf
+                    )
+                    matched_profile: bool = False
+                    for claim in profile_claims:
+                        if (
+                            claim.issuer == leaf_issuer
+                            and claim.subject == leaf_subject
+                            and claim.uri in leaf_uris
+                        ):
+                            matched_profile = True
+                            break
+                    if not matched_profile:
+                        # Profiles exist but none describe this leaf: the
+                        # only possible outcome is rejection.
+                        accepted = False
+
             # The persisted outcome is a fixed, service-defined result code
             # derived solely from the accept/reject verdict. Any free-form
             # text the plugin attached to its result is discarded here and
@@ -1676,6 +1836,141 @@ def create_app(
                 "trust_root_id": body.trust_root_id,
                 "certificate_fingerprint": body.certificate_fingerprint,
                 "effective_at": _rfc3339(effective_at),
+            },
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return Response(
+            content=body_bytes, status_code=201, media_type="application/json"
+        )
+
+    @app.post("/v1/workload-identities", status_code=201)
+    def register_workload_identity(body: RegisterWorkloadIdentityRequest) -> Response:
+        """Register a workload identity profile under a configured trust root.
+
+        Field and format validation is completed by the request model
+        before this handler runs (422 with no state written). The named
+        trust root must exist in exactly the request's tenant and
+        workload; an unknown or cross-scope root is an indistinguishable
+        404. Within one trust root an identical claim set is registered at
+        most once (409 on repeat); distinct claim sets are independent
+        profiles and never overwrite each other. The profile and its
+        claims are a single atomic write under the trust-root row lock, so
+        any failure leaves no half profile. The response carries only
+        identifiers, the scope, the non-sensitive comparison strings and
+        a timestamp — never certificate material or exception detail.
+        """
+        raw_claims = [
+            (claim.issuer, claim.subject, claim.uri) for claim in body.claims
+        ]
+        # Claims compare as a set: order and duplicate entries do not make
+        # a distinct profile.
+        claims, claims_fingerprint = _canonical_claim_set(raw_claims)
+        profile_id = str(uuid.uuid4())
+        now = _utcnow()
+        with session_factory() as session:
+            try:
+                # Lock the trust-root row for the full registration. X.509
+                # verification takes the same lock while reading the
+                # anchor's profiles, so a profile either commits before an
+                # evidence settles (and that verification may match it) or
+                # waits until after it settles (and never applies
+                # retroactively). SQLite ignores FOR UPDATE but already
+                # serializes all writers via BEGIN IMMEDIATE.
+                trust_root = session.scalar(
+                    select(TrustRoot)
+                    .where(
+                        TrustRoot.root_id == body.trust_root_id,
+                        TrustRoot.tenant_id == body.tenant_id,
+                        TrustRoot.workload_id == body.workload_id,
+                    )
+                    .with_for_update()
+                )
+                if trust_root is None:
+                    # Do not reveal whether an out-of-scope trust root exists.
+                    raise HTTPException(status_code=404, detail="trust root not found")
+                existing = session.scalar(
+                    select(WorkloadIdentityProfile.profile_id).where(
+                        WorkloadIdentityProfile.trust_root_id == body.trust_root_id,
+                        WorkloadIdentityProfile.claims_fingerprint
+                        == claims_fingerprint,
+                    )
+                )
+                if existing is not None:
+                    # An identical claim set already exists for this trust
+                    # root; distinct sets stay independent and are never
+                    # merged or overwritten.
+                    raise HTTPException(
+                        status_code=409,
+                        detail="workload identity profile already registered",
+                    )
+                session.add(
+                    WorkloadIdentityProfile(
+                        profile_id=profile_id,
+                        tenant_id=body.tenant_id,
+                        workload_id=body.workload_id,
+                        trust_root_id=body.trust_root_id,
+                        claims_fingerprint=claims_fingerprint,
+                        created_at=now,
+                    )
+                )
+                for issuer, subject, uri in claims:
+                    session.add(
+                        WorkloadIdentityClaim(
+                            claim_id=str(uuid.uuid4()),
+                            profile_id=profile_id,
+                            tenant_id=body.tenant_id,
+                            workload_id=body.workload_id,
+                            trust_root_id=body.trust_root_id,
+                            issuer=issuer,
+                            subject=subject,
+                            uri=uri,
+                        )
+                    )
+                try:
+                    session.commit()
+                except IntegrityError:
+                    # A concurrent request registered the identical claim
+                    # set first; the unique constraint guarantees at most
+                    # one profile per set and the loser reports 409.
+                    session.rollback()
+                    raise HTTPException(
+                        status_code=409,
+                        detail="workload identity profile already registered",
+                    )
+                except Exception:
+                    # Any other commit/write failure rolls the whole
+                    # (profile + claims) transaction back, so no half
+                    # profile survives.
+                    session.rollback()
+                    logger.error("workload identity profile write failed")
+                    raise HTTPException(
+                        status_code=500,
+                        detail="workload identity registration failed",
+                    )
+            except HTTPException:
+                # 404/409 judgements and the controlled 500 above keep
+                # their status; a read-only judgement has written nothing.
+                raise
+            except Exception:
+                # A failure during the locked lookups is likewise a full
+                # rollback and a sanitized 500: no claim row can exist.
+                session.rollback()
+                logger.error("workload identity registration failed")
+                raise HTTPException(
+                    status_code=500, detail="workload identity registration failed"
+                )
+        body_bytes = json.dumps(
+            {
+                "profile_id": profile_id,
+                "tenant_id": body.tenant_id,
+                "workload_id": body.workload_id,
+                "trust_root_id": body.trust_root_id,
+                "claims": [
+                    {"issuer": issuer, "subject": subject, "uri": uri}
+                    for issuer, subject, uri in claims
+                ],
+                "created_at": _rfc3339(now),
             },
             separators=(",", ":"),
             allow_nan=False,
