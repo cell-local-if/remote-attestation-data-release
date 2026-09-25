@@ -54,6 +54,7 @@ from proof_release.db import (
     REWRAP_RESULT_REWRAP_FAILED,
     REWRAP_RESULT_REWRAPPED,
     REWRAP_RESULT_SKIPPED,
+    REWRAP_JOB_STATUS_CANCELLED,
     REWRAP_JOB_STATUS_FAILED,
     REWRAP_JOB_STATUS_QUEUED,
     REWRAP_JOB_STATUS_RUNNING,
@@ -1604,6 +1605,22 @@ class CreateRewrapJobRequest(BaseModel):
         return value
 
 
+class CancelRewrapJobRequest(BaseModel):
+    """Scope naming the asynchronous rewrap job to cancel.
+
+    The body carries only the two non-blank scope strings; a missing,
+    blank, wrong-typed or unknown field is rejected as a client error
+    before the job row is ever read.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+
+    _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
+
+
 def _migrate_additive(engine) -> None:
     """Apply forward-only additive column additions to pre-existing databases."""
     if engine.dialect.name != "sqlite":
@@ -1628,6 +1645,9 @@ def _migrate_additive(engine) -> None:
         ),
         "workload_identity_claims": (
             ("seq", "INTEGER"),
+        ),
+        "rewrap_jobs": (
+            ("cancelled_at", "DATETIME"),
         ),
     }
     with engine.begin() as conn:
@@ -1874,7 +1894,8 @@ def create_app(
         #: job is parked, not dead: its cursor sits before the failing
         #: envelope, and a restart re-attempts it from there. Only a
         #: restart makes that retry — a live runner never does — so the
-        #: job remains recoverable until its scope is fully scanned.
+        #: job remains recoverable until its scope is fully scanned. A
+        #: ``cancelled`` job is terminal and is never re-queued.
         _RECOVERABLE_STATUSES = (
             REWRAP_JOB_STATUS_QUEUED,
             REWRAP_JOB_STATUS_RUNNING,
@@ -2014,7 +2035,9 @@ def create_app(
                     if terminal is not None:
                         # succeeded or failed: the terminal transition was
                         # committed inside _advance_page and the claim
-                        # cleared there.
+                        # cleared there. A claim loss (e.g. an explicit
+                        # cancellation settling the job) likewise leaves
+                        # nothing for this runner to do.
                         return
                     if self._shutdown.is_set():
                         # Stop between pages at a fully committed boundary.
@@ -2026,16 +2049,19 @@ def create_app(
             finally:
                 self._claim_tokens.pop(job_id, None)
 
-        def _advance_page(self, job_id: str) -> str | None:
+        def _advance_page(self, job_id: str):
             """Process up to ``limit`` envelopes from the current cursor.
 
             Returns the terminal status when the job settles
-            (``succeeded``/``failed``), or ``None`` when a full page was
-            handled and the runner should page again.
+            (``succeeded``/``failed``), the ``_CLAIM_LOST`` sentinel when
+            this runner no longer owns the job (e.g. an explicit cancel
+            settled it to ``cancelled`` and cleared the claim), or
+            ``None`` when a full page was handled and the runner should
+            page again.
             """
             with self._session_factory() as session:
                 if not self._owns(session, job_id):
-                    return None
+                    return RewrapJobRunner._CLAIM_LOST
                 job = session.get(RewrapJob, job_id)
                 if job is None or job.status not in (
                     REWRAP_JOB_STATUS_QUEUED,
@@ -2054,7 +2080,8 @@ def create_app(
                     # A stored cursor must always verify; if it does not
                     # the row is corrupt and the job cannot safely move.
                     logger.error("rewrap job %s has an unverifiable cursor", job_id)
-                    self._settle_failed(session, job, job.next_cursor)
+                    if not self._settle_failed(session, job, job.next_cursor):
+                        return RewrapJobRunner._CLAIM_LOST
                     return REWRAP_JOB_STATUS_FAILED
                 try:
                     rows = list(
@@ -2097,16 +2124,15 @@ def create_app(
                         return None
                     continue
                 if processed is RewrapJobRunner._CLAIM_LOST:
-                    # Another runner owns or settled the job; stop without
-                    # touching it.
-                    return None
+                    # Another runner owns the job, or a cancellation
+                    # settled it; stop without touching it.
+                    return RewrapJobRunner._CLAIM_LOST
                 # This runner settled the job as failed.
                 return REWRAP_JOB_STATUS_FAILED
             # Whole page reached without a failure.
             with self._session_factory() as session:
                 if not self._owns(session, job_id):
-                    return None
-                job = session.get(RewrapJob, job_id)
+                    return RewrapJobRunner._CLAIM_LOST
                 now = _utcnow()
                 if not has_more:
                     # The limit+1 probe found nothing beyond this page, so
@@ -2127,14 +2153,29 @@ def create_app(
                         .execution_options(synchronize_session=False)
                     ).rowcount
                     if settled != 1:
+                        # A cancellation committed first; it is the
+                        # terminal state and the job never settles twice.
                         session.rollback()
-                        raise RuntimeError(
-                            "rewrap job success settlement did not settle"
-                        )
+                        return RewrapJobRunner._CLAIM_LOST
                     session.commit()
                     return REWRAP_JOB_STATUS_SUCCEEDED
-                # Full page and more may follow: just bump updated_at.
-                job.updated_at = now
+                # Full page and more may follow: just bump updated_at,
+                # guarded so a cancellation committed since the page
+                # started is never rewritten by a stale runner.
+                token = self._claim_tokens.get(job_id)
+                bumped = session.execute(
+                    update(RewrapJob)
+                    .where(
+                        RewrapJob.job_id == job_id,
+                        RewrapJob.status == REWRAP_JOB_STATUS_RUNNING,
+                        RewrapJob.claim_token == token,
+                    )
+                    .values(updated_at=now)
+                    .execution_options(synchronize_session=False)
+                ).rowcount
+                if bumped != 1:
+                    session.rollback()
+                    return RewrapJobRunner._CLAIM_LOST
                 session.commit()
             return None
 
@@ -2164,7 +2205,8 @@ def create_app(
                     keyring = load_keyring()
                 except MasterKeyError:
                     logger.error("master keyring unavailable during rewrap job")
-                    self._settle_failed(session, job, job.next_cursor)
+                    if not self._settle_failed(session, job, job.next_cursor):
+                        return RewrapJobRunner._CLAIM_LOST
                     return REWRAP_RESULT_KEYRING
 
                 current_version = keyring.current_version
@@ -2185,11 +2227,13 @@ def create_app(
                             "master key version %s unavailable during rewrap job",
                             stored_version,
                         )
-                        self._settle_failed(session, job, job.next_cursor)
+                        if not self._settle_failed(session, job, job.next_cursor):
+                            return RewrapJobRunner._CLAIM_LOST
                         return REWRAP_RESULT_MISSING_KEY
                     except Exception:
                         logger.error("rewrap job single-envelope rewrap failed")
-                        self._settle_failed(session, job, job.next_cursor)
+                        if not self._settle_failed(session, job, job.next_cursor):
+                            return RewrapJobRunner._CLAIM_LOST
                         return REWRAP_RESULT_REWRAP_FAILED
 
                     # Guarded update, mirroring the batch and
@@ -2228,7 +2272,8 @@ def create_app(
                             job = session.get(RewrapJob, job_id)
                         else:
                             job = session.get(RewrapJob, job_id)
-                            self._settle_failed(session, job, job.next_cursor)
+                            if not self._settle_failed(session, job, job.next_cursor):
+                                return RewrapJobRunner._CLAIM_LOST
                             return REWRAP_RESULT_REWRAP_FAILED
                     else:
                         result = REWRAP_RESULT_REWRAPPED
@@ -2236,7 +2281,14 @@ def create_app(
 
                 # Independent per-envelope commit: the material change,
                 # the existing rewrap audit event and the job's progress
-                # land together and durably before the next envelope.
+                # land together and durably before the next envelope. The
+                # progress write is guarded on this runner still owning a
+                # running job: a cancellation committed in the meantime
+                # (status cancelled, claim cleared) makes the guard match
+                # zero rows, and the whole envelope transaction — material
+                # change, audit row and progress — rolls back, leaving the
+                # envelope, its wrapping material and the audit trail
+                # exactly as they were.
                 item_occurred_at = _utcnow()
                 event_status = (
                     AUDIT_EVENT_STATUS_REWRAPPED
@@ -2257,18 +2309,40 @@ def create_app(
                         occurred_at=item_occurred_at,
                     )
                 )
-                job = session.get(RewrapJob, job_id)
-                job.processed += 1
-                if result == REWRAP_RESULT_REWRAPPED:
-                    job.rewrapped += 1
-                else:
-                    job.skipped += 1
-                job.next_cursor = (
-                    _encode_cursor(tenant_id, workload_id, data_id)
-                    if data_id
-                    else ""
-                )
-                job.updated_at = item_occurred_at
+                token = self._claim_tokens.get(job_id)
+                progressed = session.execute(
+                    update(RewrapJob)
+                    .where(
+                        RewrapJob.job_id == job_id,
+                        RewrapJob.status == REWRAP_JOB_STATUS_RUNNING,
+                        RewrapJob.claim_token == token,
+                    )
+                    .values(
+                        processed=RewrapJob.processed + 1,
+                        rewrapped=(
+                            RewrapJob.rewrapped + 1
+                            if result == REWRAP_RESULT_REWRAPPED
+                            else RewrapJob.rewrapped
+                        ),
+                        skipped=(
+                            RewrapJob.skipped + 1
+                            if result != REWRAP_RESULT_REWRAPPED
+                            else RewrapJob.skipped
+                        ),
+                        next_cursor=(
+                            _encode_cursor(tenant_id, workload_id, data_id)
+                            if data_id
+                            else ""
+                        ),
+                        updated_at=item_occurred_at,
+                    )
+                    .execution_options(synchronize_session=False)
+                ).rowcount
+                if progressed != 1:
+                    # A cancellation (or claim loss) won the race: the
+                    # not-yet-committed envelope operation is discarded.
+                    session.rollback()
+                    return RewrapJobRunner._CLAIM_LOST
                 try:
                     session.commit()
                 except Exception:
@@ -2277,13 +2351,19 @@ def create_app(
                     raise
                 return None
 
-        def _settle_failed(self, session, job, resume_cursor: str) -> None:
+        def _settle_failed(self, session, job, resume_cursor: str) -> bool:
             """Move a running job to ``failed`` and park the resume cursor.
 
             The failed envelope itself is never modified and its failure
             is not counted as processed: ``failed`` increases by one and
             ``next_cursor`` stays immediately before it, so recovery
             re-attempts exactly that envelope first.
+
+            Returns ``True`` when this call settled the job. A
+            cancellation committed in the meantime wins instead: the
+            guarded UPDATE matches nothing, the uncommitted envelope
+            attempt rolls back with it, and the job keeps its single
+            terminal state — a job is never both cancelled and failed.
             """
             now = _utcnow()
             settled = session.execute(
@@ -2304,8 +2384,16 @@ def create_app(
             ).rowcount
             if settled != 1:
                 session.rollback()
+                status = session.scalar(
+                    select(RewrapJob.status).where(RewrapJob.job_id == job.job_id)
+                )
+                if status != REWRAP_JOB_STATUS_RUNNING:
+                    # A cancellation settled the job first; its terminal
+                    # state must not be rewritten.
+                    return False
                 raise RuntimeError("rewrap job failure settlement did not settle")
             session.commit()
+            return True
 
     # Per-app runner state is allocated when the app is built, but the
     # background threads start only with the application lifespan (and a
@@ -6631,6 +6719,96 @@ def create_app(
             raise HTTPException(status_code=500, detail="rewrap job unavailable")
 
         return _compact_json_line(payload)
+
+    @app.post("/v1/rewrap-jobs//cancel")
+    def rewrap_job_cancel_identifier_required() -> Response:
+        # An empty path segment is a missing job identifier: a 422 client
+        # error rather than a routing-level 404.
+        raise HTTPException(status_code=422, detail="invalid job identifier")
+
+    @app.post("/v1/rewrap-jobs/{job_id}/cancel")
+    def cancel_rewrap_job(job_id: str, body: CancelRewrapJobRequest) -> Response:
+        """Cancel a queued or running rewrap job, exactly once.
+
+        A queued job settles to ``cancelled`` atomically and is never
+        started; a running job settles the same way and its live runner
+        stops at the next envelope boundary — an envelope already
+        committed keeps its material change and audit row, while an
+        envelope attempt that has not committed is discarded wholesale.
+        Succeeded, failed and already-cancelled jobs are a stable 409
+        that rewrites neither the state, the progress, nor any timestamp.
+        The cancel marker (``cancelled_at``) and the terminal status are
+        written by one guarded UPDATE in one transaction, so a crash
+        either keeps the prior state or the cancelled one — never both —
+        and the startup recovery sweep never re-queues a cancelled job.
+        """
+        # The path identifier must be a syntactically valid job id; the
+        # body contract (two required non-blank scope strings, no unknown
+        # fields) already validated as 422s before this handler ran, so a
+        # bad request never reads the job.
+        if not job_id.strip() or not _UUID_RE.fullmatch(job_id.lower()):
+            raise HTTPException(status_code=422, detail="invalid job identifier")
+        job_id = job_id.strip().lower()
+
+        now = _utcnow()
+        try:
+            with session_factory() as session:
+                job = session.get(RewrapJob, job_id)
+                if (
+                    job is None
+                    or job.tenant_id != body.tenant_id
+                    or job.workload_id != body.workload_id
+                ):
+                    # Unknown and cross-scope jobs are indistinguishable.
+                    raise HTTPException(status_code=404, detail="rewrap job not found")
+                # The cancel marker and the terminal status commit as one
+                # guarded UPDATE: only a job still queued or running can
+                # settle, the runner's claim is cleared so a live runner
+                # stops at the next envelope boundary, and a concurrent
+                # cancel that committed first makes this match nothing.
+                settled = session.execute(
+                    update(RewrapJob)
+                    .where(
+                        RewrapJob.job_id == job_id,
+                        RewrapJob.status.in_(
+                            (REWRAP_JOB_STATUS_QUEUED, REWRAP_JOB_STATUS_RUNNING)
+                        ),
+                    )
+                    .values(
+                        status=REWRAP_JOB_STATUS_CANCELLED,
+                        cancelled_at=now,
+                        claim_token=None,
+                        updated_at=now,
+                    )
+                    .execution_options(synchronize_session=False)
+                ).rowcount
+                if settled != 1:
+                    # succeeded/failed/cancelled already: a stable 409
+                    # that changes nothing.
+                    session.rollback()
+                    raise HTTPException(
+                        status_code=409, detail="rewrap job already settled"
+                    )
+                session.commit()
+        except HTTPException:
+            raise
+        except Exception:
+            # A write or commit failure rolls the transaction back in
+            # full: the job keeps its prior state and no marker is left.
+            logger.error("rewrap job cancel failed")
+            raise HTTPException(status_code=500, detail="rewrap job unavailable")
+
+        # Job identifier, fixed status and cancel time only, in string
+        # order; compact JSON with exactly one trailing newline. Every
+        # value is a string, so no float, -0.0 or non-finite value can
+        # appear.
+        return _compact_json_line(
+            {
+                "cancelled_at": _rfc3339(now),
+                "job_id": job_id,
+                "status": REWRAP_JOB_STATUS_CANCELLED,
+            }
+        )
 
     return app
 

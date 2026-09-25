@@ -77,19 +77,22 @@ REWRAP_RESULT_CODES = frozenset(
 #: Lifecycle statuses of a persistent asynchronous rewrap job. A job is
 #: born ``queued``; its background runner (or a post-restart recovery
 #: sweep) moves it to ``running`` exactly once, and it settles exactly
-#: once to ``succeeded`` (every envelope in scope was reached) or
+#: once to ``succeeded`` (every envelope in scope was reached), to
 #: ``failed`` (the keyring went bad, a historical key was missing, or a
-#: single envelope failed). A terminal status is never changed.
+#: single envelope failed), or to ``cancelled`` (an explicit cancel found
+#: it still queued or running). A terminal status is never changed.
 REWRAP_JOB_STATUS_QUEUED = "queued"
 REWRAP_JOB_STATUS_RUNNING = "running"
 REWRAP_JOB_STATUS_SUCCEEDED = "succeeded"
 REWRAP_JOB_STATUS_FAILED = "failed"
+REWRAP_JOB_STATUS_CANCELLED = "cancelled"
 REWRAP_JOB_STATUS_CODES = frozenset(
     {
         REWRAP_JOB_STATUS_QUEUED,
         REWRAP_JOB_STATUS_RUNNING,
         REWRAP_JOB_STATUS_SUCCEEDED,
         REWRAP_JOB_STATUS_FAILED,
+        REWRAP_JOB_STATUS_CANCELLED,
     }
 )
 
@@ -635,7 +638,10 @@ class RewrapJob(Base):
     ``queued`` and advanced in the background (and by a post-restart
     recovery sweep) until every envelope of its scope has been reached or
     the first per-envelope failure leaves it ``failed`` with its resume
-    cursor parked immediately before the failing envelope. Every page
+    cursor parked immediately before the failing envelope. A queued or
+    running job can instead settle to ``cancelled`` through an explicit
+    cancel, which is terminal like the other two outcomes: the recovery
+    sweep never re-queues a cancelled job. Every page
     commits envelopes independently, so a crash loses only the in-flight
     envelope attempt and the job resumes from its last committed cursor.
 
@@ -666,8 +672,10 @@ class RewrapJob(Base):
     # processed envelope; empty string at the beginning and at the end.
     # On failure it stays immediately before the failing envelope.
     next_cursor: Mapped[str] = mapped_column(String(256))
-    # One of REWRAP_JOB_STATUS_*; queued -> running -> succeeded|failed,
-    # each transition made at most once with a guarded UPDATE.
+    # One of REWRAP_JOB_STATUS_*; queued -> running ->
+    # succeeded|failed|cancelled, each transition made at most once with
+    # a guarded UPDATE. A queued or running job may also settle directly
+    # to cancelled via an explicit cancel.
     status: Mapped[str] = mapped_column(String(16), default="queued")
     # Cumulative counters across every page the job has advanced.
     processed: Mapped[int] = mapped_column(Integer, default=0)
@@ -687,6 +695,13 @@ class RewrapJob(Base):
     # Bumped on every status/progress commit; equal to created_at until
     # the background runner makes its first transition.
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    # Set exactly once, by the winning queued/running -> cancelled
+    # transition, in the same transaction as the status change and the
+    # claim release; NULL for jobs that were never cancelled. A repeated
+    # cancel observes the stored value and never rewrites it.
+    cancelled_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
 
 
 class RewrapJobIdempotencyRecord(Base):
