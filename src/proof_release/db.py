@@ -184,6 +184,51 @@ class TrustRoot(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
+class CertificateRevocation(Base):
+    """A certificate revocation registration scoped to one trust root.
+
+    A registration revokes, within exactly one tenant/workload scope, the
+    certificate whose DER SHA-256 equals ``fingerprint`` under the named
+    trust root. It becomes live at ``effective_at`` (a past timestamp is
+    immediately effective; a future one becomes effective only once that
+    instant passes) and survives restarts.
+
+    At most one registration may exist for a
+    ``(tenant_id, workload_id, trust_root_id, fingerprint)`` tuple; the
+    unique constraint is what makes concurrent registrations race-safe.
+    Distinct fingerprints under the same root are retained independently:
+    rows are never merged or overwritten. The row stores only identifiers,
+    the scope, the 32-byte fingerprint and timestamps — never certificate
+    material, evidence, or any secret.
+    """
+
+    __tablename__ = "certificate_revocations"
+    __table_args__ = (
+        # The unique constraint also creates the composite index that serves
+        # the verification lookup by (scope, root, fingerprint), which then
+        # filters on effective_at.
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "trust_root_id",
+            "fingerprint",
+            name="uq_cert_revocation_scope_root_fingerprint",
+        ),
+    )
+
+    revocation_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # The trust root this revocation is anchored to. Referential integrity
+    # (the root exists in exactly this scope) is enforced at the application
+    # layer, like the evidence/challenge linkage elsewhere.
+    trust_root_id: Mapped[str] = mapped_column(String(36), index=True)
+    # Raw 32-byte SHA-256 of the certificate's DER encoding.
+    fingerprint: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    effective_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class Policy(Base):
     """A versioned release policy scoped to a tenant and workload.
 
