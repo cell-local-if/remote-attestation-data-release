@@ -238,6 +238,59 @@ class CertificateRevocation(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
+class WorkloadIdentity(Base):
+    """A trust-root-scoped workload identity profile.
+
+    A profile constrains which leaf-certificate identities X.509 evidence
+    anchored to one trust root may present: it holds a set of identity
+    claims, each describing the leaf certificate's issuer, subject and/or
+    URI address as exact, non-sensitive comparison strings. During
+    verification a leaf must match at least one claim of at least one
+    profile registered under the anchor trust root; when no profile exists
+    the verification result is unchanged.
+
+    The same claim set is registered at most once per trust root — the
+    unique constraint on the canonical claims digest is what makes
+    concurrent duplicate registrations settle as exactly one insert plus
+    stable 409s — while distinct claim sets under the same root are
+    independent rows that never merge or overwrite. Only profile metadata
+    is stored: the scope, the trust root, the comparison strings and a
+    timestamp — never certificate material, evidence, or secrets.
+    """
+
+    __tablename__ = "workload_identities"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "trust_root_id",
+            "claims_digest",
+            name="uq_workload_identity_scope_root_claims",
+        ),
+        Index(
+            "ix_workload_identities_lookup",
+            "tenant_id",
+            "workload_id",
+            "trust_root_id",
+        ),
+    )
+
+    identity_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # The trust root the profile is anchored to. Profiles never cross
+    # trust roots, tenants or workloads.
+    trust_root_id: Mapped[str] = mapped_column(String(36), index=True)
+    # Canonical JSON (sorted claims, sorted keys) of the claim set. Each
+    # claim is an object with a non-empty subset of issuer/subject/uri,
+    # holding only the exact strings compared against the leaf certificate.
+    claims_json: Mapped[str] = mapped_column(Text)
+    # SHA-256 of the canonical claim-set serialization, used for exact
+    # set-equality duplicate detection within one trust root.
+    claims_digest: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class Policy(Base):
     """A versioned release policy scoped to a tenant and workload.
 
