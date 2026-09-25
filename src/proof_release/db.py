@@ -184,6 +184,60 @@ class TrustRoot(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
+class CertificateRevocation(Base):
+    """A trust-root-scoped revocation of one X.509 certificate.
+
+    A row revokes exactly one certificate, identified by the unpadded
+    base64url SHA-256 of its DER encoding, within exactly one trust root
+    (and therefore within that trust root's tenant and workload). The
+    revocation becomes effective at ``effective_at`` (UTC): a past instant
+    is effective immediately, a future one only once it arrives. Rows are
+    never updated or deleted by the service; distinct fingerprints under
+    the same trust root are always independent rows — never merged or
+    overwritten — while a repeat of an already-registered
+    (scope, trust root, fingerprint) tuple is rejected.
+
+    Only identifiers, the scope, the fingerprint and a timestamp are
+    stored: no certificate material, evidence, secrets, or free-form text.
+    """
+
+    __tablename__ = "certificate_revocations"
+    __table_args__ = (
+        # At most one registration per (scope, trust root, fingerprint).
+        # The constraint is what makes concurrent duplicate registrations
+        # settle as exactly one insert plus stable 409s.
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "trust_root_id",
+            "certificate_fingerprint",
+            name="uq_cert_revocation_scope_root_fingerprint",
+        ),
+        Index(
+            "ix_cert_revocations_lookup",
+            "tenant_id",
+            "workload_id",
+            "trust_root_id",
+            "certificate_fingerprint",
+            "effective_at",
+        ),
+    )
+
+    revocation_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # The trust root the revocation is anchored to. Revocations never cross
+    # trust roots, tenants or workloads.
+    trust_root_id: Mapped[str] = mapped_column(String(36), index=True)
+    # Unpadded base64url SHA-256 digest (exactly 32 raw bytes, 43 encoded
+    # characters) of the certificate's DER encoding, computed identically
+    # for the root, intermediate and leaf certificates of an evidence chain.
+    certificate_fingerprint: Mapped[str] = mapped_column(String(43))
+    # UTC instant at/after which the revocation rejects matching evidence.
+    effective_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class Policy(Base):
     """A versioned release policy scoped to a tenant and workload.
 
