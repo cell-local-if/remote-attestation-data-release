@@ -160,6 +160,43 @@ AUDIT_EVENT_STATUS_CODES = frozenset(
 )
 
 
+#: Finite, service-defined set of proof-lifecycle audit-event types. One
+#: event type exists per attestation stage traced by the proof timeline:
+#: ``proof-received`` when an evidence record is first accepted,
+#: ``proof-verified`` when its first verification settles, and
+#: ``proof-decision`` when its first policy decision is recorded.
+PROOF_EVENT_TYPE_RECEIVED = "proof-received"
+PROOF_EVENT_TYPE_VERIFIED = "proof-verified"
+PROOF_EVENT_TYPE_DECISION = "proof-decision"
+PROOF_EVENT_TYPE_CODES = frozenset(
+    {
+        PROOF_EVENT_TYPE_RECEIVED,
+        PROOF_EVENT_TYPE_VERIFIED,
+        PROOF_EVENT_TYPE_DECISION,
+    }
+)
+
+#: Finite, service-defined set of proof-lifecycle audit-event statuses.
+#: Received events are born ``received``; verification settles exactly
+#: once to ``verified`` or ``rejected``; a decision settles exactly once
+#: to ``allowed`` or ``denied``. Each value is a fixed code derived only
+#: from a committed transition, never from plugin-supplied text.
+PROOF_EVENT_STATUS_RECEIVED = "received"
+PROOF_EVENT_STATUS_VERIFIED = "verified"
+PROOF_EVENT_STATUS_REJECTED = "rejected"
+PROOF_EVENT_STATUS_ALLOWED = "allowed"
+PROOF_EVENT_STATUS_DENIED = "denied"
+PROOF_EVENT_STATUS_CODES = frozenset(
+    {
+        PROOF_EVENT_STATUS_RECEIVED,
+        PROOF_EVENT_STATUS_VERIFIED,
+        PROOF_EVENT_STATUS_REJECTED,
+        PROOF_EVENT_STATUS_ALLOWED,
+        PROOF_EVENT_STATUS_DENIED,
+    }
+)
+
+
 #: Finite, service-defined set of workload identity profile lifecycle
 #: statuses. A profile is born active and is revoked exactly once; revocation
 #: leaves the row in place (still queryable) but removes it from the X.509
@@ -879,6 +916,72 @@ class AuditEvent(Base):
         String(64), nullable=True
     )
     # Commit time of the recorded transition; the stable listing key.
+    occurred_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+
+
+class ProofLifecycleEvent(Base):
+    """Append-only, tenant-scoped proof-lifecycle audit event.
+
+    A row is inserted in the same committed transaction as the
+    attestation stage it records: evidence reception, the first
+    verification settlement, or the first policy decision. At most one
+    event therefore exists per ``(evidence_id, event_type)`` pair: a
+    failed request, a lost settlement race or any rollback leaves no
+    event, and a retry of an already-settled stage inserts nothing. The
+    table is never updated or deleted by the service.
+
+    Only identifiers, the fixed event type/status codes, the decided
+    policy version (for decisions), the associated evidence format (for
+    reception) and UTC timestamps are stored. Raw evidence, nonces,
+    claims, capabilities, payloads, keys and exception text never have a
+    column here: ``policy_version`` and ``evidence_format`` are fixed
+    non-sensitive descriptors, not material. Columns that do not apply to
+    an event type (``policy_version`` for non-decisions,
+    ``evidence_format`` for non-receptions) are stored as NULL.
+    """
+
+    __tablename__ = "proof_lifecycle_events"
+    __table_args__ = (
+        # At most one lifecycle event per evidence and stage; the
+        # constraint is what makes a losing concurrent settlement or a
+        # retry unable to create a duplicate record.
+        UniqueConstraint(
+            "evidence_id",
+            "event_type",
+            name="uq_proof_lifecycle_event_evidence_type",
+        ),
+        # Covers the scoped listing ordered by the (occurred_at, event_id)
+        # keyset, including its exclusive cursor predicate and the fixed
+        # snapshot high-water mark.
+        Index(
+            "ix_proof_lifecycle_events_scope_occurred",
+            "tenant_id",
+            "workload_id",
+            "occurred_at",
+            "event_id",
+        ),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256), index=True)
+    # One of PROOF_EVENT_TYPE_*; a fixed, service-defined code only.
+    event_type: Mapped[str] = mapped_column(String(16))
+    # The evidence whose lifecycle stage this event records; all three
+    # stages of one proof share this identifier.
+    evidence_id: Mapped[str] = mapped_column(String(36), index=True)
+    # Set for proof-decision events (the version decided against); NULL
+    # for reception and verification events.
+    policy_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Set for proof-received events, recording the associated evidence
+    # format; NULL for verification and decision events. Only the format
+    # descriptor is kept, never the evidence itself.
+    evidence_format: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+    # One of PROOF_EVENT_STATUS_*; a fixed, service-defined code only.
+    status: Mapped[str] = mapped_column(String(16))
+    # Commit time of the recorded stage; the stable listing key.
     occurred_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
 
 
