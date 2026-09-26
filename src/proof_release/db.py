@@ -99,6 +99,38 @@ REWRAP_JOB_STATUS_CODES = frozenset(
 )
 
 
+#: Finite, service-defined set of reasons recorded by a rewrap job
+#: lifecycle event. Every event is one committed status migration and its
+#: reason explains only *which* migration committed: ``submitted`` for the
+#: queued birth, ``executed`` for the queued/running -> running claim,
+#: ``recovered`` for a post-restart failed -> running retry, ``completed``
+#: for running -> succeeded, ``cancelled`` for queued/running ->
+#: cancelled, and the three failure classifications for running -> failed
+#: (a bad keyring, a missing historical key, or an envelope that could not
+#: be rewrapped). Exception text is never persisted: a failed migration is
+#: classified into exactly one of the fixed codes below.
+REWRAP_JOB_EVENT_REASON_SUBMITTED = "submitted"
+REWRAP_JOB_EVENT_REASON_EXECUTED = "executed"
+REWRAP_JOB_EVENT_REASON_RECOVERED = "recovered"
+REWRAP_JOB_EVENT_REASON_COMPLETED = "completed"
+REWRAP_JOB_EVENT_REASON_CANCELLED = "cancelled"
+REWRAP_JOB_EVENT_REASON_KEYRING = REWRAP_RESULT_KEYRING
+REWRAP_JOB_EVENT_REASON_MISSING_KEY = REWRAP_RESULT_MISSING_KEY
+REWRAP_JOB_EVENT_REASON_REWRAP_FAILED = REWRAP_RESULT_REWRAP_FAILED
+REWRAP_JOB_EVENT_REASON_CODES = frozenset(
+    {
+        REWRAP_JOB_EVENT_REASON_SUBMITTED,
+        REWRAP_JOB_EVENT_REASON_EXECUTED,
+        REWRAP_JOB_EVENT_REASON_RECOVERED,
+        REWRAP_JOB_EVENT_REASON_COMPLETED,
+        REWRAP_JOB_EVENT_REASON_CANCELLED,
+        REWRAP_JOB_EVENT_REASON_KEYRING,
+        REWRAP_JOB_EVENT_REASON_MISSING_KEY,
+        REWRAP_JOB_EVENT_REASON_REWRAP_FAILED,
+    }
+)
+
+
 #: Finite, service-defined set of compliance audit-event types. ``grant``
 #: events trace the one-time release-grant lifecycle; ``rewrap`` events
 #: trace per-envelope key rotation performed by rewrap batches.
@@ -700,6 +732,53 @@ class RewrapJob(Base):
     cancelled_at: Mapped[datetime | None] = mapped_column(
         UTCDateTime(), nullable=True
     )
+
+
+class RewrapJobEvent(Base):
+    """One immutable lifecycle event for an asynchronous rewrap job.
+
+    A row is inserted in the *same* committed transaction as the
+    committed status migration it records: the queued birth on
+    submission, the queued/running -> running claim, the post-restart
+    failed -> running recovery, the running -> succeeded completion, the
+    queued/running -> cancelled settlement, and the running -> failed
+    classification. Exactly one event therefore exists per migration that
+    ever committed; migrations that lost a guard race rolled back and left
+    no event. The table is never updated or deleted by the service, and
+    the per-job ``seq`` is a gap-free, stable ordering key allocated in
+    the migration transaction, so the recorded order is the order in
+    which migrations committed regardless of identical timestamps.
+
+    Only identifiers, the sequence number, the old/new status codes, the
+    fixed reason code and a UTC timestamp are stored — never exception
+    text, envelope material, payloads, cursor tokens or keys.
+    """
+
+    __tablename__ = "rewrap_job_events"
+    __table_args__ = (
+        # The gap-free per-job sequence, both for allocation and for the
+        # event listing ordered by seq.
+        Index("ix_rewrap_job_events_job_seq", "job_id", "seq", unique=True),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    job_id: Mapped[str] = mapped_column(String(36), index=True)
+    # Gap-free, immutable, per-job sequence number in committed-migration
+    # order: 1 for the submission event, increasing by exactly one per
+    # later committed migration. It is the stable listing key.
+    seq: Mapped[int] = mapped_column(Integer)
+    # Status the job moved away from; NULL only for the birth migration,
+    # whose old state is "no prior status".
+    old_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # One of REWRAP_JOB_STATUS_*: the status the migration committed.
+    new_status: Mapped[str] = mapped_column(String(16))
+    # One of REWRAP_JOB_EVENT_REASON_*; a fixed, service-defined code
+    # only. Exception text is never persisted in any column.
+    reason: Mapped[str] = mapped_column(String(16))
+    # Commit time of the recorded migration.
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
 class RewrapJobIdempotencyRecord(Base):
