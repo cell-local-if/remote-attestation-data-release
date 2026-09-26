@@ -60,6 +60,11 @@ from proof_release.db import (
     REWRAP_JOB_STATUS_SUCCEEDED,
     REWRAP_JOB_STATUS_CANCELLED,
     REWRAP_JOB_STATUS_CODES,
+    REWRAP_JOB_EVENT_REASON_CANCELLED,
+    REWRAP_JOB_EVENT_REASON_COMPLETED,
+    REWRAP_JOB_EVENT_REASON_EXECUTING,
+    REWRAP_JOB_EVENT_REASON_RESUMED,
+    REWRAP_JOB_EVENT_REASON_SUBMITTED,
     VERIFICATION_RESULT_ACCEPTED,
     VERIFICATION_RESULT_REJECTED,
     WORKLOAD_IDENTITY_STATUS_ACTIVE,
@@ -88,6 +93,7 @@ from proof_release.db import (
     RewrapBatch,
     RewrapBatchItem,
     RewrapJob,
+    RewrapJobEvent,
     RewrapJobIdempotencyRecord,
     TrustRoot,
     WorkloadIdentityClaim,
@@ -1119,6 +1125,165 @@ def _decode_rewrap_job_history_cursor(
     return boundary_job
 
 
+def _rewrap_job_events_cursor_payload(
+    tenant_id: str,
+    workload_id: str,
+    job_id: str,
+    boundary_seq: int,
+    snapshot_seq: int,
+) -> bytes:
+    """Canonical byte payload authenticated inside a job-events cursor.
+
+    The cursor marks an exclusive ``seq`` position within one job's
+    timeline plus the fixed snapshot high-water mark (the greatest
+    committed ``seq``) established by the range's first query, so a
+    cursor minted for one job, scope or snapshot cannot be replayed
+    against another. The kind tag distinguishes these cursors from every
+    other HMAC cursor family sharing the same secret.
+    """
+    return json.dumps(
+        {
+            "k": _REWRAP_JOB_EVENTS_CURSOR_KIND,
+            "t": tenant_id,
+            "w": workload_id,
+            "j": job_id,
+            "b": boundary_seq,
+            "s": snapshot_seq,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _encode_rewrap_job_events_cursor(
+    tenant_id: str,
+    workload_id: str,
+    job_id: str,
+    boundary_seq: int,
+    snapshot_seq: int,
+) -> str:
+    """Build an opaque, scope-, job- and snapshot-bound events cursor."""
+    payload = _rewrap_job_events_cursor_payload(
+        tenant_id, workload_id, job_id, boundary_seq, snapshot_seq
+    )
+    mac = hmac.new(_cursor_secret(), payload, hashlib.sha256).digest()
+    return b64url_encode(payload + mac)
+
+
+def _decode_rewrap_job_events_cursor(
+    token: str,
+    tenant_id: str,
+    workload_id: str,
+    job_id: str,
+) -> tuple[int, int] | None:
+    """Validate a job-events cursor and return its boundary and snapshot.
+
+    Returns ``(boundary_seq, snapshot_seq)`` on success or ``None`` for a
+    malformed/forged token, a cursor of another kind (rewrap batch, grant
+    audit, compliance audit events, revocations or job history), or one
+    minted for any other scope, job or snapshot. The beginning marker
+    (``""``) never reaches this function: it is handled by the caller.
+    Validation is pure HMAC over the embedded payload — no state is read.
+    """
+    if not _CURSOR_RE.fullmatch(token):
+        return None
+    try:
+        raw = b64url_decode(token)
+    except ValueError:
+        return None
+    # The MAC is a fixed 32-byte suffix; the JSON payload precedes it.
+    if len(raw) <= 32:
+        return None
+    payload, mac = raw[:-32], raw[-32:]
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    if decoded.get("k") != _REWRAP_JOB_EVENTS_CURSOR_KIND:
+        return None
+    boundary_seq = decoded.get("b")
+    snapshot_seq = decoded.get("s")
+    # Both positions are non-negative integers (bool is excluded: it is
+    # an int subclass but never a valid sequence number on the wire).
+    if (
+        not isinstance(boundary_seq, int)
+        or isinstance(boundary_seq, bool)
+        or boundary_seq < 0
+    ):
+        return None
+    if (
+        not isinstance(snapshot_seq, int)
+        or isinstance(snapshot_seq, bool)
+        or snapshot_seq < boundary_seq
+    ):
+        return None
+    expected_mac = hmac.new(
+        _cursor_secret(),
+        _rewrap_job_events_cursor_payload(
+            tenant_id, workload_id, job_id, boundary_seq, snapshot_seq
+        ),
+        hashlib.sha256,
+    ).digest()
+    if not hmac.compare_digest(mac, expected_mac):
+        return None
+    # Defense in depth: the MAC already covers every field, but confirm
+    # the scope and the job explicitly.
+    if not hmac.compare_digest(str(decoded.get("t", "")), tenant_id):
+        return None
+    if not hmac.compare_digest(str(decoded.get("w", "")), workload_id):
+        return None
+    if not hmac.compare_digest(str(decoded.get("j", "")), job_id):
+        return None
+    return boundary_seq, snapshot_seq
+
+
+def _next_rewrap_job_event_seq(session, job_id: str) -> int:
+    """Allocate the next immutable event sequence number for ``job_id``.
+
+    Called only inside the transaction that commits the corresponding
+    status transition, so concurrent transitions of the same job
+    serialize (every write transaction begins as BEGIN IMMEDIATE on
+    SQLite and the guarded status UPDATEs are mutually exclusive
+    everywhere); the ``(job_id, seq)`` unique constraint is the backstop.
+    """
+    current = session.scalar(
+        select(func.max(RewrapJobEvent.seq)).where(RewrapJobEvent.job_id == job_id)
+    )
+    return 0 if current is None else current + 1
+
+
+def _append_rewrap_job_event(
+    session,
+    job,
+    *,
+    old_status: str | None,
+    new_status: str,
+    reason: str,
+    occurred_at: datetime,
+) -> None:
+    """Stage the timeline event of a winning status transition.
+
+    The event row joins the same uncommitted transaction as the guarded
+    status UPDATE it records, so the two commit — or roll back —
+    together: a transition that loses its race leaves no event behind.
+    """
+    session.add(
+        RewrapJobEvent(
+            event_id=str(uuid.uuid4()),
+            job_id=job.job_id,
+            tenant_id=job.tenant_id,
+            workload_id=job.workload_id,
+            seq=_next_rewrap_job_event_seq(session, job.job_id),
+            old_status=old_status,
+            new_status=new_status,
+            reason=reason,
+            occurred_at=occurred_at,
+        )
+    )
+
+
 #: Fixed page size for the read-only compliance audit-event listing. As
 #: with the grant audit, the page size is an internal constant and never
 #: part of the request or response contract.
@@ -1150,6 +1315,17 @@ REWRAP_JOB_HISTORY_PAGE_SIZE = 100
 #: and a revocation-registry cursor (all authenticated with the same
 #: secret) can never be replayed against the job history, and vice versa.
 _REWRAP_JOB_HISTORY_CURSOR_KIND = "rewrap-job-history-v1"
+
+#: Fixed page size for the read-only rewrap job event timeline. Like the
+#: other audit listings it is an internal constant and never part of the
+#: request or response contract.
+REWRAP_JOB_EVENTS_PAGE_SIZE = 100
+
+#: Discriminator embedded in rewrap-job-event cursors so a cursor from
+#: any other HMAC family (rewrap batch, grant audit, compliance audit
+#: events, revocations, job history) can never be replayed against the
+#: job event timeline, and vice versa.
+_REWRAP_JOB_EVENTS_CURSOR_KIND = "rewrap-job-events-v1"
 
 
 class CreateChallengeRequest(BaseModel):
@@ -2027,6 +2203,12 @@ def create_app(
             now = _utcnow()
             scope: tuple[str, str] | None = None
             with self._session_factory() as session:
+                # Read the pre-claim status inside the same (writer-locked)
+                # transaction so the timeline event can name the exact
+                # committed transition; the guarded UPDATE below remains
+                # the real exclusion.
+                prior = session.get(RewrapJob, job_id)
+                prior_status = prior.status if prior is not None else None
                 claimed = session.execute(
                     update(RewrapJob)
                     .where(
@@ -2041,9 +2223,31 @@ def create_app(
                     )
                     .execution_options(synchronize_session=False)
                 ).rowcount
-                if claimed == 1:
-                    row = session.get(RewrapJob, job_id)
-                    scope = (row.tenant_id, row.workload_id) if row else None
+                if claimed == 1 and prior is not None:
+                    scope = (prior.tenant_id, prior.workload_id)
+                    # Record only true status migrations: a queued job
+                    # starts executing, a parked failed job claimed by the
+                    # recovery sweep is resumed. A running -> running
+                    # claim (crash recovery of an in-flight job) changes
+                    # no status and appends no event.
+                    if prior_status == REWRAP_JOB_STATUS_QUEUED:
+                        _append_rewrap_job_event(
+                            session,
+                            prior,
+                            old_status=REWRAP_JOB_STATUS_QUEUED,
+                            new_status=REWRAP_JOB_STATUS_RUNNING,
+                            reason=REWRAP_JOB_EVENT_REASON_EXECUTING,
+                            occurred_at=now,
+                        )
+                    elif prior_status == REWRAP_JOB_STATUS_FAILED:
+                        _append_rewrap_job_event(
+                            session,
+                            prior,
+                            old_status=REWRAP_JOB_STATUS_FAILED,
+                            new_status=REWRAP_JOB_STATUS_RUNNING,
+                            reason=REWRAP_JOB_EVENT_REASON_RESUMED,
+                            occurred_at=now,
+                        )
                 session.commit()
             if claimed == 1 and scope is not None:
                 # Remember the token so this runner releases only its own
@@ -2222,7 +2426,9 @@ def create_app(
                     # A stored cursor must always verify; if it does not
                     # the row is corrupt and the job cannot safely move.
                     logger.error("rewrap job %s has an unverifiable cursor", job_id)
-                    self._settle_failed(session, job, job.next_cursor)
+                    self._settle_failed(
+                        session, job, job.next_cursor, REWRAP_RESULT_REWRAP_FAILED
+                    )
                     return REWRAP_JOB_STATUS_FAILED
                 try:
                     rows = list(
@@ -2329,6 +2535,14 @@ def create_app(
                         raise RuntimeError(
                             "rewrap job success settlement did not settle"
                         )
+                    _append_rewrap_job_event(
+                        session,
+                        job,
+                        old_status=REWRAP_JOB_STATUS_RUNNING,
+                        new_status=REWRAP_JOB_STATUS_SUCCEEDED,
+                        reason=REWRAP_JOB_EVENT_REASON_COMPLETED,
+                        occurred_at=now,
+                    )
                     session.commit()
                     return REWRAP_JOB_STATUS_SUCCEEDED
                 # Full page and more may follow: just bump updated_at, and
@@ -2415,7 +2629,9 @@ def create_app(
                         logger.error(
                             "master keyring unavailable during rewrap job"
                         )
-                        self._settle_failed(session, job, job.next_cursor)
+                        self._settle_failed(
+                            session, job, job.next_cursor, REWRAP_RESULT_KEYRING
+                        )
                         return REWRAP_RESULT_KEYRING
 
                     current_version = keyring.current_version
@@ -2441,7 +2657,12 @@ def create_app(
                                 "rewrap job",
                                 stored_version,
                             )
-                            self._settle_failed(session, job, job.next_cursor)
+                            self._settle_failed(
+                                session,
+                                job,
+                                job.next_cursor,
+                                REWRAP_RESULT_MISSING_KEY,
+                            )
                             return REWRAP_RESULT_MISSING_KEY
                         except Exception:
                             if self._cancel_requested(job_id):
@@ -2451,7 +2672,12 @@ def create_app(
                             logger.error(
                                 "rewrap job single-envelope rewrap failed"
                             )
-                            self._settle_failed(session, job, job.next_cursor)
+                            self._settle_failed(
+                                session,
+                                job,
+                                job.next_cursor,
+                                REWRAP_RESULT_REWRAP_FAILED,
+                            )
                             return REWRAP_RESULT_REWRAP_FAILED
 
                         # Guarded update, mirroring the batch and
@@ -2495,7 +2721,10 @@ def create_app(
                             else:
                                 job = session.get(RewrapJob, job_id)
                                 self._settle_failed(
-                                    session, job, job.next_cursor
+                                    session,
+                                    job,
+                                    job.next_cursor,
+                                    REWRAP_RESULT_REWRAP_FAILED,
                                 )
                                 return REWRAP_RESULT_REWRAP_FAILED
                         else:
@@ -2599,13 +2828,17 @@ def create_app(
             finally:
                 self._envelope_active.discard(job_id)
 
-        def _settle_failed(self, session, job, resume_cursor: str) -> None:
+        def _settle_failed(
+            self, session, job, resume_cursor: str, reason: str
+        ) -> None:
             """Move a running job to ``failed`` and park the resume cursor.
 
             The failed envelope itself is never modified and its failure
             is not counted as processed: ``failed`` increases by one and
             ``next_cursor`` stays immediately before it, so recovery
-            re-attempts exactly that envelope first.
+            re-attempts exactly that envelope first. ``reason`` is the
+            fixed REWRAP_RESULT_* failure category recorded on the
+            timeline event that commits with the settlement.
             """
             now = _utcnow()
             settled = session.execute(
@@ -2637,6 +2870,14 @@ def create_app(
                 ):
                     return
                 raise RuntimeError("rewrap job failure settlement did not settle")
+            _append_rewrap_job_event(
+                session,
+                job,
+                old_status=REWRAP_JOB_STATUS_RUNNING,
+                new_status=REWRAP_JOB_STATUS_FAILED,
+                reason=reason,
+                occurred_at=now,
+            )
             session.commit()
 
     # Per-app runner state is allocated when the app is built, but the
@@ -6522,24 +6763,34 @@ def create_app(
             now = _utcnow()
             try:
                 with session_factory() as session:
-                    session.add(
-                        RewrapJob(
-                            job_id=job_id,
-                            tenant_id=body.tenant_id,
-                            workload_id=body.workload_id,
-                            limit=body.limit,
-                            cursor=start_cursor,
-                            next_cursor=start_cursor,
-                            status=REWRAP_JOB_STATUS_QUEUED,
-                            processed=0,
-                            rewrapped=0,
-                            skipped=0,
-                            failed=0,
-                            complete=False,
-                            claim_token=None,
-                            created_at=now,
-                            updated_at=now,
-                        )
+                    job = RewrapJob(
+                        job_id=job_id,
+                        tenant_id=body.tenant_id,
+                        workload_id=body.workload_id,
+                        limit=body.limit,
+                        cursor=start_cursor,
+                        next_cursor=start_cursor,
+                        status=REWRAP_JOB_STATUS_QUEUED,
+                        processed=0,
+                        rewrapped=0,
+                        skipped=0,
+                        failed=0,
+                        complete=False,
+                        claim_token=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    session.add(job)
+                    # The submission event (null -> queued) commits with
+                    # the job row itself: a job and its timeline's first
+                    # event are one atomic write.
+                    _append_rewrap_job_event(
+                        session,
+                        job,
+                        old_status=None,
+                        new_status=REWRAP_JOB_STATUS_QUEUED,
+                        reason=REWRAP_JOB_EVENT_REASON_SUBMITTED,
+                        occurred_at=now,
                     )
                     session.commit()
             except Exception:
@@ -6628,24 +6879,33 @@ def create_app(
                     acceptance_body = _rewrap_job_acceptance_body(
                         job_id, body.limit, start_cursor, now
                     )
-                    session.add(
-                        RewrapJob(
-                            job_id=job_id,
-                            tenant_id=body.tenant_id,
-                            workload_id=body.workload_id,
-                            limit=body.limit,
-                            cursor=start_cursor,
-                            next_cursor=start_cursor,
-                            status=REWRAP_JOB_STATUS_QUEUED,
-                            processed=0,
-                            rewrapped=0,
-                            skipped=0,
-                            failed=0,
-                            complete=False,
-                            claim_token=None,
-                            created_at=now,
-                            updated_at=now,
-                        )
+                    job = RewrapJob(
+                        job_id=job_id,
+                        tenant_id=body.tenant_id,
+                        workload_id=body.workload_id,
+                        limit=body.limit,
+                        cursor=start_cursor,
+                        next_cursor=start_cursor,
+                        status=REWRAP_JOB_STATUS_QUEUED,
+                        processed=0,
+                        rewrapped=0,
+                        skipped=0,
+                        failed=0,
+                        complete=False,
+                        claim_token=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    session.add(job)
+                    # The submission event (null -> queued) joins the same
+                    # atomic commit as the job and its idempotency record.
+                    _append_rewrap_job_event(
+                        session,
+                        job,
+                        old_status=None,
+                        new_status=REWRAP_JOB_STATUS_QUEUED,
+                        reason=REWRAP_JOB_EVENT_REASON_SUBMITTED,
+                        occurred_at=now,
                     )
                     session.add(
                         RewrapJobIdempotencyRecord(
@@ -7125,6 +7385,18 @@ def create_app(
                         raise HTTPException(
                             status_code=500, detail="rewrap job cancel failed"
                         )
+                    # The winning cancel archives its transition on the
+                    # timeline in the same commit; ``job.status`` still
+                    # holds the pre-update state (queued or running)
+                    # because the guarded UPDATE bypassed the session.
+                    _append_rewrap_job_event(
+                        session,
+                        job,
+                        old_status=job.status,
+                        new_status=REWRAP_JOB_STATUS_CANCELLED,
+                        reason=REWRAP_JOB_EVENT_REASON_CANCELLED,
+                        occurred_at=cancelled_at,
+                    )
                     try:
                         session.commit()
                     except Exception:
@@ -7291,6 +7563,16 @@ def create_app(
                         raise HTTPException(
                             status_code=500, detail="rewrap job resume failed"
                         )
+                    # The winning resume archives its failed -> queued
+                    # transition on the timeline in the same commit.
+                    _append_rewrap_job_event(
+                        session,
+                        job,
+                        old_status=REWRAP_JOB_STATUS_FAILED,
+                        new_status=REWRAP_JOB_STATUS_QUEUED,
+                        reason=REWRAP_JOB_EVENT_REASON_RESUMED,
+                        occurred_at=resumed_at,
+                    )
                     # Snapshot the response fields from the settled row
                     # before committing: progress, counters and the parked
                     # cursor are exactly what the failure left; only
@@ -7345,6 +7627,189 @@ def create_app(
         # is a bool and every other value is a string (allow_nan=False
         # excludes non-finite numbers).
         return _compact_json_line(payload)
+
+    @app.get("/v1/rewrap-jobs//events")
+    def rewrap_job_events_identifier_required(
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        # An empty path segment is a missing job identifier: a 422 client
+        # error rather than a routing-level 404. It never reads state.
+        raise HTTPException(status_code=422, detail="invalid job identifier")
+
+    @app.get("/v1/rewrap-jobs/{job_id}/events")
+    def list_rewrap_job_events(
+        request: Request,
+        job_id: str,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        cursor: str | None = Query(default=None),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return a read-only, snapshot-stable page of a job's timeline.
+
+        The range is exactly one job, named by its canonical path UUID
+        and pinned to the mandatory tenant/workload scope; an unknown or
+        cross-scope job is an indistinguishable 404. Events are the
+        job's committed status transitions ordered by the job's own
+        immutable sequence number. An omitted or empty cursor starts
+        before the first event and fixes a replayable snapshot at the
+        greatest committed sequence: transitions committed afterwards
+        never enter this snapshot's pages and surface only in a fresh
+        first query, so replaying a cursor returns the identical page
+        regardless of concurrent advancement. The cursor is
+        HMAC-authenticated, carries its own kind tag and is bound to the
+        scope, the job and the snapshot, so a forged, tampered,
+        cross-scope, cross-job or foreign-family cursor is a 422 that
+        reads no state. The handler issues only SELECTs — it never
+        changes a job, an event or an envelope — and a storage failure
+        aborts the whole request with a 500 rather than returning half a
+        page.
+        """
+        # --- request shape (all 422, no storage touched) ----------------
+        allowed_params = {"tenant_id", "workload_id", "cursor"}
+        supplied = request.query_params.multi_items()
+        seen_params: set[str] = set()
+        for key, _ in supplied:
+            # An unknown parameter or one supplied twice is a client
+            # error; nothing is read in either case. (QueryParams.keys()
+            # collapses repeats, so the duplicate check must walk the
+            # multi-valued item list.)
+            if key not in allowed_params or key in seen_params:
+                raise HTTPException(
+                    status_code=422, detail="unsupported query parameter"
+                )
+            seen_params.add(key)
+
+        # The path identifier must be a canonical lowercase UUID;
+        # whitespace-padded, uppercase or otherwise non-canonical
+        # spellings are format errors checked before any state is read.
+        if not _UUID_RE.fullmatch(job_id):
+            raise HTTPException(status_code=422, detail="invalid job identifier")
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        # An omitted cursor or an explicit empty string starts before the
+        # first event and fixes a fresh snapshot. Anything else must be a
+        # well-formed token of this cursor family, minted for exactly
+        # this scope and job; every mismatch is an indistinguishable 422
+        # and the decode above is pure HMAC — no state is read.
+        boundary_seq = -1
+        snapshot_seq: int | None = None
+        if cursor is not None and cursor != "":
+            if not cursor.strip() or not _CURSOR_RE.fullmatch(cursor):
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            decoded_cursor = _decode_rewrap_job_events_cursor(
+                cursor, tenant_id, workload_id, job_id
+            )
+            if decoded_cursor is None:
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            boundary_seq, snapshot_seq = decoded_cursor
+
+        # --- read-only timeline scan ------------------------------------
+        try:
+            with session_factory() as session:
+                # The job must exist in exactly this scope; unknown and
+                # cross-scope identifiers are an indistinguishable 404.
+                job = session.get(RewrapJob, job_id)
+                if (
+                    job is None
+                    or job.tenant_id != tenant_id
+                    or job.workload_id != workload_id
+                ):
+                    raise HTTPException(
+                        status_code=404, detail="rewrap job not found"
+                    )
+
+                if snapshot_seq is None:
+                    # First query of the range: fix the replayable
+                    # snapshot as the greatest committed event sequence.
+                    # Transitions committed afterwards lie beyond the
+                    # high-water mark and never enter this snapshot's
+                    # pages.
+                    snapshot_seq = session.scalar(
+                        select(func.max(RewrapJobEvent.seq)).where(
+                            RewrapJobEvent.job_id == job_id
+                        )
+                    )
+
+                if snapshot_seq is None:
+                    # No committed event at snapshot time (only possible
+                    # for a job predating the timeline): the fixed page
+                    # is empty and already complete.
+                    rows = []
+                else:
+                    stmt = (
+                        select(RewrapJobEvent)
+                        .where(
+                            RewrapJobEvent.job_id == job_id,
+                            RewrapJobEvent.tenant_id == tenant_id,
+                            RewrapJobEvent.workload_id == workload_id,
+                            # Inclusive snapshot HWM, exclusive keyset boundary.
+                            RewrapJobEvent.seq <= snapshot_seq,
+                            RewrapJobEvent.seq > boundary_seq,
+                        )
+                        .order_by(RewrapJobEvent.seq.asc())
+                        .limit(REWRAP_JOB_EVENTS_PAGE_SIZE + 1)
+                    )
+                    # One extra row is the "more follows" probe. The scan
+                    # is a single read-only statement: a storage failure
+                    # aborts the whole request with a 500 rather than
+                    # returning a partial page.
+                    rows = list(session.scalars(stmt))
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("rewrap job events query failed")
+            raise HTTPException(
+                status_code=500, detail="rewrap job events unavailable"
+            )
+
+        has_more = len(rows) > REWRAP_JOB_EVENTS_PAGE_SIZE
+        page = rows[:REWRAP_JOB_EVENTS_PAGE_SIZE]
+
+        # Identifiers and timestamps are JSON strings, the sequence
+        # number is an integer and old_status is null only on the
+        # submission event — no floats, -0.0 or non-finite values can
+        # ever appear.
+        events = [
+            {
+                "event_id": row.event_id,
+                "seq": row.seq,
+                "old_status": row.old_status,
+                "new_status": row.new_status,
+                "reason": row.reason,
+                "occurred_at": _rfc3339(row.occurred_at),
+            }
+            for row in page
+        ]
+
+        if has_more:
+            next_cursor = _encode_rewrap_job_events_cursor(
+                tenant_id,
+                workload_id,
+                job_id,
+                page[-1].seq,
+                snapshot_seq,
+            )
+            complete = False
+        else:
+            next_cursor = ""
+            complete = True
+
+        body = (
+            json.dumps(
+                {
+                    "events": events,
+                    "next_cursor": next_cursor,
+                    "complete": complete,
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
 
     return app
 

@@ -99,6 +99,35 @@ REWRAP_JOB_STATUS_CODES = frozenset(
 )
 
 
+#: Finite, service-defined set of rewrap job event reasons. Every reason
+#: is a fixed code derived solely from a committed status transition —
+#: never free-form or exception text. ``submitted`` marks the job's
+#: creation (null -> queued); ``executing`` a queued -> running claim;
+#: ``resumed`` a failed -> queued explicit resume or a failed -> running
+#: recovery-sweep retry; ``completed`` the running -> succeeded
+#: settlement; ``cancelled`` the queued|running -> cancelled settlement.
+#: A running -> failed settlement instead carries the existing rewrap
+#: failure category that caused it (``keyring``, ``missing-key`` or
+#: ``rewrap`` — the REWRAP_RESULT_* failure codes).
+REWRAP_JOB_EVENT_REASON_SUBMITTED = "submitted"
+REWRAP_JOB_EVENT_REASON_EXECUTING = "executing"
+REWRAP_JOB_EVENT_REASON_RESUMED = "resumed"
+REWRAP_JOB_EVENT_REASON_COMPLETED = "completed"
+REWRAP_JOB_EVENT_REASON_CANCELLED = "cancelled"
+REWRAP_JOB_EVENT_REASON_CODES = frozenset(
+    {
+        REWRAP_JOB_EVENT_REASON_SUBMITTED,
+        REWRAP_JOB_EVENT_REASON_EXECUTING,
+        REWRAP_JOB_EVENT_REASON_RESUMED,
+        REWRAP_JOB_EVENT_REASON_COMPLETED,
+        REWRAP_JOB_EVENT_REASON_CANCELLED,
+        REWRAP_RESULT_KEYRING,
+        REWRAP_RESULT_MISSING_KEY,
+        REWRAP_RESULT_REWRAP_FAILED,
+    }
+)
+
+
 #: Finite, service-defined set of compliance audit-event types. ``grant``
 #: events trace the one-time release-grant lifecycle; ``rewrap`` events
 #: trace per-envelope key rotation performed by rewrap batches.
@@ -750,6 +779,67 @@ class RewrapJobIdempotencyRecord(Base):
     # plus its single trailing newline) and replayed byte-for-byte.
     response_body: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class RewrapJobEvent(Base):
+    """One committed status transition of an asynchronous rewrap job.
+
+    A row is inserted in the same committed transaction as the guarded
+    status transition it records (submission, a runner claim, the success
+    or failure settlement, a cancellation, a resume), so an event exists
+    if and only if the transition won and committed, and it survives
+    restarts. When background advancement, cancellation and resume race,
+    only the winning guarded UPDATE commits — and only that winner writes
+    an event — so the timeline always archives the final committed state
+    and one transition yields exactly one event. The table is never
+    updated or deleted by the service.
+
+    ``seq`` is the job's own zero-based event sequence: assigned inside
+    the committing transaction and immutable afterwards, it orders the
+    timeline exactly by committed-transition order and gives the read
+    endpoint a stable keyset and snapshot high-water mark. ``old_status``
+    is NULL only on the submission event (the job had no prior state);
+    every later event names both states. ``reason`` is one of the fixed
+    REWRAP_JOB_EVENT_REASON_* codes or, for a failure settlement, the
+    existing REWRAP_RESULT_* failure category — never exception text.
+
+    Only identifiers, the scope, the fixed status/reason codes, the
+    sequence number and a UTC timestamp are stored: no envelope material,
+    payload, key or free-form text ever has a column here.
+    """
+
+    __tablename__ = "rewrap_job_events"
+    __table_args__ = (
+        # At most one event per (job, sequence) position; the constraint
+        # is the backstop that makes a same-job transition race settle as
+        # exactly one committed event.
+        UniqueConstraint("job_id", "seq", name="uq_rewrap_job_event_job_seq"),
+        Index(
+            "ix_rewrap_job_events_scope_seq",
+            "tenant_id",
+            "workload_id",
+            "job_id",
+            "seq",
+        ),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("rewrap_jobs.job_id"), index=True
+    )
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # Zero-based position within the job's own timeline; immutable and
+    # gap-free in committed-transition order.
+    seq: Mapped[int] = mapped_column(Integer)
+    # One of REWRAP_JOB_STATUS_*; NULL only for the submission event.
+    old_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # One of REWRAP_JOB_STATUS_*; the state the transition committed.
+    new_status: Mapped[str] = mapped_column(String(16))
+    # One of REWRAP_JOB_EVENT_REASON_*; a fixed, service-defined code only.
+    reason: Mapped[str] = mapped_column(String(16))
+    # Commit time of the recorded transition.
+    occurred_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
 class AuditEvent(Base):
