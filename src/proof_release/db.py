@@ -672,8 +672,8 @@ class RewrapJob(Base):
     # On failure it stays immediately before the failing envelope.
     next_cursor: Mapped[str] = mapped_column(String(256))
     # One of REWRAP_JOB_STATUS_*; queued -> running -> succeeded|failed,
-    # or queued|running -> cancelled, each transition made at most once
-    # with a guarded UPDATE.
+    # queued|running -> cancelled, or failed -> queued on a manual resume,
+    # each transition made at most once with a guarded UPDATE.
     status: Mapped[str] = mapped_column(String(16), default="queued")
     # Cumulative counters across every page the job has advanced.
     processed: Mapped[int] = mapped_column(Integer, default=0)

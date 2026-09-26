@@ -1622,6 +1622,23 @@ class CancelRewrapJobRequest(BaseModel):
     _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
 
 
+class ResumeRewrapJobRequest(BaseModel):
+    """Scope naming the failed asynchronous rewrap job to resume.
+
+    Same field contract as the cancel body: exactly the two non-blank
+    scope strings; any missing, blank, wrong-typed or unknown field is
+    rejected as a client error rather than silently ignored, and
+    validation completes before the handler reads the job.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+
+    _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
+
+
 def _migrate_additive(engine) -> None:
     """Apply forward-only additive column additions to pre-existing databases."""
     if engine.dialect.name != "sqlite":
@@ -7150,6 +7167,188 @@ def create_app(
             status_code=200,
             media_type="application/json",
         )
+
+    @app.post("/v1/rewrap-jobs//resume")
+    def resume_rewrap_job_identifier_required(
+        body: ResumeRewrapJobRequest,
+    ) -> Response:
+        # An empty path segment is a missing job identifier: a 422 client
+        # error rather than a routing-level 404 or 405. It never reads a
+        # job.
+        raise HTTPException(status_code=422, detail="invalid job identifier")
+
+    @app.post("/v1/rewrap-jobs/{job_id}/resume")
+    def resume_rewrap_job(job_id: str, body: ResumeRewrapJobRequest) -> Response:
+        """Resume a failed asynchronous rewrap job from its parked cursor.
+
+        The path identifier must be a canonical lowercase UUID and the
+        body carries exactly the two non-blank scope strings; any
+        missing, blank, wrong-typed or unknown field is a 422 that never
+        reads the job. An unknown job or one outside the body's
+        tenant/workload is an indistinguishable 404 (existence is never
+        revealed). A queued, running, succeeded or cancelled job — or one
+        a racing request has just resumed — returns 409 and changes
+        neither status, counters, cursor nor any timestamp.
+
+        The winning resume commits exactly one guarded transition
+        (``failed`` -> ``queued``) in a single transaction: no second job
+        is created, no history is rewritten and no audit event is
+        appended. The ``failed`` counter and the ``next_cursor`` parked
+        immediately before the failing envelope are preserved verbatim,
+        so the background runner re-attempts exactly that envelope first
+        and never re-advances an envelope already committed or skipped;
+        the job then converges to its terminal state under the existing
+        advancement rules. A write or commit failure is a 500 after a
+        full rollback, leaving status, counters, cursor and timestamps
+        exactly as they were.
+        """
+        # A path identifier that is missing (empty segment), blank,
+        # whitespace-padded, uppercase or otherwise non-canonical is a
+        # field/format error checked before any state is read.
+        if not _UUID_RE.fullmatch(job_id):
+            raise HTTPException(status_code=422, detail="invalid job identifier")
+
+        # Read-only scope/status judgement: an unknown id or a job outside
+        # the body's tenant/workload is an indistinguishable 404.
+        try:
+            with session_factory() as session:
+                existing = session.get(RewrapJob, job_id)
+                if (
+                    existing is None
+                    or existing.tenant_id != body.tenant_id
+                    or existing.workload_id != body.workload_id
+                ):
+                    raise HTTPException(
+                        status_code=404, detail="rewrap job not found"
+                    )
+                prior_status = existing.status
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("rewrap job resume failed")
+            raise HTTPException(status_code=500, detail="rewrap job resume failed")
+
+        if prior_status != REWRAP_JOB_STATUS_FAILED:
+            # Only a failed job is resumable. Every other state — queued,
+            # running, succeeded, cancelled, or already resumed by a
+            # racing request — is a conflict observed without a write: it
+            # rewrites no state and appends no audit.
+            raise HTTPException(status_code=409, detail="rewrap job is not failed")
+
+        resumed_at = _utcnow()
+        try:
+            with session_factory() as session:
+                try:
+                    # Re-read under the writer lock; the failed-status
+                    # judgement above is advisory and the guarded UPDATE
+                    # below is the real settlement. SQLite ignores FOR
+                    # UPDATE but already serializes all writers via BEGIN
+                    # IMMEDIATE, so concurrent resumes (and the startup
+                    # sweep's retry claim) are strictly ordered.
+                    job = session.scalar(
+                        select(RewrapJob)
+                        .where(
+                            RewrapJob.job_id == job_id,
+                            RewrapJob.tenant_id == body.tenant_id,
+                            RewrapJob.workload_id == body.workload_id,
+                        )
+                        .with_for_update()
+                    )
+                    if job is None:
+                        raise HTTPException(
+                            status_code=404, detail="rewrap job not found"
+                        )
+                    if job.status != REWRAP_JOB_STATUS_FAILED:
+                        raise HTTPException(
+                            status_code=409, detail="rewrap job is not failed"
+                        )
+                    # Snapshot the response fields from the locked row
+                    # before the flip: a failed job's counters, cursor,
+                    # complete flag and created_at are immutable while
+                    # failed, and the guarded update below touches only
+                    # status, claim_token and updated_at, so these values
+                    # remain authoritative for the committed row.
+                    payload = {
+                        "job_id": job.job_id,
+                        "status": REWRAP_JOB_STATUS_QUEUED,
+                        "processed": job.processed,
+                        "rewrapped": job.rewrapped,
+                        "skipped": job.skipped,
+                        "failed": job.failed,
+                        "next_cursor": job.next_cursor,
+                        "complete": bool(job.complete),
+                        "created_at": _rfc3339(job.created_at),
+                        "updated_at": _rfc3339(resumed_at),
+                    }
+                    # Atomic settlement: only a still-failed row flips back
+                    # to queued. The guarded predicate is what makes
+                    # concurrent resumes settle with exactly one winner and
+                    # what keeps a terminal state (succeeded/cancelled) or a
+                    # racing startup-sweep claim from being overwritten.
+                    outcome = session.execute(
+                        update(RewrapJob)
+                        .where(
+                            RewrapJob.job_id == job_id,
+                            RewrapJob.status == REWRAP_JOB_STATUS_FAILED,
+                        )
+                        .values(
+                            status=REWRAP_JOB_STATUS_QUEUED,
+                            claim_token=None,
+                            updated_at=resumed_at,
+                        )
+                        .execution_options(synchronize_session=False)
+                    )
+                    if outcome.rowcount != 1:
+                        session.rollback()
+                        fresh = session.get(RewrapJob, job_id)
+                        if (
+                            fresh is not None
+                            and fresh.status != REWRAP_JOB_STATUS_FAILED
+                        ):
+                            raise HTTPException(
+                                status_code=409,
+                                detail="rewrap job is not failed",
+                            )
+                        raise HTTPException(
+                            status_code=500, detail="rewrap job resume failed"
+                        )
+                    try:
+                        session.commit()
+                    except Exception:
+                        session.rollback()
+                        logger.error("rewrap job resume failed")
+                        raise HTTPException(
+                            status_code=500, detail="rewrap job resume failed"
+                        )
+                except HTTPException:
+                    raise
+                except Exception:
+                    # A failure during the locked lookup or guarded update
+                    # is a full rollback and a sanitized 500: the status
+                    # change can never have happened on this path, so the
+                    # job keeps its prior state, counters, cursor and time.
+                    session.rollback()
+                    logger.error("rewrap job resume failed")
+                    raise HTTPException(
+                        status_code=500, detail="rewrap job resume failed"
+                    )
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("rewrap job resume failed")
+            raise HTTPException(status_code=500, detail="rewrap job resume failed")
+
+        # Durable transition first, background advancement second — exactly
+        # as on submission: even if this process dies before a worker picks
+        # the job up, the queued row is resumed by the next process's
+        # startup sweep, and the sweep's guarded claim observes the same
+        # status guard as this endpoint did.
+        app.state.rewrap_job_runner.submit(job_id)
+
+        # The response reuses the single-job progress query's field order
+        # and types verbatim; every counter stays an integer and
+        # allow_nan=False excludes non-finite values.
+        return _compact_json_line(payload)
 
     return app
 
