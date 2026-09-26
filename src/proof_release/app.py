@@ -91,6 +91,17 @@ from proof_release.db import (
     Decision,
     Evidence,
     Policy,
+    ProofEvent,
+    PROOF_EVENT_TYPE_RECEIPT,
+    PROOF_EVENT_TYPE_VERIFICATION,
+    PROOF_EVENT_TYPE_DECISION,
+    PROOF_EVENT_STATUS_RECEIVED,
+    PROOF_EVENT_STATUS_VERIFIED,
+    PROOF_EVENT_STATUS_REJECTED,
+    PROOF_EVENT_STATUS_ALLOWED,
+    PROOF_EVENT_STATUS_DENIED,
+    PROOF_EVENT_TYPE_CODES,
+    PROOF_EVENT_STATUS_CODES,
     RateLimitCounter,
     ReleaseGrant,
     RewrapBatch,
@@ -1285,6 +1296,179 @@ def _decode_rewrap_job_event_cursor(
     return boundary_seq, snapshot_seq
 
 
+def _proof_event_cursor_payload(
+    tenant_id: str,
+    workload_id: str,
+    boundary_at: str,
+    boundary_event: str,
+    *,
+    event_id: str,
+    evidence_id: str,
+    event_type: str,
+    status: str,
+    occurred_after: str,
+    occurred_before: str,
+    snapshot_at: str,
+    snapshot_event: str,
+) -> bytes:
+    """Canonical byte payload authenticated inside a proof-event cursor.
+
+    The cursor marks an exclusive ``(occurred_at, event_id)`` position and
+    every active filter plus the fixed replayable snapshot high-water mark
+    ``(occurred_at, event_id)`` are part of the signed payload, so a cursor
+    minted for one scope, filter set or snapshot cannot be replayed
+    against another. The kind tag distinguishes these cursors from every
+    other cursor family even though all share the same HMAC secret.
+    """
+    return json.dumps(
+        {
+            "k": _PROOF_EVENT_CURSOR_KIND,
+            "t": tenant_id,
+            "w": workload_id,
+            "at": boundary_at,
+            "e": boundary_event,
+            "id": event_id,
+            "ev": evidence_id,
+            "ty": event_type,
+            "s": status,
+            "a": occurred_after,
+            "b": occurred_before,
+            "sa": snapshot_at,
+            "si": snapshot_event,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _encode_proof_event_cursor(
+    tenant_id: str,
+    workload_id: str,
+    boundary_at: str,
+    boundary_event: str,
+    *,
+    event_id: str,
+    evidence_id: str,
+    event_type: str,
+    status: str,
+    occurred_after: str,
+    occurred_before: str,
+    snapshot_at: str,
+    snapshot_event: str,
+) -> str:
+    """Build an opaque, scope/filter/snapshot-bound exclusive proof cursor."""
+    payload = _proof_event_cursor_payload(
+        tenant_id,
+        workload_id,
+        boundary_at,
+        boundary_event,
+        event_id=event_id,
+        evidence_id=evidence_id,
+        event_type=event_type,
+        status=status,
+        occurred_after=occurred_after,
+        occurred_before=occurred_before,
+        snapshot_at=snapshot_at,
+        snapshot_event=snapshot_event,
+    )
+    mac = hmac.new(_cursor_secret(), payload, hashlib.sha256).digest()
+    return b64url_encode(payload + mac)
+
+
+def _decode_proof_event_cursor(
+    token: str,
+    tenant_id: str,
+    workload_id: str,
+    *,
+    event_id: str,
+    evidence_id: str,
+    event_type: str,
+    status: str,
+    occurred_after: str,
+    occurred_before: str,
+) -> tuple[str, str, str, str] | None:
+    """Validate a proof-event cursor and return its boundary and snapshot.
+
+    Returns ``(occurred_at, event_id, snapshot_at, snapshot_event)`` on
+    success or ``None`` for a malformed/forged token, a cursor of another
+    kind (rewrap batch, grant audit, compliance audit events, revocations,
+    job history or job events), or one minted for any other scope, filter
+    combination or snapshot. The beginning marker (``""``) never reaches
+    this function.
+    """
+    if not _CURSOR_RE.fullmatch(token):
+        return None
+    try:
+        raw = b64url_decode(token)
+    except ValueError:
+        return None
+    # The MAC is a fixed 32-byte suffix; the JSON payload precedes it.
+    if len(raw) <= 32:
+        return None
+    payload, mac = raw[:-32], raw[-32:]
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    if decoded.get("k") != _PROOF_EVENT_CURSOR_KIND:
+        return None
+    boundary_at = decoded.get("at")
+    boundary_event = decoded.get("e")
+    if not isinstance(boundary_at, str) or boundary_at == "":
+        return None
+    if not isinstance(boundary_event, str) or not _UUID_RE.fullmatch(boundary_event):
+        return None
+    snapshot_at = decoded.get("sa")
+    snapshot_event = decoded.get("si")
+    # A resume cursor always names the snapshot high-water mark
+    # established by the range's first query.
+    if not isinstance(snapshot_at, str) or snapshot_at == "":
+        return None
+    if not isinstance(snapshot_event, str) or not _UUID_RE.fullmatch(
+        snapshot_event
+    ):
+        return None
+    expected_mac = hmac.new(
+        _cursor_secret(),
+        _proof_event_cursor_payload(
+            tenant_id,
+            workload_id,
+            boundary_at,
+            boundary_event,
+            event_id=event_id,
+            evidence_id=evidence_id,
+            event_type=event_type,
+            status=status,
+            occurred_after=occurred_after,
+            occurred_before=occurred_before,
+            snapshot_at=snapshot_at,
+            snapshot_event=snapshot_event,
+        ),
+        hashlib.sha256,
+    ).digest()
+    if not hmac.compare_digest(mac, expected_mac):
+        return None
+    # Defense in depth: the MAC already covers every field, but confirm
+    # the scope and each active filter explicitly.
+    if not hmac.compare_digest(str(decoded.get("t", "")), tenant_id):
+        return None
+    if not hmac.compare_digest(str(decoded.get("w", "")), workload_id):
+        return None
+    for key, expected in (
+        ("id", event_id),
+        ("ev", evidence_id),
+        ("ty", event_type),
+        ("s", status),
+        ("a", occurred_after),
+        ("b", occurred_before),
+    ):
+        if not hmac.compare_digest(str(decoded.get(key, "")), expected):
+            return None
+    return boundary_at, boundary_event, snapshot_at, snapshot_event
+
+
 #: Fixed page size for the read-only compliance audit-event listing. As
 #: with the grant audit, the page size is an internal constant and never
 #: part of the request or response contract.
@@ -1327,6 +1511,18 @@ REWRAP_JOB_EVENT_PAGE_SIZE = 100
 #: revocations or job history — all authenticated with the same secret)
 #: can never be replayed against a job's event timeline, and vice versa.
 _REWRAP_JOB_EVENT_CURSOR_KIND = "rewrap-job-events-v1"
+
+#: Fixed page size for the read-only proof lifecycle audit listing. Like
+#: the other audit listings it is an internal constant and never part of
+#: the request or response contract.
+PROOF_EVENT_PAGE_SIZE = 100
+
+#: Discriminator embedded in proof lifecycle audit cursors so a cursor
+#: from any other family (rewrap batch, grant audit, compliance audit
+#: events, revocations, job history or job events — all authenticated with
+#: the same secret) can never be replayed against the proof timeline, and
+#: vice versa.
+_PROOF_EVENT_CURSOR_KIND = "compliance-proof-events-v1"
 
 
 class CreateChallengeRequest(BaseModel):
@@ -3050,6 +3246,25 @@ def create_app(
                     evidence_sha256=evidence_digest,
                 )
             )
+            # The proof lifecycle receipt event commits in the same
+            # transaction as the evidence row and the challenge claim, so a
+            # rollback leaves neither the evidence nor the event behind. It
+            # records only the evidence id, the received format and the
+            # receipt time — never the evidence, the nonce or the claims.
+            session.add(
+                ProofEvent(
+                    event_id=str(uuid.uuid4()),
+                    tenant_id=body.tenant_id,
+                    workload_id=body.workload_id,
+                    evidence_id=evidence_id,
+                    event_type=PROOF_EVENT_TYPE_RECEIPT,
+                    status=PROOF_EVENT_STATUS_RECEIVED,
+                    evidence_format=body.evidence_format,
+                    policy_id=None,
+                    policy_version=None,
+                    occurred_at=now,
+                )
+            )
             session.commit()
         return EvidenceReceivedResponse(
             evidence_id=evidence_id,
@@ -3405,6 +3620,31 @@ def create_app(
                         verified_at=_rfc3339(winner.verified_at),
                     )
                 raise HTTPException(status_code=409, detail="verification conflict")
+            # The proof lifecycle verification event commits in the same
+            # transaction as the first-and-final settlement, so it exists
+            # if and only if the conclusion committed. It records only the
+            # fixed conclusion (verified/rejected) and the settlement time
+            # — never the verifier outcome text, the evidence or the nonce.
+            # A losing retry rolls back above and writes nothing, so exactly
+            # one verification event ever exists per evidence.
+            session.add(
+                ProofEvent(
+                    event_id=str(uuid.uuid4()),
+                    tenant_id=body.tenant_id,
+                    workload_id=body.workload_id,
+                    evidence_id=evidence_id,
+                    event_type=PROOF_EVENT_TYPE_VERIFICATION,
+                    status=(
+                        PROOF_EVENT_STATUS_VERIFIED
+                        if accepted
+                        else PROOF_EVENT_STATUS_REJECTED
+                    ),
+                    evidence_format=None,
+                    policy_id=None,
+                    policy_version=None,
+                    occurred_at=verified_at,
+                )
+            )
             session.commit()
 
         return EvidenceVerifiedResponse(
@@ -4558,41 +4798,87 @@ def create_app(
             status = (
                 DECISION_STATUS_ALLOWED if satisfied else DECISION_STATUS_DENIED
             )
-            decision_id = str(uuid.uuid4())
+            # The decision row is unique per (evidence, policy version): a
+            # later decision against a *different* policy version is an
+            # independent row. The proof lifecycle, however, records only
+            # the *first* policy decision per evidence, so the decision
+            # event is inserted first-wins and a later decision must still
+            # commit on its own. The retry loop below settles both races.
+            decision_id = ""
             decided_at = _utcnow()
-            decision = Decision(
-                decision_id=decision_id,
-                evidence_id=evidence_id,
-                policy_id=policy.policy_id,
-                policy_version=policy.version,
-                status=status,
-                decided_at=decided_at,
-            )
-            session.add(decision)
-            try:
-                session.commit()
-            except IntegrityError:
-                # A concurrent request created the unique decision first;
-                # return its immutable result.
-                session.rollback()
-                winner = session.scalar(
-                    select(Decision).where(
-                        Decision.evidence_id == evidence_id,
-                        Decision.policy_id == body.policy_id,
+            for attempt in range(10):
+                decision_id = str(uuid.uuid4())
+                decided_at = _utcnow()
+                session.add(
+                    Decision(
+                        decision_id=decision_id,
+                        evidence_id=evidence_id,
+                        policy_id=policy.policy_id,
+                        policy_version=policy.version,
+                        status=status,
+                        decided_at=decided_at,
                     )
                 )
-                if winner is None:
-                    raise HTTPException(
-                        status_code=409, detail="decision conflict"
+                # Append the decision event only while this evidence still
+                # has none. It records only the policy id/version, the fixed
+                # conclusion (allowed/denied) and the decision time — never
+                # the evidence, the nonce or the evaluated claims.
+                first_decision_event = session.scalar(
+                    select(ProofEvent.event_id).where(
+                        ProofEvent.evidence_id == evidence_id,
+                        ProofEvent.event_type == PROOF_EVENT_TYPE_DECISION,
                     )
-                return DecisionResponse(
-                    decision_id=winner.decision_id,
-                    evidence_id=winner.evidence_id,
-                    policy_id=winner.policy_id,
-                    policy_version=winner.policy_version,
-                    status=winner.status,
-                    decided_at=_rfc3339(winner.decided_at),
                 )
+                if first_decision_event is None:
+                    session.add(
+                        ProofEvent(
+                            event_id=str(uuid.uuid4()),
+                            tenant_id=body.tenant_id,
+                            workload_id=body.workload_id,
+                            evidence_id=evidence_id,
+                            event_type=PROOF_EVENT_TYPE_DECISION,
+                            status=(
+                                PROOF_EVENT_STATUS_ALLOWED
+                                if status == DECISION_STATUS_ALLOWED
+                                else PROOF_EVENT_STATUS_DENIED
+                            ),
+                            evidence_format=None,
+                            policy_id=policy.policy_id,
+                            policy_version=policy.version,
+                            occurred_at=decided_at,
+                        )
+                    )
+                try:
+                    # The decision and (when this is the first decision)
+                    # the proof event commit in one transaction, so a
+                    # rollback leaves neither behind.
+                    session.commit()
+                except IntegrityError:
+                    session.rollback()
+                    # The collision is either the unique (evidence, policy)
+                    # decision — an idempotent replay whose stored result is
+                    # returned — or the first-decision proof event, lost to
+                    # a concurrent decision against another policy version:
+                    # re-run and commit this decision without an event.
+                    winner = session.scalar(
+                        select(Decision).where(
+                            Decision.evidence_id == evidence_id,
+                            Decision.policy_id == body.policy_id,
+                        )
+                    )
+                    if winner is not None:
+                        return DecisionResponse(
+                            decision_id=winner.decision_id,
+                            evidence_id=winner.evidence_id,
+                            policy_id=winner.policy_id,
+                            policy_version=winner.policy_version,
+                            status=winner.status,
+                            decided_at=_rfc3339(winner.decided_at),
+                        )
+                    continue
+                break
+            else:  # pragma: no cover - defensive retry exhaustion
+                raise HTTPException(status_code=500, detail="decision conflict")
 
         return DecisionResponse(
             decision_id=decision_id,
@@ -5328,6 +5614,341 @@ def create_app(
 
         # Compact JSON with a single terminating newline. Every value is a
         # string, null or boolean — no floats, -0.0 or non-finite values.
+        body = (
+            json.dumps(
+                {
+                    "events": events,
+                    "next_cursor": next_cursor,
+                    "complete": complete,
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
+
+    @app.get("/v1/compliance/proof-events")
+    def list_compliance_proof_events(
+        request: Request,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        event_id: str | None = Query(default=None),
+        evidence_id: str | None = Query(default=None),
+        event_type: str | None = Query(default=None),
+        status: str | None = Query(default=None),
+        occurred_after: str | None = Query(default=None),
+        occurred_before: str | None = Query(default=None),
+        cursor: str | None = Query(default=None),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return a read-only page of proof lifecycle audit events.
+
+        Events cover receipt, first verification settlement and first
+        policy decision (at most one per stage per evidence) in stable
+        ``(occurred_at, event_id)`` ascending order with an exclusive
+        keyset cursor. The cursor is HMAC-authenticated, carries its own
+        kind tag and is bound to the scope, every active filter *and* the
+        fixed snapshot established by the range's first (cursor-less or
+        empty-cursor) query, so it cannot be forged, tampered with, or
+        replayed against a different scope, filter set, snapshot or query
+        family. The first query fixes a replayable snapshot: events
+        committed afterwards never enter a replayed page and surface only
+        in a fresh first query. The handler issues only SELECTs — events
+        are written by the evidence/verification/decision transactions and
+        never here — so a query observes only committed state, appends no
+        audit and changes no business state, and returns no half page.
+        """
+        # --- request shape (all 422, no storage touched) ----------------
+        allowed_params = {
+            "tenant_id",
+            "workload_id",
+            "event_id",
+            "evidence_id",
+            "event_type",
+            "status",
+            "occurred_after",
+            "occurred_before",
+            "cursor",
+        }
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+        # A repeated parameter (even of an allowed name) is ambiguous and
+        # rejected rather than silently treated as last-wins.
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(
+                status_code=422, detail="query parameter must appear once"
+            )
+
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        # Both identifiers are canonical lowercase UUIDs; surrounding
+        # whitespace and uppercase letters are format errors.
+        event_id_filter: str | None = None
+        if event_id is not None:
+            if not event_id.strip() or not _UUID_RE.fullmatch(event_id.lower()):
+                raise HTTPException(status_code=422, detail="invalid event identifier")
+            event_id_filter = event_id.lower()
+
+        evidence_id_filter: str | None = None
+        if evidence_id is not None:
+            if not evidence_id.strip() or not _UUID_RE.fullmatch(evidence_id.lower()):
+                raise HTTPException(
+                    status_code=422, detail="invalid evidence identifier"
+                )
+            evidence_id_filter = evidence_id.lower()
+
+        if event_type is not None:
+            if not event_type.strip() or event_type not in PROOF_EVENT_TYPE_CODES:
+                raise HTTPException(status_code=422, detail="invalid event_type")
+
+        if status is not None:
+            if not status.strip() or status not in PROOF_EVENT_STATUS_CODES:
+                raise HTTPException(status_code=422, detail="invalid status")
+
+        type_filter = event_type if event_type is not None else ""
+        status_filter = status if status is not None else ""
+
+        def _time_bound(value: str | None, name: str) -> tuple[str, datetime | None]:
+            if value is None:
+                return "", None
+            if not value.strip():
+                raise HTTPException(
+                    status_code=422, detail=f"{name} must be UTC RFC3339"
+                )
+            try:
+                parsed = _parse_utc_rfc3339(value)
+            except ValueError:
+                raise HTTPException(
+                    status_code=422, detail=f"{name} must be UTC RFC3339"
+                )
+            # Normalize the spelling embedded into the cursor so two
+            # equivalent UTC spellings cannot mint different cursor domains.
+            return _rfc3339(parsed), parsed
+
+        after_raw, after_dt = _time_bound(occurred_after, "occurred_after")
+        before_raw, before_dt = _time_bound(occurred_before, "occurred_before")
+        # Equality is a valid single-instant window; the start must not be
+        # later than the end.
+        if after_dt is not None and before_dt is not None and after_dt > before_dt:
+            raise HTTPException(
+                status_code=422,
+                detail="occurred_after must not be later than occurred_before",
+            )
+
+        # Omitted cursor or an explicit empty string starts before the
+        # smallest event and fixes the range's replayable snapshot.
+        # Whitespace, malformed, forged, cross-scope, cross-filter,
+        # cross-snapshot or foreign-kind cursors are indistinguishable 422s.
+        boundary_dt: datetime | None = None
+        boundary_event: str | None = None
+        snapshot_dt: datetime | None = None
+        if cursor is not None and cursor != "":
+            if not cursor.strip() or not _CURSOR_RE.fullmatch(cursor):
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            decoded_boundary = _decode_proof_event_cursor(
+                cursor,
+                tenant_id,
+                workload_id,
+                event_id=event_id_filter or "",
+                evidence_id=evidence_id_filter or "",
+                event_type=type_filter,
+                status=status_filter,
+                occurred_after=after_raw,
+                occurred_before=before_raw,
+            )
+            if decoded_boundary is None:
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            boundary_at_raw, boundary_event, snapshot_at_raw, _ = decoded_boundary
+            try:
+                boundary_dt = _parse_utc_rfc3339(boundary_at_raw)
+                snapshot_dt = _parse_utc_rfc3339(snapshot_at_raw)
+            except ValueError:
+                raise HTTPException(status_code=422, detail="invalid cursor")
+
+        # --- read-only audit scan ---------------------------------------
+        try:
+            with session_factory() as session:
+                # An explicitly named event must exist in exactly this
+                # scope; unknown and cross-scope identifiers are an
+                # indistinguishable 404 rather than an empty page.
+                if event_id_filter is not None:
+                    named = session.get(ProofEvent, event_id_filter)
+                    if (
+                        named is None
+                        or named.tenant_id != tenant_id
+                        or named.workload_id != workload_id
+                    ):
+                        raise HTTPException(
+                            status_code=404, detail="proof event not found"
+                        )
+
+                # An explicitly named proof (evidence) must exist in
+                # exactly this tenant and workload; an unknown or
+                # cross-scope proof is an indistinguishable 404.
+                if evidence_id_filter is not None:
+                    proof = session.get(Evidence, evidence_id_filter)
+                    if (
+                        proof is None
+                        or proof.tenant_id != tenant_id
+                        or proof.workload_id != workload_id
+                    ):
+                        raise HTTPException(
+                            status_code=404, detail="evidence not found"
+                        )
+
+                def _filtered(stmt):
+                    if event_id_filter is not None:
+                        stmt = stmt.where(ProofEvent.event_id == event_id_filter)
+                    if evidence_id_filter is not None:
+                        stmt = stmt.where(
+                            ProofEvent.evidence_id == evidence_id_filter
+                        )
+                    if type_filter:
+                        stmt = stmt.where(ProofEvent.event_type == type_filter)
+                    if status_filter:
+                        stmt = stmt.where(ProofEvent.status == status_filter)
+                    if after_dt is not None:
+                        stmt = stmt.where(ProofEvent.occurred_at >= after_dt)
+                    if before_dt is not None:
+                        stmt = stmt.where(ProofEvent.occurred_at <= before_dt)
+                    return stmt
+
+                if snapshot_dt is None:
+                    # First query of the range: fix a replayable snapshot
+                    # as the greatest (occurred_at, event_id) among
+                    # currently committed, in-range rows. Events committed
+                    # afterwards lie beyond the high-water mark and never
+                    # enter this snapshot's pages.
+                    hwm_stmt = _filtered(
+                        select(
+                            ProofEvent.occurred_at,
+                            ProofEvent.event_id,
+                        ).where(
+                            ProofEvent.tenant_id == tenant_id,
+                            ProofEvent.workload_id == workload_id,
+                        )
+                    )
+                    hwm_row = session.execute(
+                        hwm_stmt.order_by(
+                            ProofEvent.occurred_at.desc(),
+                            ProofEvent.event_id.desc(),
+                        ).limit(1)
+                    ).first()
+                    if hwm_row is None:
+                        # No in-range event at snapshot time: the fixed
+                        # first page is empty and already complete; later
+                        # commits belong to fresh first queries.
+                        rows = []
+                        hwm_at = None
+                        hwm_event = ""
+                    else:
+                        hwm_at, hwm_event = hwm_row
+                        snapshot_dt = hwm_at
+                else:
+                    # The snapshot high-water mark travels inside the
+                    # cursor (HMAC-verified above); its id component is
+                    # read alongside for the inclusive tie predicate.
+                    hwm_at = snapshot_dt
+                    hwm_event = decoded_boundary[3]
+
+                if hwm_at is not None:
+                    stmt = _filtered(
+                        select(ProofEvent).where(
+                            ProofEvent.tenant_id == tenant_id,
+                            ProofEvent.workload_id == workload_id,
+                            # Inclusive snapshot high-water mark.
+                            or_(
+                                ProofEvent.occurred_at < hwm_at,
+                                and_(
+                                    ProofEvent.occurred_at == hwm_at,
+                                    ProofEvent.event_id <= hwm_event,
+                                ),
+                            ),
+                        )
+                    )
+                    if boundary_dt is not None:
+                        # Exclusive (occurred_at, event_id) keyset.
+                        stmt = stmt.where(
+                            or_(
+                                ProofEvent.occurred_at > boundary_dt,
+                                and_(
+                                    ProofEvent.occurred_at == boundary_dt,
+                                    ProofEvent.event_id > boundary_event,
+                                ),
+                            )
+                        )
+                    stmt = stmt.order_by(
+                        ProofEvent.occurred_at.asc(),
+                        ProofEvent.event_id.asc(),
+                    ).limit(PROOF_EVENT_PAGE_SIZE + 1)
+                    # One extra row is the "more follows" probe. The scan
+                    # is a single read-only statement: a storage failure
+                    # aborts the whole request with a 500 rather than
+                    # returning a partial page.
+                    rows = list(session.scalars(stmt))
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("compliance proof event query failed")
+            raise HTTPException(
+                status_code=500, detail="proof audit unavailable"
+            )
+
+        if not rows:
+            page = []
+            has_more = False
+        else:
+            has_more = len(rows) > PROOF_EVENT_PAGE_SIZE
+            page = rows[:PROOF_EVENT_PAGE_SIZE]
+
+        events = [
+            {
+                "event_id": row.event_id,
+                "evidence_id": row.evidence_id,
+                "event_type": row.event_type,
+                "status": row.status,
+                # The associated format is recorded only for receipt; the
+                # policy version only for decision. Both are null for the
+                # other stages. No payload, nonce, claims or secrets ever
+                # appear.
+                "evidence_format": row.evidence_format,
+                "policy_version": row.policy_version,
+                "occurred_at": _rfc3339(row.occurred_at),
+            }
+            for row in page
+        ]
+
+        if has_more:
+            last = page[-1]
+            next_cursor = _encode_proof_event_cursor(
+                tenant_id,
+                workload_id,
+                _rfc3339(last.occurred_at),
+                last.event_id,
+                event_id=event_id_filter or "",
+                evidence_id=evidence_id_filter or "",
+                event_type=type_filter,
+                status=status_filter,
+                occurred_after=after_raw,
+                occurred_before=before_raw,
+                snapshot_at=_rfc3339(hwm_at),
+                snapshot_event=hwm_event,
+            )
+            complete = False
+        else:
+            next_cursor = ""
+            complete = True
+
+        # Compact JSON with a single terminating newline. Every value is a
+        # string, null, integer or boolean — no floats, -0.0 or non-finite
+        # values; all times are UTC JSON strings.
         body = (
             json.dumps(
                 {

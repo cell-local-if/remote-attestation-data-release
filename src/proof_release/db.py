@@ -160,6 +160,43 @@ AUDIT_EVENT_STATUS_CODES = frozenset(
 )
 
 
+#: Finite, service-defined set of proof lifecycle audit-event types.
+#: ``receipt`` records the reception of attestation evidence,
+#: ``verification`` the first (and only) verification settlement, and
+#: ``decision`` the first policy decision taken against the proof. At most
+#: one event of each type exists per evidence.
+PROOF_EVENT_TYPE_RECEIPT = "receipt"
+PROOF_EVENT_TYPE_VERIFICATION = "verification"
+PROOF_EVENT_TYPE_DECISION = "decision"
+PROOF_EVENT_TYPE_CODES = frozenset(
+    {
+        PROOF_EVENT_TYPE_RECEIPT,
+        PROOF_EVENT_TYPE_VERIFICATION,
+        PROOF_EVENT_TYPE_DECISION,
+    }
+)
+
+#: Finite, service-defined set of proof lifecycle audit-event statuses. A
+#: receipt event is born ``received``; a verification event records only
+#: the settled conclusion (``verified`` or ``rejected``); a decision event
+#: records only ``allowed`` or ``denied``. Every value is a fixed code
+#: derived solely from a committed lifecycle transition.
+PROOF_EVENT_STATUS_RECEIVED = "received"
+PROOF_EVENT_STATUS_VERIFIED = "verified"
+PROOF_EVENT_STATUS_REJECTED = "rejected"
+PROOF_EVENT_STATUS_ALLOWED = "allowed"
+PROOF_EVENT_STATUS_DENIED = "denied"
+PROOF_EVENT_STATUS_CODES = frozenset(
+    {
+        PROOF_EVENT_STATUS_RECEIVED,
+        PROOF_EVENT_STATUS_VERIFIED,
+        PROOF_EVENT_STATUS_REJECTED,
+        PROOF_EVENT_STATUS_ALLOWED,
+        PROOF_EVENT_STATUS_DENIED,
+    }
+)
+
+
 #: Finite, service-defined set of workload identity profile lifecycle
 #: statuses. A profile is born active and is revoked exactly once; revocation
 #: leaves the row in place (still queryable) but removes it from the X.509
@@ -878,6 +915,77 @@ class AuditEvent(Base):
     capability_sha256: Mapped[str | None] = mapped_column(
         String(64), nullable=True
     )
+    # Commit time of the recorded transition; the stable listing key.
+    occurred_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+
+
+class ProofEvent(Base):
+    """Append-only, tenant-scoped proof lifecycle audit event.
+
+    Exactly one row exists per evidence per lifecycle stage: one
+    ``receipt`` event (inserted in the evidence-reception transaction),
+    one ``verification`` event (inserted in the transaction that performs
+    the first and final received -> verified/rejected settlement), and one
+    ``decision`` event per evidence (inserted in the transaction that
+    records the first policy decision). Failed or repeated attempts settle
+    nothing and insert nothing, so retries can never duplicate a stage.
+    The unique ``(evidence_id, event_type)`` constraint backs the
+    one-event-per-stage rule even under concurrent writers.
+
+    A row is inserted in the same committed transaction as the state
+    transition it records, so an event exists if and only if the change
+    committed and it survives restarts; a rollback leaves no event behind.
+    The table is never updated or deleted by the service.
+
+    Only identifiers, the fixed type/status codes, the evidence format,
+    the policy id/version and timestamps are stored. The raw evidence,
+    nonce, claims, capabilities, payloads, keys and exception text never
+    have a column here (the evidence digest lives on the evidence row the
+    event references). Columns that do not apply to an event's stage
+    (policy id/version outside a decision) are NULL.
+"""
+
+    __tablename__ = "proof_events"
+    __table_args__ = (
+        # Covers the scoped listing ordered by the (occurred_at, event_id)
+        # keyset, including its exclusive cursor predicate and the fixed
+        # snapshot high-water mark.
+        Index(
+            "ix_proof_events_scope_occurred",
+            "tenant_id",
+            "workload_id",
+            "occurred_at",
+            "event_id",
+        ),
+        # At most one event of each stage per evidence, even when receipt,
+        # verification and decision transactions race.
+        UniqueConstraint(
+            "evidence_id",
+            "event_type",
+            name="uq_proof_event_evidence_stage",
+        ),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256), index=True)
+    # The proof (evidence) this lifecycle event belongs to.
+    evidence_id: Mapped[str] = mapped_column(String(36), index=True)
+    # One of PROOF_EVENT_TYPE_*; a fixed, service-defined code only.
+    event_type: Mapped[str] = mapped_column(String(16))
+    # receipt: received; verification: verified|rejected;
+    # decision: allowed|denied.
+    status: Mapped[str] = mapped_column(String(16))
+    # The associated evidence format, recorded for receipt events so the
+    # audit identifies what was received; NULL for the later stages.
+    evidence_format: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+    # Set only for decision events: the exact policy version that was
+    # evaluated. policy_id is an immutable version identifier; this
+    # denormalizes the integer version for audit reads.
+    policy_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    policy_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Commit time of the recorded transition; the stable listing key.
     occurred_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
 
