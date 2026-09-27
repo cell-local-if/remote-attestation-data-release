@@ -26,17 +26,20 @@ from pydantic import (
     field_validator,
 )
 from sqlalchemy import (
+    BigInteger,
     and_,
     create_engine,
     delete,
     event,
     func,
+    inspect,
+    literal_column,
     or_,
     select,
     text,
     update,
 )
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
 from cryptography import x509
@@ -2069,11 +2072,8 @@ class ResumeRewrapJobRequest(BaseModel):
     _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
 
 
-def _migrate_additive(engine) -> None:
-    """Apply forward-only additive column additions to pre-existing databases."""
-    if engine.dialect.name != "sqlite":
-        # Non-sqlite deployments are created from metadata; nothing to add.
-        return
+def _migrate_additive_sqlite(engine) -> None:
+    """Apply forward-only additive column additions to legacy SQLite files."""
     additions = {
         "evidence": (
             ("verified_at", "DATETIME"),
@@ -2099,12 +2099,6 @@ def _migrate_additive(engine) -> None:
             # rows created before then have never been cancelled, so the
             # new column backfills to NULL.
             ("cancelled_at", "DATETIME"),
-        ),
-        "proof_lifecycle_events": (
-            # Per-scope commit-order marker added after the proof timeline
-            # first shipped; pre-existing rows are backfilled below in
-            # rowid (commit) order so their snapshot order is preserved.
-            ("commit_seq", "BIGINT"),
         ),
     }
     with engine.begin() as conn:
@@ -2153,68 +2147,225 @@ def _migrate_additive(engine) -> None:
                     text(f"UPDATE {table} SET verification_detail = NULL")
                 )
 
-    # The proof-lifecycle commit sequence is added to pre-existing
-    # databases above; create_all ran before this migration and does not
-    # alter an existing table, so neither the column values nor its unique
-    # index exist yet on such a database. Backfill each scope's events
-    # 1..N in rowid order — rowid is SQLite's serialized commit order — so
-    # the new marker preserves the exact historical commit ordering the
-    # fixed snapshot relies on, then create the unique index. A fresh
-    # database already has both (and IF NOT EXISTS / no NULL rows make
-    # this a no-op there).
-    if engine.dialect.name == "sqlite":
-        with engine.begin() as conn:
-            tables = {
-                row[0]
-                for row in conn.execute(
-                    text(
-                        "SELECT name FROM sqlite_master "
-                        "WHERE type = 'table' AND name = 'proof_lifecycle_events'"
-                    )
-                ).fetchall()
-            }
-            if "proof_lifecycle_events" in tables:
-                columns = {
-                    row[1]
-                    for row in conn.execute(
-                        text("PRAGMA table_info(proof_lifecycle_events)")
-                    ).fetchall()
-                }
-                if "commit_seq" in columns:
-                    conn.execute(
-                        text(
-                            "UPDATE proof_lifecycle_events "
-                            "SET commit_seq = ("
-                            "SELECT COUNT(*) FROM proof_lifecycle_events AS prior "
-                            "WHERE prior.tenant_id = proof_lifecycle_events.tenant_id "
-                            "AND prior.workload_id = proof_lifecycle_events.workload_id "
-                            "AND prior.rowid <= proof_lifecycle_events.rowid"
-                            ") "
-                            "WHERE commit_seq IS NULL"
-                        )
-                    )
-                    # Seed each scope's commit counter at its backfilled
-                    # maximum so the first event written after the upgrade
-                    # allocates N+1 rather than colliding with a legacy
-                    # row's sequence. OR IGNORE keeps a counter created by
-                    # a concurrently upgraded writer intact.
-                    conn.execute(
-                        text(
-                            "INSERT OR IGNORE INTO proof_event_commit_counters "
-                            "(tenant_id, workload_id, last_seq) "
-                            "SELECT tenant_id, workload_id, MAX(commit_seq) "
-                            "FROM proof_lifecycle_events "
-                            "GROUP BY tenant_id, workload_id"
-                        )
-                    )
+
+# Physical row locator used to reconstruct historical commit order for
+# legacy events written before ``commit_seq`` existed. The locator needs no
+# timestamp tie-break and no dialect-specific insert marker:
+_PROOF_LEGACY_LOCATORS = {
+    # SQLite's rowid is its serialized insert (commit) order.
+    "sqlite": "rowid",
+    # PostgreSQL's ctid is the heap tuple's physical location; append-only
+    # legacy events are stored in insertion order, so ordering by it
+    # reconstructs commit order exactly, independent of business time or
+    # equal timestamps.
+    "postgresql": "ctid",
+}
+
+
+def _probe_proof_legacy_locator(conn) -> str | None:
+    """Pick a physical commit-order column the *live* driver actually has.
+
+    Selection is capability-based rather than trusting the dialect name
+    alone: the dialect-hinted locator is tried first, then every other
+    known locator, and the first that compiles and executes wins. This uses
+    ``ctid`` on a real PostgreSQL backend and ``rowid`` on real SQLite even
+    when a proxy/driver reports a different dialect name, and degrades
+    safely on backends that expose neither.
+    """
+    preferred = _PROOF_LEGACY_LOCATORS.get(conn.engine.dialect.name)
+    candidates = (
+        [preferred]
+        + [name for name in _PROOF_LEGACY_LOCATORS.values() if name != preferred]
+        if preferred is not None
+        else list(_PROOF_LEGACY_LOCATORS.values())
+    )
+    for column in candidates:
+        # A failed probe on a locking backend (e.g. PostgreSQL) aborts the
+        # surrounding transaction, so isolate each attempt in a savepoint:
+        # a locator the driver lacks rolls back only the savepoint and the
+        # migration transaction stays usable.
+        try:
+            with conn.begin_nested():
                 conn.execute(
                     text(
-                        "CREATE UNIQUE INDEX IF NOT EXISTS "
-                        "ix_proof_lifecycle_events_scope_commit_seq "
-                        "ON proof_lifecycle_events "
-                        "(tenant_id, workload_id, commit_seq)"
+                        f"SELECT {column} FROM proof_lifecycle_events LIMIT 1"
                     )
+                ).fetchall()
+        except SQLAlchemyError:
+            continue
+        return column
+    return None
+
+
+def _backfill_proof_commit_sequence(engine) -> None:
+    """Upgrade a database written before proof ``commit_seq`` existed.
+
+    Runs on *every* backend, not just SQLite: a legacy events table missing
+    the column gets it added, each scope's historical events are numbered
+    1..N in their original commit order, the per-scope counter is seeded at
+    that maximum (so the first post-upgrade event allocates N+1 and never
+    collides with a legacy sequence), and the unique per-scope index is
+    created. A fresh database already has all four, which makes this a
+    no-op; running it again is idempotent.
+    """
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
+    if "proof_lifecycle_events" not in table_names:
+        # Nothing to upgrade (a fresh deployment builds the full schema via
+        # metadata, sequenced column included).
+        return
+
+    column_names = {
+        column["name"]
+        for column in inspector.get_columns("proof_lifecycle_events")
+    }
+    if "commit_seq" not in column_names:
+        # Standard ADD COLUMN (nullable, no default) is supported on every
+        # target backend; existing rows read back as NULL and are numbered
+        # below. The type is compiled for the actual dialect rather than
+        # hard-coded, so this stays portable.
+        column_type = BigInteger().compile(dialect=engine.dialect)
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "ALTER TABLE proof_lifecycle_events "
+                    f"ADD COLUMN commit_seq {column_type}"
                 )
+            )
+
+    events = ProofLifecycleEvent.__table__
+    counters = ProofEventCommitCounter.__table__
+
+    with engine.begin() as conn:
+        # Resolve the physical commit-order locator against this live
+        # driver before reading the legacy rows.
+        locator = _probe_proof_legacy_locator(conn)
+        if locator is not None:
+            order_columns = [literal_column(locator)]
+        else:
+            # Backend without an exposed physical locator: the immutable
+            # business key is a deterministic substitute (event_id is
+            # unique, so even identical business timestamps cannot tie).
+            order_columns = [
+                ProofLifecycleEvent.occurred_at.asc(),
+                ProofLifecycleEvent.event_id.asc(),
+            ]
+
+        # Number only the unsequenced legacy rows. Rows written after the
+        # feature shipped already carry sequences allocated in commit order;
+        # begin each scope's legacy numbering just beyond its existing
+        # maximum so the two ranges never collide.
+        base_rows = conn.execute(
+            select(
+                ProofLifecycleEvent.tenant_id,
+                ProofLifecycleEvent.workload_id,
+                func.max(ProofLifecycleEvent.commit_seq),
+            ).group_by(
+                ProofLifecycleEvent.tenant_id,
+                ProofLifecycleEvent.workload_id,
+            )
+        ).fetchall()
+        next_seq = {
+            (tenant_id, workload_id): (maximum or 0)
+            for tenant_id, workload_id, maximum in base_rows
+        }
+
+        legacy_rows = conn.execute(
+            select(
+                ProofLifecycleEvent.event_id,
+                ProofLifecycleEvent.tenant_id,
+                ProofLifecycleEvent.workload_id,
+            )
+            .where(ProofLifecycleEvent.commit_seq.is_(None))
+            .order_by(
+                ProofLifecycleEvent.tenant_id.asc(),
+                ProofLifecycleEvent.workload_id.asc(),
+                *order_columns,
+            )
+        ).fetchall()
+
+        updates: list[dict[str, object]] = []
+        for event_id, tenant_id, workload_id in legacy_rows:
+            current = next_seq[(tenant_id, workload_id)] + 1
+            next_seq[(tenant_id, workload_id)] = current
+            updates.append({"event_id": event_id, "commit_seq": current})
+        if updates:
+            conn.execute(
+                text(
+                    "UPDATE proof_lifecycle_events "
+                    "SET commit_seq = :commit_seq "
+                    "WHERE event_id = :event_id"
+                ),
+                updates,
+            )
+
+    # The counter is a separate table; create_all builds it on fresh
+    # databases but never on an upgraded one, so ensure it exists before
+    # seeding. checkfirst makes this a no-op when present.
+    counters.create(bind=engine, checkfirst=True)
+
+    with engine.begin() as conn:
+        existing = {
+            (tenant_id, workload_id)
+            for tenant_id, workload_id in conn.execute(
+                select(
+                    ProofEventCommitCounter.tenant_id,
+                    ProofEventCommitCounter.workload_id,
+                )
+            ).fetchall()
+        }
+        maximums = conn.execute(
+            select(
+                ProofLifecycleEvent.tenant_id,
+                ProofLifecycleEvent.workload_id,
+                func.max(ProofLifecycleEvent.commit_seq),
+            ).group_by(
+                ProofLifecycleEvent.tenant_id,
+                ProofLifecycleEvent.workload_id,
+            )
+        ).fetchall()
+        seeds = [
+            {
+                "tenant_id": tenant_id,
+                "workload_id": workload_id,
+                "last_seq": maximum,
+            }
+            for tenant_id, workload_id, maximum in maximums
+            if maximum is not None and (tenant_id, workload_id) not in existing
+        ]
+        if seeds:
+            conn.execute(counters.insert(), seeds)
+
+    # Unique per-scope ordering index backing the snapshot cutoff. The
+    # index is already declared on the events table's metadata, but a
+    # pre-existing table is skipped wholesale by create_all, so create
+    # that same metadata object explicitly (checkfirst introspection makes
+    # this a no-op on a fresh database, and it is idempotent across
+    # re-opens). Constructing a *new* Index on these columns would attach a
+    # duplicate to the shared metadata and break later create_all calls, so
+    # the declared object is reused. It is built only after the backfill,
+    # when no NULL/duplicate sequences remain.
+    commit_index = next(
+        index
+        for index in events.indexes
+        if index.name == "ix_proof_lifecycle_events_scope_commit_seq"
+    )
+    commit_index.create(bind=engine, checkfirst=True)
+
+
+def _migrate_additive(engine) -> None:
+    """Apply forward-only additive upgrades to pre-existing databases.
+
+    The column additions patch only SQLite files written by older builds —
+    non-sqlite deployments are created from metadata. The proof-lifecycle
+    commit-sequence upgrade, however, must run on *every* backend: a
+    non-sqlite database written before the sequence existed otherwise keeps
+    NULL sequences and no seeded counter, breaking the fixed snapshot's
+    commit-boundary cutoff.
+    """
+    if engine.dialect.name == "sqlite":
+        _migrate_additive_sqlite(engine)
+    _backfill_proof_commit_sequence(engine)
 
 
 def create_app(

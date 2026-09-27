@@ -948,9 +948,10 @@ class ProofLifecycleEvent(Base):
     sequence and a later commit always takes the greater one, even when
     its business time is older or identical; the audit query bounds its
     replayable snapshot by this marker, never by write timing or equal
-    timestamps. Rows written by older deployments are backfilled
-    (SQLite) and fresh deployments always populate it; it is nullable
-    only for such legacy rows.
+    timestamps. Rows written by older deployments are backfilled on open
+    on every backend (numbered per scope in historical commit order, with
+    the per-scope counter seeded at that maximum); fresh deployments
+    always populate it, and it is nullable only for such legacy rows.
     """
 
     __tablename__ = "proof_lifecycle_events"
@@ -998,8 +999,9 @@ class ProofLifecycleEvent(Base):
     evidence_id: Mapped[str] = mapped_column(String(36), index=True)
     # Gap-free per-scope sequence allocated in the event's own transaction,
     # strictly increasing in business commit order on every backend. NULL
-    # only on rows written before the column existed (backfilled on
-    # SQLite); every new event carries a positive value.
+    # only on rows written before the column existed, which the open-time
+    # migration numbers on every backend; every new event carries a
+    # positive value.
     commit_seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Set for proof-decision events (the version decided against); NULL
     # for reception and verification events.

@@ -1186,3 +1186,242 @@ def test_legacy_sqlite_database_backfills_commit_sequence(tmp_path, monkeypatch)
             assert indexed
     finally:
         application.state.engine.dispose()
+
+
+# --- non-SQLite historical migration --------------------------------------
+#
+# No real PostgreSQL server is available here, so the non-SQLite path is
+# exercised by running the migration against a real legacy SQLite file
+# through an engine whose dialect *reports* a non-sqlite name while still
+# driving the same live DBAPI connection. That proves the upgrade is no
+# longer gated on the SQLite dialect (the pre-fix defect), and the
+# capability-based locator probe independently selects a physical column
+# the live driver actually exposes.
+
+
+def _build_legacy_database(path) -> str:
+    # Write a database with the pre-commit_seq schema and three legacy
+    # events: scope tA holds two events whose commit (insert) order differs
+    # from their business-time order, and scope tB holds one.
+    from sqlalchemy import create_engine, text
+
+    from proof_release.db import Base
+
+    url = f"sqlite:///{path}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(
+            text("DROP INDEX ix_proof_lifecycle_events_scope_commit_seq")
+        )
+        conn.execute(
+            text("ALTER TABLE proof_lifecycle_events DROP COLUMN commit_seq")
+        )
+        conn.execute(text("DROP TABLE proof_event_commit_counters"))
+        conn.execute(
+            text(
+                """
+                INSERT INTO proof_lifecycle_events
+                (event_id, tenant_id, workload_id, event_type, evidence_id,
+                 policy_version, evidence_format, status, occurred_at)
+                VALUES
+                ('11111111-1111-4111-8111-111111111111','tA','w1',
+                 'proof-received','11111111-1111-4111-8111-111111111111',
+                 NULL,'f','received','2026-01-01T00:00:03+00:00'),
+                ('22222222-2222-4222-8222-222222222222','tA','w1',
+                 'proof-verified','11111111-1111-4111-8111-111111111111',
+                 NULL,NULL,'verified','2026-01-01T00:00:01+00:00'),
+                ('33333333-3333-4333-8333-333333333333','tB','w9',
+                 'proof-received','33333333-3333-4333-8333-333333333333',
+                 NULL,'f','received','2026-01-01T00:00:02+00:00')
+                """
+            )
+        )
+    engine.dispose()
+    return url
+
+
+def _non_sqlite_engine(url):
+    # An engine that drives the legacy file but presents itself to the
+    # migration as a non-sqlite backend.
+    from sqlalchemy import create_engine
+
+    engine = create_engine(url)
+    engine.dialect.name = "postgresql"
+    return engine
+
+
+def test_non_sqlite_database_backfills_commit_sequence(tmp_path):
+    from sqlalchemy import text
+
+    from proof_release.app import _migrate_additive
+
+    url = _build_legacy_database(tmp_path / "legacy.db")
+    engine = _non_sqlite_engine(url)
+    assert engine.dialect.name == "postgresql"
+    try:
+        # Before the fix this was a no-op on non-sqlite dialects, leaving
+        # NULL sequences and no counter table.
+        _migrate_additive(engine)
+
+        with engine.begin() as conn:
+            backfilled = dict(
+                conn.execute(
+                    text("SELECT event_id, commit_seq FROM proof_lifecycle_events")
+                ).fetchall()
+            )
+            # Commit (physical insert) order within tA is preserved even
+            # though the second row's business time is older; the other
+            # scope restarts at 1.
+            assert backfilled["11111111-1111-4111-8111-111111111111"] == 1
+            assert backfilled["22222222-2222-4222-8222-222222222222"] == 2
+            assert backfilled["33333333-3333-4333-8333-333333333333"] == 1
+
+            counters = {
+                tenant: last
+                for tenant, _workload, last in conn.execute(
+                    text(
+                        "SELECT tenant_id, workload_id, last_seq "
+                        "FROM proof_event_commit_counters"
+                    )
+                ).fetchall()
+            }
+            assert counters == {"tA": 2, "tB": 1}
+
+            indexed = conn.execute(
+                text(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+                    "AND name = "
+                    "'ix_proof_lifecycle_events_scope_commit_seq'"
+                )
+            ).fetchall()
+            assert indexed
+            nulls = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM proof_lifecycle_events "
+                    "WHERE commit_seq IS NULL"
+                )
+            ).scalar()
+            assert nulls == 0
+    finally:
+        engine.dispose()
+
+
+def test_non_sqlite_backfill_is_idempotent_and_continues_gap_free(tmp_path):
+    from sqlalchemy import text
+
+    from proof_release.app import (
+        _migrate_additive,
+        _next_proof_event_commit_seq,
+    )
+
+    url = _build_legacy_database(tmp_path / "legacy.db")
+    engine = _non_sqlite_engine(url)
+    try:
+        _migrate_additive(engine)
+        # A second open over an already-upgraded database changes nothing.
+        _migrate_additive(engine)
+
+        with engine.begin() as conn:
+            backfilled = dict(
+                conn.execute(
+                    text("SELECT event_id, commit_seq FROM proof_lifecycle_events")
+                ).fetchall()
+            )
+            assert backfilled["11111111-1111-4111-8111-111111111111"] == 1
+            assert backfilled["22222222-2222-4222-8222-222222222222"] == 2
+
+        # The first event written after the upgrade allocates N+1 from the
+        # seeded counter rather than colliding with a legacy sequence.
+        from sqlalchemy.orm import sessionmaker
+
+        session_factory = sessionmaker(bind=engine)
+        with session_factory() as session:
+            next_seq = _next_proof_event_commit_seq(session, "tA", "w1")
+            assert next_seq == 3
+            other_scope = _next_proof_event_commit_seq(session, "tC", "w1")
+            assert other_scope == 1
+            session.rollback()
+    finally:
+        engine.dispose()
+
+
+def test_non_sqlite_backfill_locator_probe_falls_back_to_business_key(
+    tmp_path, monkeypatch
+):
+    from sqlalchemy import text
+
+    from proof_release import app as app_module
+    from proof_release.app import _migrate_additive
+
+    url = _build_legacy_database(tmp_path / "legacy.db")
+    engine = _non_sqlite_engine(url)
+    # Simulate a backend that exposes neither rowid nor ctid: the
+    # deterministic (occurred_at, event_id) business key must drive the
+    # numbering without depending on any dialect-specific marker.
+    monkeypatch.setattr(
+        app_module, "_probe_proof_legacy_locator", lambda conn: None
+    )
+    try:
+        _migrate_additive(engine)
+        with engine.begin() as conn:
+            backfilled = dict(
+                conn.execute(
+                    text("SELECT event_id, commit_seq FROM proof_lifecycle_events")
+                ).fetchall()
+            )
+            # tA's rows are now numbered in business-time order: the
+            # 00:00:01 verification precedes the 00:00:03 reception.
+            assert backfilled["22222222-2222-4222-8222-222222222222"] == 1
+            assert backfilled["11111111-1111-4111-8111-111111111111"] == 2
+            assert backfilled["33333333-3333-4333-8333-333333333333"] == 1
+    finally:
+        engine.dispose()
+
+
+def test_non_sqlite_migrated_events_serve_through_the_audit_query(tmp_path):
+    # End-to-end: a legacy database upgraded through the non-sqlite path
+    # is then opened normally; the audit query lists the backfilled events
+    # in stable business-time order and a later commit starts at N+1.
+    from sqlalchemy import text
+
+    url = _build_legacy_database(tmp_path / "legacy.db")
+    engine = _non_sqlite_engine(url)
+    try:
+        app_module._migrate_additive(engine)
+    finally:
+        engine.dispose()
+
+    application = create_app(url)
+    try:
+        client = TestClient(application)
+        response = client.get(
+            "/v1/compliance/proof-events",
+            params={"tenant_id": "tA", "workload_id": "w1"},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert [event["event_id"] for event in body["events"]] == [
+            "22222222-2222-4222-8222-222222222222",
+            "11111111-1111-4111-8111-111111111111",
+        ]
+        assert body["complete"] is True
+        assert body["next_cursor"] == ""
+
+        # A new event in tA continues the gap-free sequence past the
+        # backfilled maximum; the other scope is untouched.
+        with application.state.session_factory() as session:
+            seq = app_module._next_proof_event_commit_seq(session, "tA", "w1")
+            assert seq == 3
+            session.rollback()
+            counters = dict(
+                session.execute(
+                    text(
+                        "SELECT tenant_id, last_seq "
+                        "FROM proof_event_commit_counters"
+                    )
+                ).fetchall()
+            )
+            assert counters == {"tA": 2, "tB": 1}
+    finally:
+        application.state.engine.dispose()
