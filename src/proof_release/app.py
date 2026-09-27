@@ -31,6 +31,9 @@ from sqlalchemy import (
     delete,
     event,
     func,
+    inspect,
+    insert,
+    literal_column,
     or_,
     select,
     text,
@@ -2072,7 +2075,13 @@ class ResumeRewrapJobRequest(BaseModel):
 def _migrate_additive(engine) -> None:
     """Apply forward-only additive column additions to pre-existing databases."""
     if engine.dialect.name != "sqlite":
-        # Non-sqlite deployments are created from metadata; nothing to add.
+        # Locking backends are created from metadata, so the other
+        # historical column additions never apply there. The proof
+        # lifecycle commit sequence is different: it shipped after the
+        # proof timeline, so a database written by an older deployment
+        # lacks the column, the per-scope counters are unseeded and the
+        # unique index is missing. Upgrade it dialect-neutrally.
+        _migrate_proof_event_commit_sequence(engine)
         return
     additions = {
         "evidence": (
@@ -2154,67 +2163,178 @@ def _migrate_additive(engine) -> None:
                 )
 
     # The proof-lifecycle commit sequence is added to pre-existing
-    # databases above; create_all ran before this migration and does not
-    # alter an existing table, so neither the column values nor its unique
-    # index exist yet on such a database. Backfill each scope's events
-    # 1..N in rowid order — rowid is SQLite's serialized commit order — so
-    # the new marker preserves the exact historical commit ordering the
-    # fixed snapshot relies on, then create the unique index. A fresh
-    # database already has both (and IF NOT EXISTS / no NULL rows make
-    # this a no-op there).
-    if engine.dialect.name == "sqlite":
-        with engine.begin() as conn:
-            tables = {
-                row[0]
-                for row in conn.execute(
-                    text(
-                        "SELECT name FROM sqlite_master "
-                        "WHERE type = 'table' AND name = 'proof_lifecycle_events'"
-                    )
-                ).fetchall()
-            }
-            if "proof_lifecycle_events" in tables:
-                columns = {
-                    row[1]
-                    for row in conn.execute(
-                        text("PRAGMA table_info(proof_lifecycle_events)")
-                    ).fetchall()
-                }
-                if "commit_seq" in columns:
-                    conn.execute(
-                        text(
-                            "UPDATE proof_lifecycle_events "
-                            "SET commit_seq = ("
-                            "SELECT COUNT(*) FROM proof_lifecycle_events AS prior "
-                            "WHERE prior.tenant_id = proof_lifecycle_events.tenant_id "
-                            "AND prior.workload_id = proof_lifecycle_events.workload_id "
-                            "AND prior.rowid <= proof_lifecycle_events.rowid"
-                            ") "
-                            "WHERE commit_seq IS NULL"
-                        )
-                    )
-                    # Seed each scope's commit counter at its backfilled
-                    # maximum so the first event written after the upgrade
-                    # allocates N+1 rather than colliding with a legacy
-                    # row's sequence. OR IGNORE keeps a counter created by
-                    # a concurrently upgraded writer intact.
-                    conn.execute(
-                        text(
-                            "INSERT OR IGNORE INTO proof_event_commit_counters "
-                            "(tenant_id, workload_id, last_seq) "
-                            "SELECT tenant_id, workload_id, MAX(commit_seq) "
-                            "FROM proof_lifecycle_events "
-                            "GROUP BY tenant_id, workload_id"
-                        )
-                    )
+    # databases above; the same dialect-neutral upgrade (column,
+    # per-scope backfill, seeded counter, unique index) runs for every
+    # backend. A fresh database already has all three and the upgrade is
+    # a no-op there.
+    _migrate_proof_event_commit_sequence(engine)
+
+
+def _migrate_proof_event_commit_sequence(engine) -> None:
+    """Bring a deployment written before ``commit_seq`` up to date.
+
+    The proof-lifecycle audit fixes its replayable snapshot to the
+    business commit boundary through a per-scope, gap-free, strictly
+    increasing ``commit_seq`` allocated in each event's own write
+    transaction. Databases written before the sequence existed must be
+    upgraded on open *on every backend*, not only SQLite:
+
+    * the nullable ``commit_seq`` column is added when missing (SQLite's
+      ALTER comes from the additive table map above; locking backends get
+      it here);
+    * legacy rows are backfilled per scope in a stable order — SQLite's
+      ``rowid`` (its serialized insert order) or the audit listing key
+      ``(occurred_at, event_id)`` numbered client-side on every other
+      dialect — so each scope gets a gap-free 1..N run even when business
+      times are inverted or identical;
+    * each scope's :class:`ProofEventCommitCounter` is seeded at its
+      backfilled maximum (only when absent) so the first event written
+      after the upgrade allocates N+1 rather than colliding;
+    * the unique ``(tenant_id, workload_id, commit_seq)`` index is
+      created last, once no NULL remains, so two concurrent allocations
+      can never mint the same sequence.
+
+    The whole upgrade is one transaction and changes no business field,
+    response shape or secret-handling rule. A database created by the
+    current metadata already has the column, counters and index, so each
+    step short-circuits.
+    """
+    is_sqlite = engine.dialect.name == "sqlite"
+    events_tbl = ProofLifecycleEvent.__table__
+    counters_tbl = ProofEventCommitCounter.__table__
+
+    # A table created by a pre-proof-timeline deployment need not exist at
+    # all yet; create_all has just run on the current metadata, so on such
+    # a database the table (with every column and index) now exists empty
+    # and nothing below has work to do.
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        if events_tbl.name not in inspector.get_table_names():
+            return
+        column_names = {col["name"] for col in inspector.get_columns(events_tbl.name)}
+        if "commit_seq" not in column_names:
+            if is_sqlite:
                 conn.execute(
                     text(
-                        "CREATE UNIQUE INDEX IF NOT EXISTS "
-                        "ix_proof_lifecycle_events_scope_commit_seq "
-                        "ON proof_lifecycle_events "
-                        "(tenant_id, workload_id, commit_seq)"
+                        f"ALTER TABLE {events_tbl.name} ADD COLUMN commit_seq BIGINT"
                     )
                 )
+            else:
+                # Locking backend carrying a pre-sequence table: add the
+                # column nullable (legacy rows are populated below before
+                # the unique index is built).
+                conn.execute(
+                    text(
+                        f"ALTER TABLE {events_tbl.name} "
+                        f"ADD COLUMN commit_seq BIGINT NULL"
+                    )
+                )
+
+        # Backfill only legacy rows (never touch an already-sequenced row).
+        if is_sqlite:
+            # rowid is SQLite's serialized insert/commit order; the
+            # correlated COUNT assigns 1..N per scope in that order.
+            conn.execute(
+                text(
+                    f"UPDATE {events_tbl.name} "
+                    "SET commit_seq = ("
+                    "SELECT COUNT(*) FROM proof_lifecycle_events AS prior "
+                    "WHERE prior.tenant_id = proof_lifecycle_events.tenant_id "
+                    "AND prior.workload_id = proof_lifecycle_events.workload_id "
+                    "AND prior.rowid <= proof_lifecycle_events.rowid"
+                    ") "
+                    "WHERE commit_seq IS NULL"
+                )
+            )
+        else:
+            # Historical commit order on a backend with no rowid: the
+            # pre-sequence deployment carried no monotonic commit marker
+            # (the primary key is a UUID v4 minted in the event's own
+            # transaction, whose lexical order is not commit order).
+            # Number legacy rows in Python by the audit's own stable
+            # listing key — per scope, (occurred_at, event_id) ascending —
+            # and write each row's one-based position by primary key.
+            # Doing it client-side rather than with a correlated
+            # self-update keeps the upgrade identical across locking
+            # dialects (several reject or mis-merge a self-referencing
+            # UPDATE). The exact historical tie-break is immaterial to
+            # snapshot correctness: every legacy row committed before the
+            # upgrade and is therefore inside every fresh first query
+            # regardless of its position relative to other legacy rows.
+            legacy_rows = conn.execute(
+                select(
+                    events_tbl.c.event_id,
+                    events_tbl.c.tenant_id,
+                    events_tbl.c.workload_id,
+                )
+                .where(events_tbl.c.commit_seq.is_(None))
+                .order_by(
+                    events_tbl.c.tenant_id,
+                    events_tbl.c.workload_id,
+                    events_tbl.c.occurred_at,
+                    events_tbl.c.event_id,
+                )
+            ).fetchall()
+            per_scope: dict[tuple[str, str], int] = {}
+            for event_id, tenant_id, workload_id in legacy_rows:
+                seq = per_scope.get((tenant_id, workload_id), 0) + 1
+                per_scope[(tenant_id, workload_id)] = seq
+                conn.execute(
+                    events_tbl.update()
+                    .where(
+                        events_tbl.c.event_id == event_id,
+                        events_tbl.c.commit_seq.is_(None),
+                    )
+                    .values(commit_seq=seq)
+                )
+
+        # Seed a per-scope counter at the existing maximum, but never
+        # overwrite a counter that is already present (a concurrent
+        # upgrader or a scope already writing events). The
+        # (tenant_id, workload_id) primary key makes the anti-duplicate
+        # portable across dialects.
+        conn.execute(
+            insert(counters_tbl)
+            .from_select(
+                ["tenant_id", "workload_id", "last_seq"],
+                select(
+                    events_tbl.c.tenant_id,
+                    events_tbl.c.workload_id,
+                    func.max(events_tbl.c.commit_seq),
+                )
+                .where(events_tbl.c.commit_seq.is_not(None))
+                .group_by(
+                    events_tbl.c.tenant_id, events_tbl.c.workload_id
+                )
+                .where(
+                    ~select(literal_column("1"))
+                    .select_from(counters_tbl.alias("existing_counter"))
+                    .where(
+                        literal_column("existing_counter.tenant_id")
+                        == events_tbl.c.tenant_id,
+                        literal_column("existing_counter.workload_id")
+                        == events_tbl.c.workload_id,
+                    )
+                    .exists()
+                ),
+            )
+        )
+
+        # Build the unique ordering index last, once every row is
+        # sequenced. Reuse the index object already declared on the
+        # model's table (never construct a second Index bound to the same
+        # columns — that would register a duplicate on the shared
+        # metadata and make every later create_all attempt the index
+        # twice); checkfirst makes creation a no-op on current-metadata
+        # databases and every other dialect portably.
+        index_names = {idx["name"] for idx in inspector.get_indexes(events_tbl.name)}
+        if "ix_proof_lifecycle_events_scope_commit_seq" not in index_names:
+            model_index = next(
+                idx
+                for idx in events_tbl.indexes
+                if idx.name == "ix_proof_lifecycle_events_scope_commit_seq"
+            )
+            model_index.create(conn, checkfirst=True)
 
 
 def create_app(
