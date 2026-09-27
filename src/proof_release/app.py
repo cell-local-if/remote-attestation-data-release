@@ -80,6 +80,7 @@ from proof_release.db import (
     POLICY_STATUS_RETIRED,
     TRUST_ROOT_STATUS_ACTIVE,
     TRUST_ROOT_STATUS_RETIRED,
+    TRUST_ROOT_STATUS_CODES,
     AUDIT_EVENT_STATUS_CONSUMED,
     AUDIT_EVENT_STATUS_PENDING,
     AUDIT_EVENT_STATUS_REVOKED,
@@ -118,6 +119,7 @@ from proof_release.db import (
     RewrapJobEvent,
     RewrapJobIdempotencyRecord,
     TrustRoot,
+    TrustRootCommitCounter,
     WorkloadIdentityClaim,
     WorkloadIdentityProfile,
 )
@@ -332,6 +334,22 @@ def _next_decision_commit_seq(session, tenant_id: str, workload_id: str) -> int:
     """Allocate the next per-scope decision commit sequence."""
     return _next_scoped_commit_seq(
         session, tenant_id, workload_id, DecisionCommitCounter
+    )
+
+
+def _next_trust_root_commit_seq(session, tenant_id: str, workload_id: str) -> int:
+    """Allocate the next per-scope trust-root lifecycle sequence.
+
+    Both creation (``TrustRoot.commit_seq``) and the terminal retirement
+    (``TrustRoot.retired_seq``) draw from this one shared counter inside
+    their own transactions, so the counter's last value is the scope's
+    total commit high-water mark: the read-only lifecycle query fixes its
+    replayable snapshot at that value and reconstructs each root's status
+    as-of the snapshot from ``retired_seq``, isolating a replayed page
+    from both later creations and later retirements.
+    """
+    return _next_scoped_commit_seq(
+        session, tenant_id, workload_id, TrustRootCommitCounter
     )
 
 
@@ -1719,6 +1737,169 @@ def _decode_decision_cursor(
     return boundary_at, boundary_decision, snapshot_seq
 
 
+def _trust_root_cursor_payload(
+    tenant_id: str,
+    workload_id: str,
+    boundary_at: str,
+    boundary_root: str,
+    *,
+    root_id: str,
+    name: str,
+    status: str,
+    created_after: str,
+    created_before: str,
+    snapshot_seq: int,
+) -> bytes:
+    """Canonical byte payload authenticated inside a trust-root cursor.
+
+    The cursor marks an exclusive ``(created_at, root_id)`` position and
+    every active filter plus the fixed replayable snapshot are part of the
+    signed payload, so a cursor minted for one filter set or snapshot
+    cannot be replayed against another. The snapshot membership cutoff is
+    the per-scope trust-root lifecycle ``commit_seq`` high-water mark
+    (``q``): the business commit boundary established by the first query,
+    shared by creation and retirement. The kind tag distinguishes these
+    cursors from every other cursor family even though all share the same
+    HMAC secret.
+    """
+    return json.dumps(
+        {
+            "k": _TRUST_ROOT_CURSOR_KIND,
+            "t": tenant_id,
+            "w": workload_id,
+            "at": boundary_at,
+            "id": boundary_root,
+            "ri": root_id,
+            "nm": name,
+            "s": status,
+            "a": created_after,
+            "b": created_before,
+            "q": snapshot_seq,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _encode_trust_root_cursor(
+    tenant_id: str,
+    workload_id: str,
+    boundary_at: str,
+    boundary_root: str,
+    *,
+    root_id: str,
+    name: str,
+    status: str,
+    created_after: str,
+    created_before: str,
+    snapshot_seq: int,
+) -> str:
+    """Build an opaque, scope/filter/snapshot-bound exclusive trust-root cursor."""
+    payload = _trust_root_cursor_payload(
+        tenant_id,
+        workload_id,
+        boundary_at,
+        boundary_root,
+        root_id=root_id,
+        name=name,
+        status=status,
+        created_after=created_after,
+        created_before=created_before,
+        snapshot_seq=snapshot_seq,
+    )
+    mac = hmac.new(_cursor_secret(), payload, hashlib.sha256).digest()
+    return b64url_encode(payload + mac)
+
+
+def _decode_trust_root_cursor(
+    token: str,
+    tenant_id: str,
+    workload_id: str,
+    *,
+    root_id: str,
+    name: str,
+    status: str,
+    created_after: str,
+    created_before: str,
+) -> tuple[str, str, int] | None:
+    """Validate a trust-root cursor and return its exclusive boundary.
+
+    Returns ``(created_at, root_id, snapshot_seq)`` on success or ``None``
+    for a malformed/forged token, a cursor of any other kind (rewrap
+    batch, grant audit, compliance audit events, proof-lifecycle events,
+    decisions, revocations or rewrap job listings), or one minted for any
+    other scope, filter combination or snapshot. The beginning marker
+    (``""``) never reaches this function.
+    """
+    if not _CURSOR_RE.fullmatch(token):
+        return None
+    try:
+        raw = b64url_decode(token)
+    except ValueError:
+        return None
+    # The MAC is a fixed 32-byte suffix; the JSON payload precedes it.
+    if len(raw) <= 32:
+        return None
+    payload, mac = raw[:-32], raw[-32:]
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    if decoded.get("k") != _TRUST_ROOT_CURSOR_KIND:
+        return None
+    boundary_at = decoded.get("at")
+    boundary_root = decoded.get("id")
+    if not isinstance(boundary_at, str) or boundary_at == "":
+        return None
+    if not isinstance(boundary_root, str) or not _UUID_RE.fullmatch(boundary_root):
+        return None
+    # The commit-order membership cutoff carried by a resume cursor. A
+    # resume cursor always names the positive per-scope lifecycle sequence
+    # high-water mark established by the first query (bools are rejected
+    # as ints).
+    snapshot_seq = decoded.get("q")
+    if not isinstance(snapshot_seq, int) or isinstance(snapshot_seq, bool):
+        return None
+    if snapshot_seq < 1:
+        return None
+    expected_mac = hmac.new(
+        _cursor_secret(),
+        _trust_root_cursor_payload(
+            tenant_id,
+            workload_id,
+            boundary_at,
+            boundary_root,
+            root_id=root_id,
+            name=name,
+            status=status,
+            created_after=created_after,
+            created_before=created_before,
+            snapshot_seq=snapshot_seq,
+        ),
+        hashlib.sha256,
+    ).digest()
+    if not hmac.compare_digest(mac, expected_mac):
+        return None
+    # Defense in depth: the MAC already covers every field, but confirm
+    # the scope and each active filter explicitly.
+    if not hmac.compare_digest(str(decoded.get("t", "")), tenant_id):
+        return None
+    if not hmac.compare_digest(str(decoded.get("w", "")), workload_id):
+        return None
+    for key, expected in (
+        ("ri", root_id),
+        ("nm", name),
+        ("s", status),
+        ("a", created_after),
+        ("b", created_before),
+    ):
+        if not hmac.compare_digest(str(decoded.get(key, "")), expected):
+            return None
+    return boundary_at, boundary_root, snapshot_seq
+
+
 #: Fixed page size for the read-only compliance audit-event listing. As
 #: with the grant audit, the page size is an internal constant and never
 #: part of the request or response contract.
@@ -1785,6 +1966,18 @@ DECISION_PAGE_SIZE = 100
 #: authenticated with the same secret) can never be replayed against the
 #: decision listing, and vice versa.
 _DECISION_CURSOR_KIND = "compliance-decisions-v1"
+
+#: Fixed page size for the read-only trust-root lifecycle listing. As with
+#: the other read-only listings, the page size is an internal constant and
+#: never part of the request or response contract.
+TRUST_ROOT_PAGE_SIZE = 100
+
+#: Discriminator embedded in trust-root lifecycle cursors so a cursor from
+#: any other family (rewrap batch, release-grant audit, compliance audit
+#: events, proof-lifecycle events, decisions, revocations or rewrap job
+#: listings — all authenticated with the same secret) can never be replayed
+#: against the trust-root listing, and vice versa.
+_TRUST_ROOT_CURSOR_KIND = "trust-roots-v1"
 
 
 class CreateChallengeRequest(BaseModel):
@@ -2305,6 +2498,10 @@ def _migrate_additive(engine) -> None:
         # The compliance decision sequence and denormalized scope columns
         # likewise shipped after the decision table first existed.
         _migrate_decision_commit_sequence(engine)
+        # The trust-root lifecycle query gained the per-scope commit-order
+        # marker (shared by creation and retirement) after creation and
+        # retirement first shipped.
+        _migrate_trust_root_commit_sequence(engine)
         return
     additions = {
         "evidence": (
@@ -2317,6 +2514,11 @@ def _migrate_additive(engine) -> None:
         "trust_roots": (
             ("status", "VARCHAR(16)"),
             ("retired_at", "DATETIME"),
+            # Per-scope lifecycle sequence shared by creation and the
+            # terminal retirement; pre-existing rows are backfilled below
+            # in rowid (commit) order.
+            ("commit_seq", "BIGINT"),
+            ("retired_seq", "BIGINT"),
         ),
         "policies": (
             ("status", "VARCHAR(16)"),
@@ -2421,6 +2623,10 @@ def _migrate_additive(engine) -> None:
     # marker together with denormalized scope columns; legacy databases
     # are upgraded identically on every backend.
     _migrate_decision_commit_sequence(engine)
+    # The trust-root lifecycle query gained the per-scope sequence shared
+    # by creation and retirement; legacy databases (columns added above on
+    # SQLite) are completed identically on every backend.
+    _migrate_trust_root_commit_sequence(engine)
 
 
 def _migrate_proof_event_commit_sequence(engine) -> None:
@@ -2775,6 +2981,165 @@ def _migrate_decision_commit_sequence(engine) -> None:
                     idx for idx in decisions_tbl.indexes if idx.name == index_name
                 )
                 model_index.create(conn, checkfirst=True)
+
+
+def _migrate_trust_root_commit_sequence(engine) -> None:
+    """Bring a deployment written before the trust-root sequence up to date.
+
+    The read-only trust-root lifecycle query fixes its replayable snapshot
+    through a per-scope, gap-free, strictly increasing lifecycle sequence
+    drawn from one counter by *both* creation (``commit_seq``) and the
+    terminal retirement (``retired_seq``). The original trust-root table
+    carried neither marker, so databases written by older deployments are
+    upgraded on open on every backend:
+
+    * the nullable ``commit_seq``/``retired_seq`` columns are added when
+      missing (SQLite's ALTER comes from the additive table map; locking
+      backends get them here);
+    * legacy rows are numbered per scope client-side in the listing key
+      order — each root's creation 1..N by ``(created_at, root_id)``, then
+      each retired root's retirement N+1..N+R by ``(retired_at, root_id)``
+      — so every sequence is gap-free, unique and strictly after the
+      root's own creation, and an active legacy row keeps
+      ``retired_seq NULL``;
+    * each scope's :class:`TrustRootCommitCounter` is seeded at the
+      backfilled maximum N+R (only when absent) so the next creation or
+      retirement allocates N+R+1 rather than colliding;
+    * the unique ``(tenant_id, workload_id, commit_seq)`` index and the
+      scoped listing index are (re)created checkfirst.
+
+    No snapshot spanning the upgrade could ever have existed (no cursors
+    predate this change), so the exact relative order of legacy creations
+    and retirements is immaterial: every legacy commit predates the
+    upgrade and lies inside every fresh first query, where every legacy
+    retired root correctly reconstructs as retired (its retired_seq is at
+    or below the seeded maximum) and every legacy active root as active.
+    The upgrade changes no business field, response shape or
+    secret-handling rule; a current-metadata database short-circuits.
+    """
+    is_sqlite = engine.dialect.name == "sqlite"
+    roots_tbl = TrustRoot.__table__
+    counters_tbl = TrustRootCommitCounter.__table__
+
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        if roots_tbl.name not in inspector.get_table_names():
+            return
+        column_names = {col["name"] for col in inspector.get_columns(roots_tbl.name)}
+        if not is_sqlite:
+            for column, column_type in (
+                ("commit_seq", "BIGINT NULL"),
+                ("retired_seq", "BIGINT NULL"),
+            ):
+                if column not in column_names:
+                    conn.execute(
+                        text(
+                            f"ALTER TABLE {roots_tbl.name} "
+                            f"ADD COLUMN {column} {column_type}"
+                        )
+                    )
+
+        # Number legacy rows in Python, identically on every backend.
+        # Rows that already carry a sequence (an upgrade partially applied
+        # or a current-metadata database) are left untouched.
+        legacy_scopes = conn.execute(
+            select(
+                roots_tbl.c.tenant_id,
+                roots_tbl.c.workload_id,
+            )
+            .where(roots_tbl.c.commit_seq.is_(None))
+            .group_by(roots_tbl.c.tenant_id, roots_tbl.c.workload_id)
+        ).fetchall()
+
+        per_scope_max: dict[tuple[str, str], int] = {}
+        for tenant_id, workload_id in legacy_scopes:
+            # Creation order follows the lifecycle listing key.
+            ordered = conn.execute(
+                select(
+                    roots_tbl.c.root_id,
+                    roots_tbl.c.status,
+                    roots_tbl.c.retired_at,
+                )
+                .where(
+                    roots_tbl.c.tenant_id == tenant_id,
+                    roots_tbl.c.workload_id == workload_id,
+                    roots_tbl.c.commit_seq.is_(None),
+                )
+                .order_by(roots_tbl.c.created_at, roots_tbl.c.root_id)
+            ).fetchall()
+            retired = [
+                (root_id, retired_at)
+                for root_id, status, retired_at in ordered
+                if status == TRUST_ROOT_STATUS_RETIRED
+            ]
+            retired.sort(key=lambda item: (item[1], item[0]))
+            for seq, (root_id, _status, _retired_at) in enumerate(ordered, start=1):
+                conn.execute(
+                    roots_tbl.update()
+                    .where(
+                        roots_tbl.c.root_id == root_id,
+                        roots_tbl.c.commit_seq.is_(None),
+                    )
+                    .values(commit_seq=seq)
+                )
+            n_roots = len(ordered)
+            # Retirements follow every legacy creation in the scope, in
+            # retirement-time order.
+            for offset, (root_id, _retired_at) in enumerate(retired):
+                conn.execute(
+                    roots_tbl.update()
+                    .where(
+                        roots_tbl.c.root_id == root_id,
+                        roots_tbl.c.retired_seq.is_(None),
+                    )
+                    .values(retired_seq=n_roots + offset + 1)
+                )
+            per_scope_max[(tenant_id, workload_id)] = n_roots + len(retired)
+
+        # Seed a per-scope counter at the backfilled maximum, never
+        # overwriting a counter already present.
+        for (tenant_id, workload_id), last_seq in per_scope_max.items():
+            existing = conn.execute(
+                select(func.count())
+                .select_from(counters_tbl)
+                .where(
+                    counters_tbl.c.tenant_id == tenant_id,
+                    counters_tbl.c.workload_id == workload_id,
+                )
+            ).scalar()
+            if not existing:
+                conn.execute(
+                    counters_tbl.insert().values(
+                        tenant_id=tenant_id,
+                        workload_id=workload_id,
+                        last_seq=last_seq,
+                    )
+                )
+
+        # (Re)create the model-declared indexes checkfirst.
+        index_names = {idx["name"] for idx in inspector.get_indexes(roots_tbl.name)}
+        for index_name in (
+            "ix_trust_roots_scope_commit_seq",
+            "ix_trust_roots_scope_created",
+        ):
+            if index_name not in index_names:
+                model_index = next(
+                    idx for idx in roots_tbl.indexes if idx.name == index_name
+                )
+                model_index.create(conn, checkfirst=True)
+
+
+async def _require_empty_query_body(request: Request) -> None:
+    """Reject a read-only query carrying any request body (422).
+
+    Read-only listings are ranged entirely by query parameters, so a body
+    is never meaningful. The body is read directly (rather than trusting
+    Content-Length, which chunked or HTTP/2 clients may omit) and anything
+    non-empty — including whitespace or non-JSON — is rejected before any
+    state is read.
+    """
+    if await request.body() != b"":
+        raise HTTPException(status_code=422, detail="query body must be empty")
 
 
 def create_app(
@@ -4392,6 +4757,15 @@ def create_app(
                 raise HTTPException(
                     status_code=409, detail="trust root already configured"
                 )
+            # Sequence the creation inside its own write transaction. The
+            # same per-scope counter is advanced by retirement, so the
+            # read-only lifecycle query can bound a replayable snapshot by
+            # a commit high-water mark immune to both later inserts and
+            # later in-place retirements. A rolled-back creation returns
+            # the allocation as well.
+            commit_seq = _next_trust_root_commit_seq(
+                session, body.tenant_id, body.workload_id
+            )
             session.add(
                 TrustRoot(
                     root_id=root_id,
@@ -4401,6 +4775,7 @@ def create_app(
                     root_pem=pem,
                     cert_sha256=cert_digest,
                     created_at=now,
+                    commit_seq=commit_seq,
                 )
             )
             try:
@@ -4487,9 +4862,20 @@ def create_app(
                     raise HTTPException(
                         status_code=409, detail="trust root already retired"
                     )
+                # Sequence the retirement from the same per-scope counter
+                # creation draws from, before the guarded flip. The root row
+                # is already locked, so no concurrent transition can
+                # interleave: the lifecycle query reconstructs this root's
+                # as-of-snapshot status by comparing retired_seq against its
+                # fixed high-water mark. The counter row is the only other
+                # lock this path takes and creation never takes the root
+                # lock, so the two lock orders cannot cycle.
+                retired_seq = _next_trust_root_commit_seq(
+                    session, body.tenant_id, body.workload_id
+                )
                 # Atomic settlement: only one caller can flip
-                # active -> retired, and retired_at is written by that
-                # same single-row update.
+                # active -> retired, and retired_at/retired_seq are written
+                # by that same single-row update.
                 outcome = session.execute(
                     update(TrustRoot)
                     .where(
@@ -4499,6 +4885,7 @@ def create_app(
                     .values(
                         status=TRUST_ROOT_STATUS_RETIRED,
                         retired_at=retired_at,
+                        retired_seq=retired_seq,
                     )
                     .execution_options(synchronize_session=False)
                 )
@@ -4554,6 +4941,328 @@ def create_app(
             status_code=200,
             media_type="application/json",
         )
+
+    @app.get("/v1/trust-roots")
+    def list_trust_roots(
+        request: Request,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        root_id: str | None = Query(default=None),
+        name: str | None = Query(default=None),
+        status: str | None = Query(default=None),
+        created_after: str | None = Query(default=None),
+        created_before: str | None = Query(default=None),
+        cursor: str | None = Query(default=None),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return a read-only, cursor-stable page of trust-root registrations.
+
+        The range is fixed by the mandatory tenant and workload and may be
+        narrowed by an explicit registration id (a canonical UUID), an
+        exact name, a lifecycle status (``active``/``retired``) and an
+        inclusive creation-time window. Ordering is stable
+        ``(created_at, root_id)`` ascending with an exclusive keyset
+        cursor. The cursor carries its own kind tag, is HMAC-authenticated
+        and is bound to the scope, every active filter *and* the fixed
+        snapshot established by the range's first (cursor-less or explicit
+        empty-cursor) query, so it can be neither forged nor replayed
+        against a different scope, filter set, snapshot or query family.
+
+        The snapshot is fixed at the per-scope lifecycle commit boundary:
+        creation and retirement share one gap-free counter, and a root's
+        status as-of the snapshot is reconstructed from the sequence its
+        retirement committed at. Replaying a cursor therefore returns the
+        identical page even while roots are concurrently retired or new
+        roots registered; those changes surface only in a fresh first
+        query. The handler issues only SELECTs — it never creates, retires
+        or otherwise mutates a trust root — and a storage failure aborts
+        the whole request with a 500 rather than returning a half page.
+        """
+        # --- request shape (all 422, no storage touched) ----------------
+        allowed_params = {
+            "tenant_id",
+            "workload_id",
+            "root_id",
+            "name",
+            "status",
+            "created_after",
+            "created_before",
+            "cursor",
+        }
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+        # Each parameter is a single scalar string; a repeated parameter
+        # (even of an allowed name) is rejected rather than silently
+        # treated as last-wins.
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(
+                status_code=422, detail="query parameter must appear once"
+            )
+
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        root_filter: str | None = None
+        if root_id is not None:
+            if not root_id.strip() or not _UUID_RE.fullmatch(root_id):
+                raise HTTPException(
+                    status_code=422, detail="invalid trust root identifier"
+                )
+            root_filter = root_id
+
+        # Exact-text name filter. Only a blank/whitespace value is a shape
+        # error; a non-blank value is matched verbatim (names may contain
+        # interior or surrounding visible characters) and a name that
+        # matches nothing is an empty range, never a 404.
+        name_filter: str | None = None
+        if name is not None:
+            if not name.strip():
+                raise HTTPException(status_code=422, detail="invalid name")
+            name_filter = name
+
+        if status is not None:
+            if not status.strip() or status not in TRUST_ROOT_STATUS_CODES:
+                raise HTTPException(status_code=422, detail="invalid status")
+        status_filter = status if status is not None else ""
+
+        def _time_bound(value: str | None, name: str) -> tuple[str, datetime | None]:
+            if value is None:
+                return "", None
+            if not value.strip():
+                raise HTTPException(
+                    status_code=422, detail=f"{name} must be UTC RFC3339"
+                )
+            try:
+                parsed = _parse_utc_rfc3339(value)
+            except ValueError:
+                raise HTTPException(
+                    status_code=422, detail=f"{name} must be UTC RFC3339"
+                )
+            # Normalize the spelling embedded into the cursor so two
+            # equivalent UTC spellings cannot mint different cursor domains.
+            return _rfc3339(parsed), parsed
+
+        after_raw, after_dt = _time_bound(created_after, "created_after")
+        before_raw, before_dt = _time_bound(created_before, "created_before")
+        # The window is closed on both ends; equality is a valid
+        # single-instant window and the start must not follow the end.
+        if after_dt is not None and before_dt is not None and after_dt > before_dt:
+            raise HTTPException(
+                status_code=422,
+                detail="created_after must not be later than created_before",
+            )
+
+        # Omitted cursor or an explicit empty string starts before the
+        # smallest registration and fixes the range's replayable snapshot.
+        # Whitespace, malformed, forged, cross-scope, cross-filter,
+        # cross-snapshot or foreign-kind cursors are indistinguishable 422s.
+        boundary_dt: datetime | None = None
+        boundary_root: str | None = None
+        snapshot_seq: int | None = None
+        if cursor is not None and cursor != "":
+            if not cursor.strip() or not _CURSOR_RE.fullmatch(cursor):
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            decoded_boundary = _decode_trust_root_cursor(
+                cursor,
+                tenant_id,
+                workload_id,
+                root_id=root_filter or "",
+                name=name_filter or "",
+                status=status_filter,
+                created_after=after_raw,
+                created_before=before_raw,
+            )
+            if decoded_boundary is None:
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            boundary_at_raw, boundary_root, snapshot_seq = decoded_boundary
+            try:
+                boundary_dt = _parse_utc_rfc3339(boundary_at_raw)
+            except ValueError:
+                raise HTTPException(status_code=422, detail="invalid cursor")
+
+        # --- read-only scan ---------------------------------------------
+        rows: list = []
+        try:
+            with session_factory() as session:
+                # An explicitly named registration must exist in exactly
+                # this tenant and workload; an unknown or cross-scope root
+                # is an indistinguishable 404 (an explicit resource
+                # selector, not a mere range bound). A name-only filter is
+                # different: no such resource is named, so a non-match is
+                # an empty range rather than a 404.
+                if root_filter is not None:
+                    named = session.get(TrustRoot, root_filter)
+                    if (
+                        named is None
+                        or named.tenant_id != tenant_id
+                        or named.workload_id != workload_id
+                    ):
+                        raise HTTPException(
+                            status_code=404, detail="trust root not found"
+                        )
+
+                if snapshot_seq is None:
+                    # First query of the range: fix a replayable snapshot
+                    # at the scope's current lifecycle commit high-water
+                    # mark. Creation and retirement share this one counter,
+                    # so a registration or a retirement committed afterwards
+                    # takes a greater sequence: the new row lies beyond the
+                    # mark and an as-yet-active row keeps reconstructing as
+                    # active on replayed pages, regardless of in-place
+                    # updates or equal business timestamps.
+                    fixed_seq = session.scalar(
+                        select(TrustRootCommitCounter.last_seq).where(
+                            TrustRootCommitCounter.tenant_id == tenant_id,
+                            TrustRootCommitCounter.workload_id == workload_id,
+                        )
+                    )
+                    # No committed lifecycle change in the scope yet.
+                    snapshot_seq = int(fixed_seq) if fixed_seq is not None else 0
+
+                if snapshot_seq > 0:
+                    stmt = select(TrustRoot).where(
+                        TrustRoot.tenant_id == tenant_id,
+                        TrustRoot.workload_id == workload_id,
+                        # Membership: registrations that had committed by
+                        # the snapshot. Roots are never deleted, so the
+                        # immutable creation sequence alone bounds membership.
+                        TrustRoot.commit_seq <= snapshot_seq,
+                    )
+                    if root_filter is not None:
+                        stmt = stmt.where(TrustRoot.root_id == root_filter)
+                    if name_filter is not None:
+                        # Name is immutable, so the current column value is
+                        # exactly the value the snapshot row carried.
+                        stmt = stmt.where(TrustRoot.name == name_filter)
+                    if after_dt is not None:
+                        stmt = stmt.where(TrustRoot.created_at >= after_dt)
+                    if before_dt is not None:
+                        stmt = stmt.where(TrustRoot.created_at <= before_dt)
+
+                    # Status is evaluated as-of the snapshot rather than
+                    # read from the mutable current column: a root is
+                    # retired in the snapshot exactly when its retirement
+                    # committed at or before the high-water mark. A
+                    # retirement committed afterwards must not flip a
+                    # replayed page from active to retired.
+                    retired_as_of = and_(
+                        TrustRoot.retired_seq.is_not(None),
+                        TrustRoot.retired_seq <= snapshot_seq,
+                    )
+                    if status_filter == TRUST_ROOT_STATUS_RETIRED:
+                        stmt = stmt.where(retired_as_of)
+                    elif status_filter == TRUST_ROOT_STATUS_ACTIVE:
+                        stmt = stmt.where(
+                            or_(
+                                TrustRoot.retired_seq.is_(None),
+                                TrustRoot.retired_seq > snapshot_seq,
+                            )
+                        )
+
+                    if boundary_dt is not None:
+                        # Exclusive (created_at, root_id) keyset. Both
+                        # components are immutable, so the boundary walks
+                        # the same fixed snapshot set in stable order.
+                        stmt = stmt.where(
+                            or_(
+                                TrustRoot.created_at > boundary_dt,
+                                and_(
+                                    TrustRoot.created_at == boundary_dt,
+                                    TrustRoot.root_id > boundary_root,
+                                ),
+                            )
+                        )
+                    stmt = stmt.order_by(
+                        TrustRoot.created_at.asc(),
+                        TrustRoot.root_id.asc(),
+                    ).limit(TRUST_ROOT_PAGE_SIZE + 1)
+                    # One extra row is the "more follows" probe. The scan
+                    # is a single read-only statement: a storage failure
+                    # aborts the whole request with a 500 rather than
+                    # returning a partial page.
+                    rows = list(session.scalars(stmt))
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("trust root query failed")
+            raise HTTPException(
+                status_code=500, detail="trust root registry unavailable"
+            )
+
+        has_more = len(rows) > TRUST_ROOT_PAGE_SIZE
+        page = rows[:TRUST_ROOT_PAGE_SIZE]
+
+        trust_roots = [
+            {
+                # Creation-response field order, then lifecycle fields.
+                "root_id": row.root_id,
+                "tenant_id": row.tenant_id,
+                "workload_id": row.workload_id,
+                "name": row.name,
+                "created_at": _rfc3339(row.created_at),
+                # Reconstruct the as-of-snapshot status from the retirement
+                # commit marker rather than the mutable current column.
+                "status": (
+                    TRUST_ROOT_STATUS_RETIRED
+                    if row.retired_seq is not None
+                    and row.retired_seq <= snapshot_seq
+                    else TRUST_ROOT_STATUS_ACTIVE
+                ),
+                # The recorded retirement time is shown only when the
+                # retirement had committed by the snapshot; an active
+                # (as-of) root reports null even if it was retired later.
+                "retired_at": (
+                    _rfc3339(row.retired_at)
+                    if row.retired_seq is not None
+                    and row.retired_seq <= snapshot_seq
+                    else None
+                ),
+            }
+            for row in page
+        ]
+
+        if has_more:
+            last = page[-1]
+            next_cursor = _encode_trust_root_cursor(
+                tenant_id,
+                workload_id,
+                _rfc3339(last.created_at),
+                last.root_id,
+                root_id=root_filter or "",
+                name=name_filter or "",
+                status=status_filter,
+                created_after=after_raw,
+                created_before=before_raw,
+                snapshot_seq=snapshot_seq,
+            )
+            complete = False
+        else:
+            next_cursor = ""
+            complete = True
+
+        # Compact container (list, next_cursor, complete) with a single
+        # terminating newline. Every entry value is a JSON string or null
+        # and complete is a boolean, so no floats, -0.0 or non-finite
+        # values can appear. No certificate PEM, key, evidence or exception
+        # text is ever included.
+        body = (
+            json.dumps(
+                {
+                    "trust_roots": trust_roots,
+                    "next_cursor": next_cursor,
+                    "complete": complete,
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
 
     @app.post("/v1/revocations", status_code=201)
     def register_revocation(body: CreateRevocationRequest) -> Response:
@@ -4805,18 +5514,6 @@ def create_app(
         return Response(
             content=body_bytes, status_code=201, media_type="application/json"
         )
-
-    async def _require_empty_query_body(request: Request) -> None:
-        """Reject a read-only query carrying any request body (422).
-
-        The identity-profile query is ranged entirely by query
-        parameters, so a body is never meaningful. The body is read
-        directly (rather than trusting Content-Length, which chunked or
-        HTTP/2 clients may omit) and anything non-empty — including
-        whitespace or non-JSON — is rejected before any state is read.
-        """
-        if await request.body() != b"":
-            raise HTTPException(status_code=422, detail="query body must be empty")
 
     @app.get("/v1/workload-identities")
     def list_workload_identities(
