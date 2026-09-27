@@ -574,6 +574,17 @@ class Decision(Base):
     concurrent requests return that same row. The row records only
     identifiers, the fixed status code and timestamps — never the raw
     evidence, the nonce, or the evaluated claims.
+
+    ``tenant_id``/``workload_id`` denormalize the evidence's scope so the
+    read-only compliance decision query can range strictly by scope
+    without a join. ``commit_seq`` fixes the query's replayable snapshot
+    to the business commit boundary: a per-scope, gap-free, strictly
+    increasing sequence allocated inside the same transaction as the
+    decision (see :class:`DecisionCommitCounter`), so a decision that
+    commits after a query's first page can never enter that query's fixed
+    snapshot even when its ``decided_at`` is older or identical. Both are
+    nullable only for rows written before the columns existed; such rows
+    are backfilled on open and every new decision carries them.
     """
 
     __tablename__ = "decisions"
@@ -583,9 +594,37 @@ class Decision(Base):
             "policy_id",
             name="uq_decision_evidence_policy",
         ),
+        # Covers the scoped compliance listing ordered by the
+        # (decided_at, decision_id) keyset, including its exclusive
+        # cursor predicate.
+        Index(
+            "ix_decisions_scope_decided",
+            "tenant_id",
+            "workload_id",
+            "decided_at",
+            "decision_id",
+        ),
+        # Per-scope commit order: the immutable high-water mark that
+        # fixes the compliance decision snapshot to committed business
+        # boundaries. Unique so two concurrent allocations can never
+        # mint the same sequence.
+        Index(
+            "ix_decisions_scope_commit_seq",
+            "tenant_id",
+            "workload_id",
+            "commit_seq",
+            unique=True,
+        ),
     )
 
     decision_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    # Denormalized scope of the evidence this decision was taken for;
+    # NULL only on rows written before the column existed (backfilled on
+    # open from the referenced evidence).
+    tenant_id: Mapped[str | None] = mapped_column(
+        String(256), nullable=True, index=True
+    )
+    workload_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     evidence_id: Mapped[str] = mapped_column(String(36), index=True)
     policy_id: Mapped[str] = mapped_column(String(36), index=True)
     # Snapshot of the evaluated policy version; policy_id already identifies
@@ -594,6 +633,45 @@ class Decision(Base):
     # One of DECISION_STATUS_*; a fixed, service-defined code only.
     status: Mapped[str] = mapped_column(String(16))
     decided_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    # Gap-free per-scope sequence allocated in the decision's own
+    # transaction, strictly increasing in business commit order on every
+    # backend. NULL only on rows written before the column existed
+    # (backfilled on open); every new decision carries a positive value.
+    commit_seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+
+class DecisionCommitCounter(Base):
+    """Per-scope monotonic allocator for decision ``commit_seq``.
+
+    Exactly one row exists per ``(tenant_id, workload_id)``. It is an
+    internal ordering device — never exposed on any response and holding
+    no business state, material or secret — whose sole purpose is to make
+    the compliance decision query's snapshot cutoff the business commit
+    boundary on every backend, mirroring
+    :class:`ProofEventCommitCounter`:
+
+    * allocating the next sequence reads this row ``FOR UPDATE`` (locking
+      backends) so concurrent decisions in one scope serialize on the
+      counter row itself;
+    * on SQLite every write transaction already begins as BEGIN
+      IMMEDIATE, serializing all writers process-wide;
+    * the scope's first allocation inserts the anchor inside a savepoint,
+      so the unique ``(tenant_id, workload_id)`` race costs only that
+      savepoint and never rolls the surrounding decision back.
+
+    The counter advances in the same transaction as the decision it
+    sequences, so a committed decision's sequence is final and strictly
+    greater than every decision that committed before it, independent of
+    write timing or equal business timestamps.
+    """
+
+    __tablename__ = "decision_commit_counters"
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # Last per-scope commit sequence handed out; 1 for the scope's first
+    # decision, strictly increasing thereafter.
+    last_seq: Mapped[int] = mapped_column(BigInteger)
 
 
 class DataEnvelope(Base):

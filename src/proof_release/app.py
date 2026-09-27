@@ -47,6 +47,7 @@ from cryptography.hazmat.primitives.serialization import Encoding
 
 from proof_release.db import (
     DECISION_STATUS_ALLOWED,
+    DECISION_STATUS_CODES,
     DECISION_STATUS_DENIED,
     RELEASE_GRANT_STATUS_CODES,
     RELEASE_GRANT_STATUS_CONSUMED,
@@ -104,6 +105,7 @@ from proof_release.db import (
     Challenge,
     DataEnvelope,
     Decision,
+    DecisionCommitCounter,
     Evidence,
     Policy,
     ProofEventCommitCounter,
@@ -318,6 +320,69 @@ def _next_proof_event_commit_seq(
     logger.error("proof event commit sequence could not settle")
     raise HTTPException(
         status_code=500, detail="proof event sequencing unavailable"
+    )
+
+
+def _next_decision_commit_seq(
+    session, tenant_id: str, workload_id: str
+) -> int:
+    """Allocate the next per-scope decision commit sequence.
+
+    Must be called inside the decision's open write transaction, before
+    the :class:`Decision` row is added. Returns 1 for the scope's first
+    decision and a strictly greater value for every later one. The value
+    is fixed by the business commit boundary, not by ``decided_at``:
+
+    * the per-scope :class:`DecisionCommitCounter` row is read
+      ``FOR UPDATE``, so on locking backends concurrent decisions in one
+      scope serialize on that anchor row and each waiter observes the
+      preceding winner's new maximum;
+    * on SQLite every write transaction already begins as BEGIN
+      IMMEDIATE, fully serializing allocations;
+    * the scope's first decision has no counter row yet, so it is
+      inserted inside a savepoint: two racing first allocations lose
+      only the savepoint (never the surrounding decision), and the loser
+      re-reads the winner's row. The bounded loop also covers the rare
+      case where the apparent winner rolled its whole transaction back.
+
+    The counter advances in the same transaction as the decision, so a
+    later commit always takes a greater sequence regardless of write
+    timing or identical business timestamps — the property the
+    compliance decision query bounds its replayable snapshot by.
+    """
+    for _ in range(10):
+        counter = session.scalar(
+            select(DecisionCommitCounter)
+            .where(
+                DecisionCommitCounter.tenant_id == tenant_id,
+                DecisionCommitCounter.workload_id == workload_id,
+            )
+            .with_for_update()
+        )
+        if counter is not None:
+            counter.last_seq = counter.last_seq + 1
+            return counter.last_seq
+        # First decision for this scope: install the anchor in a
+        # savepoint so a collision with a concurrent first decision
+        # rolls back only this insert, leaving the caller's transaction
+        # intact.
+        try:
+            with session.begin_nested():
+                session.add(
+                    DecisionCommitCounter(
+                        tenant_id=tenant_id, workload_id=workload_id, last_seq=1
+                    )
+                )
+            return 1
+        except IntegrityError:
+            # begin_nested() has already released the rolled-back
+            # savepoint; loop to re-read the winner's anchor (or retry
+            # the insert if that winner's whole transaction rolled back).
+            continue
+    # pragma: no cover - bounded backstop for pathological anchor contention
+    logger.error("decision commit sequence could not settle")
+    raise HTTPException(
+        status_code=500, detail="decision sequencing unavailable"
     )
 
 
@@ -1531,6 +1596,180 @@ def _decode_proof_event_cursor(
     return boundary_at, boundary_event, snapshot_seq
 
 
+def _decision_cursor_payload(
+    tenant_id: str,
+    workload_id: str,
+    boundary_at: str,
+    boundary_decision: str,
+    *,
+    decision_id: str,
+    evidence_id: str,
+    policy_id: str,
+    status: str,
+    decided_after: str,
+    decided_before: str,
+    snapshot_seq: int,
+) -> bytes:
+    """Canonical byte payload authenticated inside a decision cursor.
+
+    The cursor marks an exclusive ``(decided_at, decision_id)`` position
+    and every active filter plus the fixed replayable snapshot are part
+    of the signed payload, so a cursor minted for one filter set or
+    snapshot cannot be replayed against another. The snapshot membership
+    cutoff is the per-scope ``commit_seq`` high-water mark (``q``): the
+    business commit boundary established by the first query. Bounding
+    membership by commit order — rather than by ``decided_at`` — is what
+    keeps a decision that commits *after* the first query but carries an
+    older or identical business time out of the fixed snapshot, on every
+    backend. The kind tag distinguishes these cursors from every other
+    cursor family even though all share the same HMAC secret.
+    """
+    return json.dumps(
+        {
+            "k": _DECISION_CURSOR_KIND,
+            "t": tenant_id,
+            "w": workload_id,
+            "at": boundary_at,
+            "d": boundary_decision,
+            "dd": decision_id,
+            "id": evidence_id,
+            "p": policy_id,
+            "s": status,
+            "a": decided_after,
+            "b": decided_before,
+            "q": snapshot_seq,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _encode_decision_cursor(
+    tenant_id: str,
+    workload_id: str,
+    boundary_at: str,
+    boundary_decision: str,
+    *,
+    decision_id: str,
+    evidence_id: str,
+    policy_id: str,
+    status: str,
+    decided_after: str,
+    decided_before: str,
+    snapshot_seq: int,
+) -> str:
+    """Build an opaque, scope/filter/snapshot-bound exclusive decision cursor."""
+    payload = _decision_cursor_payload(
+        tenant_id,
+        workload_id,
+        boundary_at,
+        boundary_decision,
+        decision_id=decision_id,
+        evidence_id=evidence_id,
+        policy_id=policy_id,
+        status=status,
+        decided_after=decided_after,
+        decided_before=decided_before,
+        snapshot_seq=snapshot_seq,
+    )
+    mac = hmac.new(_cursor_secret(), payload, hashlib.sha256).digest()
+    return b64url_encode(payload + mac)
+
+
+def _decode_decision_cursor(
+    token: str,
+    tenant_id: str,
+    workload_id: str,
+    *,
+    decision_id: str,
+    evidence_id: str,
+    policy_id: str,
+    status: str,
+    decided_after: str,
+    decided_before: str,
+) -> tuple[str, str, int] | None:
+    """Validate a decision cursor and return its exclusive boundary.
+
+    Returns ``(decided_at, decision_id, snapshot_seq)`` on success or
+    ``None`` for a malformed/forged token, a cursor of another kind
+    (rewrap batch, grant audit, compliance audit events, proof-lifecycle
+    events, revocations or rewrap job listings), or one minted for any
+    other scope, filter combination or snapshot. The beginning marker
+    (``""``) never reaches this function.
+    """
+    if not _CURSOR_RE.fullmatch(token):
+        return None
+    try:
+        raw = b64url_decode(token)
+    except ValueError:
+        return None
+    # The MAC is a fixed 32-byte suffix; the JSON payload precedes it.
+    if len(raw) <= 32:
+        return None
+    payload, mac = raw[:-32], raw[-32:]
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    if decoded.get("k") != _DECISION_CURSOR_KIND:
+        return None
+    boundary_at = decoded.get("at")
+    boundary_decision = decoded.get("d")
+    if not isinstance(boundary_at, str) or boundary_at == "":
+        return None
+    if not isinstance(boundary_decision, str) or not _UUID_RE.fullmatch(
+        boundary_decision
+    ):
+        return None
+    # The commit-order membership cutoff carried by a resume cursor. A
+    # resume cursor always names the positive per-scope sequence
+    # high-water mark established by the range's first query (bools are
+    # rejected as ints).
+    snapshot_seq = decoded.get("q")
+    if not isinstance(snapshot_seq, int) or isinstance(snapshot_seq, bool):
+        return None
+    if snapshot_seq < 1:
+        return None
+    expected_mac = hmac.new(
+        _cursor_secret(),
+        _decision_cursor_payload(
+            tenant_id,
+            workload_id,
+            boundary_at,
+            boundary_decision,
+            decision_id=decision_id,
+            evidence_id=evidence_id,
+            policy_id=policy_id,
+            status=status,
+            decided_after=decided_after,
+            decided_before=decided_before,
+            snapshot_seq=snapshot_seq,
+        ),
+        hashlib.sha256,
+    ).digest()
+    if not hmac.compare_digest(mac, expected_mac):
+        return None
+    # Defense in depth: the MAC already covers every field, but confirm
+    # the scope and each active filter explicitly.
+    if not hmac.compare_digest(str(decoded.get("t", "")), tenant_id):
+        return None
+    if not hmac.compare_digest(str(decoded.get("w", "")), workload_id):
+        return None
+    for key, expected in (
+        ("dd", decision_id),
+        ("id", evidence_id),
+        ("p", policy_id),
+        ("s", status),
+        ("a", decided_after),
+        ("b", decided_before),
+    ):
+        if not hmac.compare_digest(str(decoded.get(key, "")), expected):
+            return None
+    return boundary_at, boundary_decision, snapshot_seq
+
+
 #: Fixed page size for the read-only compliance audit-event listing. As
 #: with the grant audit, the page size is an internal constant and never
 #: part of the request or response contract.
@@ -1585,6 +1824,18 @@ PROOF_EVENT_PAGE_SIZE = 100
 #: the same secret) can never be replayed against the proof timeline, and
 #: vice versa.
 _PROOF_EVENT_CURSOR_KIND = "compliance-proof-events-v1"
+
+#: Fixed page size for the read-only compliance decision listing. Like
+#: the other audit listings it is an internal constant and never part of
+#: the request or response contract.
+DECISION_PAGE_SIZE = 100
+
+#: Discriminator embedded in compliance decision cursors so a cursor
+#: from any other family (rewrap batch, grant audit, compliance audit
+#: events, proof-lifecycle events, revocations or rewrap job listings —
+#: all authenticated with the same secret) can never be replayed against
+#: the decision listing, and vice versa.
+_DECISION_CURSOR_KIND = "compliance-decisions-v1"
 
 
 class CreateChallengeRequest(BaseModel):
@@ -2102,6 +2353,9 @@ def _migrate_additive(engine) -> None:
         # lacks the column, the per-scope counters are unseeded and the
         # unique index is missing. Upgrade it dialect-neutrally.
         _migrate_proof_event_commit_sequence(engine)
+        # The decision commit sequence shipped after the decision audit
+        # itself; upgrade it dialect-neutrally as well.
+        _migrate_decision_commit_sequence(engine)
         return
     additions = {
         "evidence": (
@@ -2203,6 +2457,9 @@ def _migrate_additive(engine) -> None:
     # backend. A fresh database already has all three and the upgrade is
     # a no-op there.
     _migrate_proof_event_commit_sequence(engine)
+    # The decision scope/commit-sequence upgrade is likewise
+    # dialect-neutral and a no-op on current-metadata databases.
+    _migrate_decision_commit_sequence(engine)
 
 
 def _migrate_proof_event_commit_sequence(engine) -> None:
@@ -2368,6 +2625,186 @@ def _migrate_proof_event_commit_sequence(engine) -> None:
                 idx
                 for idx in events_tbl.indexes
                 if idx.name == "ix_proof_lifecycle_events_scope_commit_seq"
+            )
+            model_index.create(conn, checkfirst=True)
+
+
+def _migrate_decision_commit_sequence(engine) -> None:
+    """Bring a deployment written before decision ``commit_seq`` up to date.
+
+    The compliance decision query fixes its replayable snapshot to the
+    business commit boundary through a per-scope, gap-free, strictly
+    increasing ``commit_seq`` allocated in each decision's own write
+    transaction, and ranges strictly by the denormalized
+    ``tenant_id``/``workload_id`` scope columns. Databases written before
+    those columns existed must be upgraded on open *on every backend*,
+    not only SQLite:
+
+    * the nullable ``tenant_id``, ``workload_id`` and ``commit_seq``
+      columns are added when missing;
+    * each legacy row's scope is backfilled from the evidence record the
+      decision references (a decision can only ever exist for a stored
+      evidence, and evidence is never deleted);
+    * legacy rows are numbered per scope in a stable order — SQLite's
+      ``rowid`` (its serialized insert order) or the audit listing key
+      ``(decided_at, decision_id)`` numbered client-side on every other
+      dialect — so each scope gets a gap-free 1..N run even when
+      business times are inverted or identical;
+    * each scope's :class:`DecisionCommitCounter` is seeded at its
+      backfilled maximum (only when absent) so the first decision
+      written after the upgrade allocates N+1 rather than colliding;
+    * the unique ``(tenant_id, workload_id, commit_seq)`` index and the
+      scoped listing index are created last, once no NULL remains.
+
+    The whole upgrade is one transaction and changes no business field,
+    response shape or secret-handling rule. A database created by the
+    current metadata already has the columns, counters and indexes, so
+    each step short-circuits.
+    """
+    is_sqlite = engine.dialect.name == "sqlite"
+    decisions_tbl = Decision.__table__
+    counters_tbl = DecisionCommitCounter.__table__
+
+    # A table created by any earlier deployment always exists once
+    # create_all has run on the current metadata (fresh databases get it
+    # with every column and index, and nothing below has work to do).
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        if decisions_tbl.name not in inspector.get_table_names():
+            return
+        column_names = {
+            col["name"] for col in inspector.get_columns(decisions_tbl.name)
+        }
+        for column, column_type in (
+            ("tenant_id", "VARCHAR(256)"),
+            ("workload_id", "VARCHAR(256)"),
+            ("commit_seq", "BIGINT"),
+        ):
+            if column not in column_names:
+                conn.execute(
+                    text(
+                        f"ALTER TABLE {decisions_tbl.name} "
+                        f"ADD COLUMN {column} {column_type}"
+                    )
+                )
+
+        # Backfill the denormalized scope from the referenced evidence
+        # (never touch an already-scoped row).
+        conn.execute(
+            text(
+                f"UPDATE {decisions_tbl.name} "
+                "SET tenant_id = ("
+                "SELECT tenant_id FROM evidence "
+                f"WHERE evidence.evidence_id = {decisions_tbl.name}.evidence_id"
+                "), "
+                "workload_id = ("
+                "SELECT workload_id FROM evidence "
+                f"WHERE evidence.evidence_id = {decisions_tbl.name}.evidence_id"
+                f") WHERE tenant_id IS NULL"
+            )
+        )
+
+        # Backfill only legacy rows (never touch an already-sequenced row).
+        if is_sqlite:
+            # rowid is SQLite's serialized insert/commit order; the
+            # correlated COUNT assigns 1..N per scope in that order.
+            conn.execute(
+                text(
+                    f"UPDATE {decisions_tbl.name} "
+                    "SET commit_seq = ("
+                    "SELECT COUNT(*) FROM decisions AS prior "
+                    f"WHERE prior.tenant_id = {decisions_tbl.name}.tenant_id "
+                    f"AND prior.workload_id = {decisions_tbl.name}.workload_id "
+                    f"AND prior.rowid <= {decisions_tbl.name}.rowid"
+                    ") "
+                    "WHERE commit_seq IS NULL"
+                )
+            )
+        else:
+            # Historical commit order on a backend with no rowid: the
+            # pre-sequence deployment carried no monotonic commit marker
+            # (the primary key is a UUID v4 minted in the decision's own
+            # transaction, whose lexical order is not commit order).
+            # Number legacy rows in Python by the audit's own stable
+            # listing key — per scope, (decided_at, decision_id)
+            # ascending — and write each row's one-based position by
+            # primary key. The exact historical tie-break is immaterial
+            # to snapshot correctness: every legacy row committed before
+            # the upgrade and is therefore inside every fresh first
+            # query regardless of its position relative to other legacy
+            # rows.
+            legacy_rows = conn.execute(
+                select(
+                    decisions_tbl.c.decision_id,
+                    decisions_tbl.c.tenant_id,
+                    decisions_tbl.c.workload_id,
+                )
+                .where(decisions_tbl.c.commit_seq.is_(None))
+                .order_by(
+                    decisions_tbl.c.tenant_id,
+                    decisions_tbl.c.workload_id,
+                    decisions_tbl.c.decided_at,
+                    decisions_tbl.c.decision_id,
+                )
+            ).fetchall()
+            per_scope: dict[tuple[str, str], int] = {}
+            for decision_id, tenant_id, workload_id in legacy_rows:
+                seq = per_scope.get((tenant_id, workload_id), 0) + 1
+                per_scope[(tenant_id, workload_id)] = seq
+                conn.execute(
+                    decisions_tbl.update()
+                    .where(
+                        decisions_tbl.c.decision_id == decision_id,
+                        decisions_tbl.c.commit_seq.is_(None),
+                    )
+                    .values(commit_seq=seq)
+                )
+
+        # Seed a per-scope counter at the existing maximum, but never
+        # overwrite a counter that is already present (a concurrent
+        # upgrader or a scope already writing decisions). The
+        # (tenant_id, workload_id) primary key makes the anti-duplicate
+        # portable across dialects.
+        conn.execute(
+            insert(counters_tbl)
+            .from_select(
+                ["tenant_id", "workload_id", "last_seq"],
+                select(
+                    decisions_tbl.c.tenant_id,
+                    decisions_tbl.c.workload_id,
+                    func.max(decisions_tbl.c.commit_seq),
+                )
+                .where(decisions_tbl.c.commit_seq.is_not(None))
+                .group_by(
+                    decisions_tbl.c.tenant_id, decisions_tbl.c.workload_id
+                )
+                .where(
+                    ~select(literal_column("1"))
+                    .select_from(counters_tbl.alias("existing_counter"))
+                    .where(
+                        literal_column("existing_counter.tenant_id")
+                        == decisions_tbl.c.tenant_id,
+                        literal_column("existing_counter.workload_id")
+                        == decisions_tbl.c.workload_id,
+                    )
+                    .exists()
+                ),
+            )
+        )
+
+        # Build the ordering indexes last, once every row is scoped and
+        # sequenced. Reuse the index objects already declared on the
+        # model's table (never construct a second Index bound to the
+        # same columns — that would register a duplicate on the shared
+        # metadata); checkfirst makes creation a no-op on
+        # current-metadata databases and every dialect portably.
+        for index_name in (
+            "ix_decisions_scope_commit_seq",
+            "ix_decisions_scope_decided",
+            "ix_decisions_tenant_id",
+        ):
+            model_index = next(
+                idx for idx in decisions_tbl.indexes if idx.name == index_name
             )
             model_index.create(conn, checkfirst=True)
 
@@ -5261,11 +5698,21 @@ def create_app(
             )
             decision = Decision(
                 decision_id=decision_id,
+                tenant_id=body.tenant_id,
+                workload_id=body.workload_id,
                 evidence_id=evidence_id,
                 policy_id=policy.policy_id,
                 policy_version=policy.version,
                 status=status,
                 decided_at=decided_at,
+                # Per-scope commit-order marker for the read-only
+                # compliance decision query's replayable snapshot;
+                # allocated inside this same transaction so a later
+                # commit always takes a greater sequence. The response
+                # contract is unchanged.
+                commit_seq=_next_decision_commit_seq(
+                    session, body.tenant_id, body.workload_id
+                ),
             )
             session.add(decision)
             if prior_decision is None:
@@ -6379,6 +6826,331 @@ def create_app(
             json.dumps(
                 {
                     "events": events,
+                    "next_cursor": next_cursor,
+                    "complete": complete,
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
+
+    @app.get("/v1/compliance/decisions")
+    def list_compliance_decisions(
+        request: Request,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        decision_id: str | None = Query(default=None),
+        evidence_id: str | None = Query(default=None),
+        policy_id: str | None = Query(default=None),
+        status: str | None = Query(default=None),
+        decided_after: str | None = Query(default=None),
+        decided_before: str | None = Query(default=None),
+        cursor: str | None = Query(default=None),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return a read-only, tenant-isolated page of release decisions.
+
+        Unlike the proof timeline (which records only the *first*
+        decision per evidence), this listing covers every recorded
+        decision — one per (evidence, policy version) pair — in stable
+        ``(decided_at, decision_id)`` ascending order with an exclusive
+        keyset cursor. The first (cursor-less or empty-cursor) query
+        fixes a replayable snapshot at the greatest per-scope decision
+        commit sequence among the currently committed, in-filter
+        decisions; decisions committed afterwards surface only in a
+        fresh first query, never in later pages of this snapshot — even
+        when their business time is older. The cursor is
+        HMAC-authenticated, carries its own kind tag and is bound to the
+        scope, every active filter *and* the fixed snapshot, so it
+        cannot be forged, tampered with, or replayed against another
+        scope, filter set, snapshot or cursor family. The handler issues
+        only SELECTs: it appends no audit and changes no business state,
+        and a storage failure aborts the whole request with a 500 rather
+        than returning a half page.
+        """
+        # --- request shape (all 422, no storage touched) ----------------
+        allowed_params = {
+            "tenant_id",
+            "workload_id",
+            "decision_id",
+            "evidence_id",
+            "policy_id",
+            "status",
+            "decided_after",
+            "decided_before",
+            "cursor",
+        }
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+        # Each parameter is a single scalar string; a repeated parameter
+        # (even of an allowed name) is rejected rather than silently
+        # treated as last-wins.
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(
+                status_code=422, detail="query parameter must appear once"
+            )
+
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        # Explicit identifiers are canonical lowercase UUIDs; surrounding
+        # whitespace and uppercase letters are format errors.
+        def _uuid_filter(value: str | None, name: str) -> str | None:
+            if value is None:
+                return None
+            if not value.strip() or not _UUID_RE.fullmatch(value):
+                raise HTTPException(
+                    status_code=422, detail=f"invalid {name} identifier"
+                )
+            return value
+
+        decision_id_filter = _uuid_filter(decision_id, "decision")
+        evidence_id_filter = _uuid_filter(evidence_id, "evidence")
+        policy_id_filter = _uuid_filter(policy_id, "policy")
+
+        if status is not None:
+            if not status.strip() or status not in DECISION_STATUS_CODES:
+                raise HTTPException(status_code=422, detail="invalid status")
+        status_filter = status if status is not None else ""
+
+        def _time_bound(value: str | None, name: str) -> tuple[str, datetime | None]:
+            if value is None:
+                return "", None
+            if not value.strip():
+                raise HTTPException(
+                    status_code=422, detail=f"{name} must be UTC RFC3339"
+                )
+            try:
+                parsed = _parse_utc_rfc3339(value)
+            except ValueError:
+                raise HTTPException(
+                    status_code=422, detail=f"{name} must be UTC RFC3339"
+                )
+            # Normalize the spelling embedded into the cursor so two
+            # equivalent UTC spellings cannot mint different cursor domains.
+            return _rfc3339(parsed), parsed
+
+        after_raw, after_dt = _time_bound(decided_after, "decided_after")
+        before_raw, before_dt = _time_bound(decided_before, "decided_before")
+        # Equality is a valid single-instant window; the start must not be
+        # later than the end.
+        if after_dt is not None and before_dt is not None and after_dt > before_dt:
+            raise HTTPException(
+                status_code=422,
+                detail="decided_after must not be later than decided_before",
+            )
+
+        # Omitted cursor or an explicit empty string starts before the
+        # smallest decision and fixes the range's replayable snapshot.
+        # Whitespace, malformed, forged, cross-scope, cross-filter,
+        # cross-snapshot or foreign-kind cursors are indistinguishable 422s.
+        boundary_dt: datetime | None = None
+        boundary_decision: str | None = None
+        # Per-scope commit-order high-water mark fixed by the first query.
+        # None marks the first query of a range; a resume cursor carries
+        # the established value bound by its HMAC.
+        snapshot_seq: int | None = None
+        if cursor is not None and cursor != "":
+            if not cursor.strip() or not _CURSOR_RE.fullmatch(cursor):
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            decoded_boundary = _decode_decision_cursor(
+                cursor,
+                tenant_id,
+                workload_id,
+                decision_id=decision_id_filter or "",
+                evidence_id=evidence_id_filter or "",
+                policy_id=policy_id_filter or "",
+                status=status_filter,
+                decided_after=after_raw,
+                decided_before=before_raw,
+            )
+            if decoded_boundary is None:
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            boundary_at_raw, boundary_decision, snapshot_seq = decoded_boundary
+            try:
+                boundary_dt = _parse_utc_rfc3339(boundary_at_raw)
+            except ValueError:
+                raise HTTPException(status_code=422, detail="invalid cursor")
+
+        # --- read-only decision scan ------------------------------------
+        rows: list = []
+        try:
+            with session_factory() as session:
+                # An explicitly named decision, evidence or policy must
+                # exist in exactly this tenant/workload; an unknown or
+                # cross-scope identifier is an indistinguishable 404
+                # rather than an empty page, never revealing existence.
+                if decision_id_filter is not None:
+                    named_decision = session.get(Decision, decision_id_filter)
+                    if (
+                        named_decision is None
+                        or named_decision.tenant_id != tenant_id
+                        or named_decision.workload_id != workload_id
+                    ):
+                        raise HTTPException(
+                            status_code=404, detail="decision not found"
+                        )
+                if evidence_id_filter is not None:
+                    named_evidence = session.get(Evidence, evidence_id_filter)
+                    if (
+                        named_evidence is None
+                        or named_evidence.tenant_id != tenant_id
+                        or named_evidence.workload_id != workload_id
+                    ):
+                        raise HTTPException(
+                            status_code=404, detail="evidence not found"
+                        )
+                if policy_id_filter is not None:
+                    named_policy = session.get(Policy, policy_id_filter)
+                    if (
+                        named_policy is None
+                        or named_policy.tenant_id != tenant_id
+                        or named_policy.workload_id != workload_id
+                    ):
+                        raise HTTPException(
+                            status_code=404, detail="policy not found"
+                        )
+
+                def _filtered(stmt):
+                    if decision_id_filter is not None:
+                        stmt = stmt.where(
+                            Decision.decision_id == decision_id_filter
+                        )
+                    if evidence_id_filter is not None:
+                        stmt = stmt.where(
+                            Decision.evidence_id == evidence_id_filter
+                        )
+                    if policy_id_filter is not None:
+                        stmt = stmt.where(Decision.policy_id == policy_id_filter)
+                    if status_filter:
+                        stmt = stmt.where(Decision.status == status_filter)
+                    if after_dt is not None:
+                        stmt = stmt.where(Decision.decided_at >= after_dt)
+                    if before_dt is not None:
+                        stmt = stmt.where(Decision.decided_at <= before_dt)
+                    return stmt
+
+                if snapshot_seq is None:
+                    # First query of the range: fix a replayable snapshot
+                    # at the greatest per-scope commit sequence among the
+                    # currently committed, in-filter decisions.
+                    # ``commit_seq`` is allocated inside each decision's
+                    # own write transaction and is strictly increasing in
+                    # business commit order on every backend, so a
+                    # decision that commits after this point takes a
+                    # greater sequence and can never enter the snapshot
+                    # even when its business time is older or equal to an
+                    # already-seen decision. This is independent of write
+                    # timing, equal timestamps and the particular dialect.
+                    fixed_seq = session.scalar(
+                        _filtered(
+                            select(func.max(Decision.commit_seq)).where(
+                                Decision.tenant_id == tenant_id,
+                                Decision.workload_id == workload_id,
+                            )
+                        )
+                    )
+                    if fixed_seq is None:
+                        # No in-filter decision at snapshot time: the
+                        # fixed first page is empty and already complete;
+                        # later commits belong to fresh first queries.
+                        rows = []
+                        snapshot_seq = 0
+                    else:
+                        snapshot_seq = int(fixed_seq)
+
+                if snapshot_seq > 0:
+                    stmt = _filtered(
+                        select(Decision).where(
+                            Decision.tenant_id == tenant_id,
+                            Decision.workload_id == workload_id,
+                            # Inclusive fixed-snapshot cutoff by business
+                            # commit order.
+                            Decision.commit_seq <= snapshot_seq,
+                        )
+                    )
+                    if boundary_dt is not None:
+                        # Exclusive (decided_at, decision_id) keyset.
+                        # Snapshot membership is fixed above; the boundary
+                        # only walks the same immutable set in
+                        # business-time order.
+                        stmt = stmt.where(
+                            or_(
+                                Decision.decided_at > boundary_dt,
+                                and_(
+                                    Decision.decided_at == boundary_dt,
+                                    Decision.decision_id > boundary_decision,
+                                ),
+                            )
+                        )
+                    stmt = stmt.order_by(
+                        Decision.decided_at.asc(),
+                        Decision.decision_id.asc(),
+                    ).limit(DECISION_PAGE_SIZE + 1)
+                    # One extra row is the "more follows" probe. The scan
+                    # is a single read-only statement: a storage failure
+                    # aborts the whole request with a 500 rather than
+                    # returning a partial page.
+                    rows = list(session.scalars(stmt))
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("compliance decision query failed")
+            raise HTTPException(
+                status_code=500, detail="decision audit unavailable"
+            )
+
+        has_more = len(rows) > DECISION_PAGE_SIZE
+        page = rows[:DECISION_PAGE_SIZE]
+
+        decisions = [
+            {
+                "decision_id": row.decision_id,
+                "evidence_id": row.evidence_id,
+                "policy_id": row.policy_id,
+                # The decided policy version is an integer — never a float.
+                "policy_version": row.policy_version,
+                "status": row.status,
+                "decided_at": _rfc3339(row.decided_at),
+            }
+            for row in page
+        ]
+
+        if has_more:
+            last = page[-1]
+            next_cursor = _encode_decision_cursor(
+                tenant_id,
+                workload_id,
+                _rfc3339(last.decided_at),
+                last.decision_id,
+                decision_id=decision_id_filter or "",
+                evidence_id=evidence_id_filter or "",
+                policy_id=policy_id_filter or "",
+                status=status_filter,
+                decided_after=after_raw,
+                decided_before=before_raw,
+                snapshot_seq=snapshot_seq,
+            )
+            complete = False
+        else:
+            next_cursor = ""
+            complete = True
+
+        # Compact JSON with a single terminating newline. Every value is
+        # a string, boolean or integer — no floats, -0.0 or non-finite
+        # values. No evidence, nonce, claims, capability, payload or key
+        # material ever appears.
+        body = (
+            json.dumps(
+                {
+                    "decisions": decisions,
                     "next_cursor": next_cursor,
                     "complete": complete,
                 },
