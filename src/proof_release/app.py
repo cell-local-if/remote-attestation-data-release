@@ -75,6 +75,8 @@ from proof_release.db import (
     VERIFICATION_RESULT_REJECTED,
     WORKLOAD_IDENTITY_STATUS_ACTIVE,
     WORKLOAD_IDENTITY_STATUS_REVOKED,
+    POLICY_STATUS_ACTIVE,
+    POLICY_STATUS_RETIRED,
     TRUST_ROOT_STATUS_ACTIVE,
     TRUST_ROOT_STATUS_RETIRED,
     AUDIT_EVENT_STATUS_CONSUMED,
@@ -1823,6 +1825,24 @@ class PolicyCreatedResponse(BaseModel):
     created_at: str
 
 
+class RetirePolicyRequest(BaseModel):
+    """Scope naming the policy version to retire.
+
+    The body carries only the two non-blank scope strings; any missing,
+    blank, wrong-typed, incomplete or unknown field is rejected as a
+    client error rather than silently ignored, and validation completes
+    before the handler touches storage. The two fields together with the
+    path ``policy_id`` name exactly one concrete policy version.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+
+    _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
+
+
 class CreateDecisionRequest(BaseModel):
     tenant_id: StrictStr = Field(min_length=1)
     workload_id: StrictStr = Field(min_length=1)
@@ -2095,6 +2115,10 @@ def _migrate_additive(engine) -> None:
             ("status", "VARCHAR(16)"),
             ("retired_at", "DATETIME"),
         ),
+        "policies": (
+            ("status", "VARCHAR(16)"),
+            ("retired_at", "DATETIME"),
+        ),
         "workload_identity_profiles": (
             ("status", "VARCHAR(16)"),
             ("updated_at", "DATETIME"),
@@ -2147,6 +2171,17 @@ def _migrate_additive(engine) -> None:
                         "SET status = :active WHERE status IS NULL"
                     ),
                     {"active": TRUST_ROOT_STATUS_ACTIVE},
+                )
+            if table == "policies":
+                # Policy versions created before terminal retirement
+                # existed are all active; only an explicit retire ever
+                # sets a version's retired_at.
+                conn.execute(
+                    text(
+                        "UPDATE policies "
+                        "SET status = :active WHERE status IS NULL"
+                    ),
+                    {"active": POLICY_STATUS_ACTIVE},
                 )
             if table == "workload_identity_claims":
                 conn.execute(
@@ -4933,6 +4968,145 @@ def create_app(
             created_at=_rfc3339(now),
         )
 
+    @app.post("/v1/policies//retire")
+    def retire_policy_identifier_required(
+        body: RetirePolicyRequest,
+    ) -> Response:
+        # An empty path segment is a missing policy identifier: a 422
+        # client error rather than a routing-level 404 or 405. It never
+        # reads or modifies a policy version.
+        raise HTTPException(status_code=422, detail="invalid policy identifier")
+
+    @app.post("/v1/policies/{policy_id}/retire")
+    def retire_policy(policy_id: str, body: RetirePolicyRequest) -> Response:
+        """Retire one concrete versioned policy.
+
+        The path identifier must be a canonical UUID and the body carries
+        only the two non-blank scope strings; any missing, blank,
+        wrong-typed, incomplete or unknown field is a 422 that never reads
+        or writes the policy. A path UUID is checked before storage is
+        touched. An unknown policy or one outside the body's
+        tenant/workload is an indistinguishable 404 (existence is never
+        revealed) — the path id and the body scope name exactly one
+        version. A repeat retire returns 409 and never rewrites the
+        recorded ``retired_at`` and appends no audit or other state
+        record. The active -> retired transition is one guarded atomic
+        update under the policy row lock, so concurrent retires of one
+        version settle as exactly one success and stable 409s; distinct
+        versions (including other versions of the same name) hold
+        independent locks and are isolated. A write or commit failure
+        returns 500 after a full rollback, leaving the original status and
+        time unchanged, and the same request succeeds after recovery.
+        Retirement only terminates *new* decisions against this version:
+        existing decisions, their policy_version/decided_at and every
+        release grant are untouched, and the version cannot be deleted or
+        overwritten into bypassing the terminal state.
+        """
+        # A path identifier that is missing (empty segment), blank,
+        # whitespace-padded or not a canonical lowercase UUID is a
+        # field/format error; the raw value must match exactly. This runs
+        # before any storage access, so a malformed path can neither read
+        # nor modify a policy version.
+        if not _UUID_RE.fullmatch(policy_id):
+            raise HTTPException(status_code=422, detail="invalid policy identifier")
+
+        retired_at = _utcnow()
+        with session_factory() as session:
+            try:
+                # Lock the policy row for the whole transition so two
+                # concurrent retires serialize on this exact version; the
+                # decision path reads the same row under lock and is
+                # therefore strictly ordered against this commit. SQLite
+                # ignores FOR UPDATE but already serializes all writers via
+                # BEGIN IMMEDIATE.
+                policy = session.scalar(
+                    select(Policy)
+                    .where(
+                        Policy.policy_id == policy_id,
+                        Policy.tenant_id == body.tenant_id,
+                        Policy.workload_id == body.workload_id,
+                    )
+                    .with_for_update()
+                )
+                if policy is None:
+                    # Do not reveal whether an out-of-scope or unknown
+                    # policy exists: unknown id and scope mismatch share
+                    # one indistinguishable 404.
+                    raise HTTPException(status_code=404, detail="policy not found")
+                if policy.status == POLICY_STATUS_RETIRED:
+                    # A repeated retire is a conflict. It neither rewrites
+                    # the recorded retirement time nor appends any audit or
+                    # other state record.
+                    raise HTTPException(
+                        status_code=409, detail="policy already retired"
+                    )
+                # Atomic settlement: only one caller can flip
+                # active -> retired, and retired_at is written by that
+                # same single-row update.
+                outcome = session.execute(
+                    update(Policy)
+                    .where(
+                        Policy.policy_id == policy_id,
+                        Policy.status == POLICY_STATUS_ACTIVE,
+                    )
+                    .values(
+                        status=POLICY_STATUS_RETIRED,
+                        retired_at=retired_at,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                if outcome.rowcount != 1:
+                    session.rollback()
+                    fresh = session.get(Policy, policy_id)
+                    if fresh is not None and fresh.status == POLICY_STATUS_RETIRED:
+                        raise HTTPException(
+                            status_code=409, detail="policy already retired"
+                        )
+                    raise HTTPException(
+                        status_code=409, detail="policy retirement conflict"
+                    )
+                try:
+                    session.commit()
+                except Exception:
+                    session.rollback()
+                    logger.error("policy retirement failed")
+                    raise HTTPException(
+                        status_code=500, detail="policy retirement failed"
+                    )
+            except HTTPException:
+                # 404/409 judgements and the controlled 500 above keep
+                # their status; a read-only judgement has written nothing.
+                raise
+            except Exception:
+                # A failure during the locked lookup is a full rollback and
+                # a sanitized 500: the status update can never have happened
+                # on this path, so the version stays active with no time set.
+                session.rollback()
+                logger.error("policy retirement failed")
+                raise HTTPException(
+                    status_code=500, detail="policy retirement failed"
+                )
+        # Compact JSON describing only the retirement result. The keys are
+        # emitted in the fixed order policy_id, status, retired_at; every
+        # value is a string (allow_nan=False makes non-finite numbers
+        # impossible), terminated by exactly one newline. No rule, claim,
+        # evidence, nonce, capability, payload, key or exception text is
+        # ever present.
+        body_bytes = json.dumps(
+            {
+                "policy_id": policy_id,
+                "status": POLICY_STATUS_RETIRED,
+                "retired_at": _rfc3339(retired_at),
+            },
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return Response(
+            content=body_bytes + b"\n",
+            status_code=200,
+            media_type="application/json",
+        )
+
     @app.post(
         "/v1/evidence/{evidence_id}/decisions",
         response_model=DecisionResponse,
@@ -4972,7 +5146,9 @@ def create_app(
                 raise HTTPException(status_code=422, detail="invalid nonce")
 
             policy = session.scalar(
-                select(Policy).where(Policy.policy_id == body.policy_id)
+                select(Policy)
+                .where(Policy.policy_id == body.policy_id)
+                .with_for_update()
             )
             if (
                 policy is None
@@ -4999,6 +5175,20 @@ def create_app(
                     status=existing.status,
                     decided_at=_rfc3339(existing.decided_at),
                 )
+
+            # A retired policy version is terminal and can never produce a
+            # *new* decision. This follows the idempotent replay lookup, so
+            # a decision already recorded against the version keeps
+            # returning its stored result: retirement is never retroactive
+            # and existing decisions keep their status, policy_version and
+            # decided_at. The row lock taken above orders this judgement
+            # against retirement on the same version — a retire that
+            # commits first is observed as 409 and inserts neither a
+            # decision nor a proof event, while a retire that commits after
+            # this decision never rewrites it. SQLite serializes all
+            # writers via BEGIN IMMEDIATE.
+            if policy.status == POLICY_STATUS_RETIRED:
+                raise HTTPException(status_code=409, detail="policy is retired")
 
             # Only settled, verified evidence may drive a release decision;
             # received (unverified) and rejected evidence cannot. This gate

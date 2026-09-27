@@ -38,6 +38,21 @@ DECISION_STATUS_ALLOWED = "allowed"
 DECISION_STATUS_DENIED = "denied"
 DECISION_STATUS_CODES = frozenset({DECISION_STATUS_ALLOWED, DECISION_STATUS_DENIED})
 
+#: Finite, service-defined set of policy-version lifecycle statuses. A
+#: policy version is born active and is retired exactly once; retirement
+#: is a terminal state. A retired version keeps its row (so its id,
+#: version, rule and the decisions already taken against it stay
+#: explainable and addressable) but can no longer produce new decisions:
+#: a decision request against it fails with 409. Creating the next
+#: version of the same name allocates a fresh active row, so retirement
+#: of one version cannot be bypassed by deleting or overwriting it —
+#: versions are never deleted or updated, and a retired version is never
+#: made active again. Versions are strictly isolated: retiring one
+#: version changes no other version.
+POLICY_STATUS_ACTIVE = "active"
+POLICY_STATUS_RETIRED = "retired"
+POLICY_STATUS_CODES = frozenset({POLICY_STATUS_ACTIVE, POLICY_STATUS_RETIRED})
+
 #: Finite, service-defined set of persisted release-grant statuses. A grant
 #: is born pending and settles atomically, exactly once, to either consumed
 #: (its first successful presentation or payload release) or revoked (an
@@ -506,6 +521,11 @@ class Policy(Base):
     higher version; older versions are retained and remain addressable by
     id and version so that decisions already taken against them stay
     explainable.
+
+    A version is born active and retires exactly once. Retirement leaves
+    the row and its immutable rule in place but terminates new decisions
+    against that version; it never touches the decisions already recorded
+    against it, other versions, or any release grant.
     """
 
     __tablename__ = "policies"
@@ -532,6 +552,19 @@ class Policy(Base):
     # comparison values — never evidence or claims values.
     rule_json: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    # One of POLICY_STATUS_*; active -> retired exactly once. A retired
+    # version remains stored (its id and rule still identify the decisions
+    # taken against it) but is a terminal state: it never produces a new
+    # decision and is never made active again. Other versions, including
+    # newer versions of the same name, are independent rows.
+    status: Mapped[str] = mapped_column(
+        String(16), default=POLICY_STATUS_ACTIVE
+    )
+    # Set exactly once, by the winning active -> retired transition; a
+    # repeated retire observes the stored value and never rewrites it.
+    retired_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
 
 
 class Decision(Base):
