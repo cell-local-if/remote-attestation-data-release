@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+import json
 
 import pytest
 from fastapi.testclient import TestClient
@@ -15,6 +16,8 @@ TENANT = "tenant-a"
 WORKLOAD = "workload-1"
 
 LEAF = {"claim": "measurement", "equals": "abc"}
+
+PATH_LEAF = {"path": ["tenant", "region"], "equals": "eu"}
 
 
 @pytest.fixture()
@@ -159,6 +162,99 @@ def test_create_policy_rejects_rules_outside_the_four_forms(client, rule):
 )
 def test_create_policy_accepts_the_four_rule_forms(client, rule):
     assert _create(client, rule=rule).status_code == 201
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        # path leaf basics
+        {"path": ["tenant", "region"], "equals": "eu"},
+        {"path": ["a"], "equals": 1},
+        {"path": ["a"], "equals": None},
+        {"path": ["a"], "equals": True},
+        {"path": ["a.b", "c.d"], "equals": "x"},  # dots are name characters
+        # eight segments is the inclusive bound
+        {"path": ["a", "b", "c", "d", "e", "f", "g", "h"], "equals": 1},
+        # 128 characters per segment is the inclusive bound
+        {"path": ["x" * 128], "equals": 1},
+        # nested freely with the legacy forms
+        {"all": [PATH_LEAF, LEAF]},
+        {"any": [PATH_LEAF, {"claim": "x", "equals": 1}]},
+        {"not": PATH_LEAF},
+        {
+            "all": [
+                {"any": [PATH_LEAF, {"claim": "b", "equals": 2}]},
+                {"not": {"path": ["c", "d"], "equals": False}},
+            ]
+        },
+    ],
+)
+def test_create_policy_accepts_path_rule_forms(client, rule):
+    assert _create(client, rule=rule).status_code == 201
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        {"path": [], "equals": "eu"},  # empty path
+        {"path": ["tenant", "region"]},  # missing equals
+        {"path": ["tenant", "region"], "equals": {"x": 1}},  # object equals
+        {"path": ["tenant", "region"], "equals": [1, 2]},  # array equals
+        {"path": "tenant", "equals": "eu"},  # path not a list
+        {"path": {}, "equals": "eu"},
+        {"path": None, "equals": "eu"},
+        {"path": ["tenant", 1], "equals": "eu"},  # wrong-typed segment
+        {"path": ["tenant", None], "equals": "eu"},
+        {"path": ["tenant", []], "equals": "eu"},
+        {"path": ["tenant", {}], "equals": "eu"},
+        {"path": [""], "equals": "eu"},  # empty segment
+        {"path": ["tenant", ""], "equals": "eu"},
+        {"path": [" "], "equals": "eu"},  # blank segment
+        {"path": ["tenant", "  "], "equals": "eu"},
+        {"path": ["tenant", "\t"], "equals": "eu"},
+        # nine segments exceeds the bound
+        {"path": ["a", "b", "c", "d", "e", "f", "g", "h", "i"], "equals": 1},
+        # a single segment over 128 characters
+        {"path": ["x" * 129], "equals": 1},
+        # unknown sibling keys on a path leaf
+        {"path": ["a"], "equals": 1, "extra": 2},
+        {"path": ["a"], "claim": "b"},
+        {"path": ["a"]},  # path alone is not a single-form node
+        # illegal nesting inside a path value
+        {"path": [{"claim": "a", "equals": 1}], "equals": 1},
+    ],
+)
+def test_create_policy_rejects_malformed_path_rules(client, rule):
+    assert _create(client, rule=rule).status_code == 422
+
+
+def test_malformed_path_rule_allocates_no_version_and_writes_nothing(client, app):
+    first = _create(client, rule=LEAF, name="release")
+    assert first.status_code == 201
+    rejected = _create(
+        client, rule={"path": [], "equals": "eu"}, name="release"
+    )
+    assert rejected.status_code == 422
+
+    # The rejected request neither consumed a version nor wrote a row; the
+    # next legal version of the same name is 2, not 3.
+    second = _create(client, rule=PATH_LEAF, name="release")
+    assert second.status_code == 201
+    assert second.json()["version"] == 2
+
+    with app.state.session_factory() as session:
+        rows = session.query(Policy).order_by(Policy.version).all()
+        assert [(r.name, r.version) for r in rows] == [
+            ("release", 1),
+            ("release", 2),
+        ]
+        assert json.loads(rows[1].rule_json) == PATH_LEAF
+
+
+def test_path_rule_round_trips_verbatim(client):
+    response = _create(client, rule=PATH_LEAF)
+    assert response.status_code == 201
+    assert response.json()["rule"] == PATH_LEAF
 
 
 def test_policies_persist_across_restart(tmp_path):

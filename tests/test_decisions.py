@@ -222,6 +222,234 @@ def test_missing_claim_denies(client):
     )
 
 
+def test_path_rule_allows_when_nested_value_matches(client):
+    created, evidence, evidence_id = _receive_and_verify(
+        client, {"tenant": {"region": "eu", "tier": 2}}
+    )
+    policy = _policy(client, {"path": ["tenant", "region"], "equals": "eu"})
+
+    response = _decide(client, evidence_id, created, evidence, policy["policy_id"])
+    assert response.status_code == 200
+    assert response.json()["status"] == "allowed"
+
+
+def test_path_rule_denies_when_nested_value_differs(client):
+    created, evidence, evidence_id = _receive_and_verify(
+        client, {"tenant": {"region": "us"}}
+    )
+    policy = _policy(
+        client, {"path": ["tenant", "region"], "equals": "eu"}, name="mismatch"
+    )
+    assert (
+        _decide(client, evidence_id, created, evidence, policy["policy_id"])
+        .json()["status"]
+        == "denied"
+    )
+
+
+def test_path_rule_denies_on_missing_intermediate_or_field(client):
+    policy = _policy(
+        client, {"path": ["tenant", "region"], "equals": "eu"}, name="missing"
+    )
+
+    # Completely absent top-level claim.
+    created, evidence, evidence_id = _receive_and_verify(client, {"other": 1})
+    assert (
+        _decide(client, evidence_id, created, evidence, policy["policy_id"])
+        .json()["status"]
+        == "denied"
+    )
+
+    # Intermediate object present but final field absent.
+    created, evidence, evidence_id = _receive_and_verify(client, {"tenant": {}})
+    assert (
+        _decide(client, evidence_id, created, evidence, policy["policy_id"])
+        .json()["status"]
+        == "denied"
+    )
+
+    # Empty claims object.
+    created, evidence, evidence_id = _receive_and_verify(client, {})
+    assert (
+        _decide(client, evidence_id, created, evidence, policy["policy_id"])
+        .json()["status"]
+        == "denied"
+    )
+
+
+def test_path_rule_does_not_expand_arrays_or_descend_scalars(client):
+    policy = _policy(
+        client,
+        {"path": ["tenant", "region"], "equals": "eu"},
+        name="no-expansion",
+    )
+
+    # An array in the middle is never indexed: always a miss.
+    created, evidence, evidence_id = _receive_and_verify(
+        client, {"tenant": [{"region": "eu"}]}
+    )
+    assert (
+        _decide(client, evidence_id, created, evidence, policy["policy_id"])
+        .json()["status"]
+        == "denied"
+    )
+
+    # A scalar in the middle cannot be descended either.
+    created, evidence, evidence_id = _receive_and_verify(
+        client, {"tenant": "eu"}
+    )
+    assert (
+        _decide(client, evidence_id, created, evidence, policy["policy_id"])
+        .json()["status"]
+        == "denied"
+    )
+
+    # null intermediate is a non-object and a miss, not a null match.
+    created, evidence, evidence_id = _receive_and_verify(
+        client, {"tenant": None}
+    )
+    assert (
+        _decide(client, evidence_id, created, evidence, policy["policy_id"])
+        .json()["status"]
+        == "denied"
+    )
+
+    # A value sitting inside an array at the leaf is not the same as the
+    # scalar the rule compares against.
+    created, evidence, evidence_id = _receive_and_verify(
+        client, {"tenant": {"region": ["eu"]}}
+    )
+    assert (
+        _decide(client, evidence_id, created, evidence, policy["policy_id"])
+        .json()["status"]
+        == "denied"
+    )
+
+
+def test_path_segment_dots_are_literal_name_characters(client):
+    # The single segment "tenant.region" names one top-level field that
+    # literally contains a dot; it must never be split into two segments.
+    created, evidence, evidence_id = _receive_and_verify(
+        client, {"tenant.region": "eu", "tenant": {"region": "us"}}
+    )
+    policy = _policy(client, {"path": ["tenant.region"], "equals": "eu"})
+    assert (
+        _decide(client, evidence_id, created, evidence, policy["policy_id"])
+        .json()["status"]
+        == "allowed"
+    )
+
+    # The nested object is irrelevant to the literal segment and must not
+    # satisfy it.
+    other = _policy(
+        client, {"path": ["tenant.region"], "equals": "us"}, name="lit2"
+    )
+    assert (
+        _decide(client, evidence_id, created, evidence, other["policy_id"])
+        .json()["status"]
+        == "denied"
+    )
+
+
+def test_path_rule_uses_scalar_comparison_semantics(client):
+    created, evidence, evidence_id = _receive_and_verify(
+        client, {"t": {"n": 3, "b": True, "z": None, "s": "x"}}
+    )
+    cases = {
+        "num": (["t", "n"], 3, "allowed"),
+        "num-mismatch": (["t", "n"], 4, "denied"),
+        "bool": (["t", "b"], True, "allowed"),
+        "bool-not-int": (["t", "b"], 1, "denied"),
+        "null": (["t", "z"], None, "allowed"),
+        "str": (["t", "s"], "x", "allowed"),
+    }
+    for name, (segments, expected, want) in cases.items():
+        policy = _policy(
+            client, {"path": segments, "equals": expected}, name=name
+        )
+        got = _decide(
+            client, evidence_id, created, evidence, policy["policy_id"]
+        ).json()["status"]
+        assert got == want, name
+
+
+def test_path_and_claim_rules_compose_in_one_tree(client):
+    created, evidence, evidence_id = _receive_and_verify(
+        client,
+        {
+            "measurement": "abc",
+            "tenant": {"region": "eu", "tier": 2},
+            "enabled": True,
+        },
+    )
+    satisfied = _policy(
+        client,
+        {
+            "all": [
+                {"claim": "measurement", "equals": "abc"},
+                {"path": ["tenant", "region"], "equals": "eu"},
+                {"any": [
+                    {"path": ["tenant", "tier"], "equals": 3},
+                    {"claim": "enabled", "equals": True},
+                ]},
+                {"not": {"path": ["tenant", "region"], "equals": "apac"}},
+            ]
+        },
+        name="compound-path-yes",
+    )
+    assert (
+        _decide(client, evidence_id, created, evidence, satisfied["policy_id"])
+        .json()["status"]
+        == "allowed"
+    )
+
+    unsatisfied = _policy(
+        client,
+        {"all": [
+            {"claim": "measurement", "equals": "abc"},
+            {"path": ["tenant", "region"], "equals": "apac"},
+        ]},
+        name="compound-path-no",
+    )
+    assert (
+        _decide(client, evidence_id, created, evidence, unsatisfied["policy_id"])
+        .json()["status"]
+        == "denied"
+    )
+
+
+def test_path_rule_evaluation_never_raises_on_degenerate_claims(client):
+    # No matter the shape of the claim values, descending a path is a miss
+    # rather than an exception.
+    created, evidence, evidence_id = _receive_and_verify(
+        client,
+        {
+            "a": [[1, 2], 3],
+            "b": "scalar",
+            "c": None,
+            "d": {"e": [{"f": {"g": 1}}]},
+        },
+    )
+    policy = _policy(
+        client,
+        {
+            "any": [
+                {"path": ["a", "0"], "equals": 1},
+                {"path": ["b", "x"], "equals": None},
+                {"path": ["c", "x"], "equals": None},
+                {"path": ["d", "e", "f", "g"], "equals": 1},
+            ]
+        },
+        name="degenerate",
+    )
+    assert (
+        _decide(client, evidence_id, created, evidence, policy["policy_id"])
+        .json()["status"]
+        == "denied"
+    )
+
+
+
 def test_decision_before_verification_returns_409(client):
     created, evidence, evidence_id = _receive_only(client)
     policy = _policy(client, {"claim": "measurement", "equals": "abc"})
