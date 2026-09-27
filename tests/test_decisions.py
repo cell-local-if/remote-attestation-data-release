@@ -577,3 +577,136 @@ def test_decision_evaluates_x509_builtin_json_claims(client):
     response = _decide(client, evidence_id, created, evidence, policy["policy_id"])
     assert response.status_code == 200
     assert response.json()["status"] == "allowed"
+
+
+def test_path_rule_allows_when_nested_claim_matches(client):
+    claims = {"tenant": {"region": "eu", "tier": 2}}
+    created, evidence, evidence_id = _receive_and_verify(client, claims)
+    policy = _policy(client, {"path": ["tenant", "region"], "equals": "eu"})
+
+    response = _decide(client, evidence_id, created, evidence, policy["policy_id"])
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "allowed"
+
+
+@pytest.mark.parametrize(
+    "claims,rule",
+    [
+        # Missing intermediate object and missing final field.
+        ({}, {"path": ["tenant", "region"], "equals": "eu"}),
+        ({"tenant": {}}, {"path": ["tenant", "region"], "equals": None}),
+        # An array never expands and cannot be indexed by a segment.
+        (
+            {"tenant": [{"region": "eu"}]},
+            {"path": ["tenant", "region"], "equals": "eu"},
+        ),
+        # A scalar where another object field is expected is a miss, not
+        # an error.
+        ({"tenant": "eu"}, {"path": ["tenant", "region"], "equals": "eu"}),
+        # A terminal value that does not compare equal (type-strict).
+        ({"tenant": {"region": "EU"}}, {"path": ["tenant", "region"], "equals": "eu"}),
+        ({"tenant": {"region": 1}}, {"path": ["tenant", "region"], "equals": True}),
+        ({"tenant": {"region": None}}, {"path": ["tenant", "region"], "equals": "eu"}),
+        # An explicit null is present-but-not-equal to a string, while an
+        # absent field is not equal to null.
+        (
+            {"tenant": {"region": "eu"}},
+            {"path": ["tenant", "region"], "equals": None},
+        ),
+    ],
+)
+def test_path_rule_denies_on_miss_without_raising(client, claims, rule):
+    created, evidence, evidence_id = _receive_and_verify(client, claims)
+    policy = _policy(client, rule)
+
+    response = _decide(client, evidence_id, created, evidence, policy["policy_id"])
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "denied"
+
+
+def test_path_rule_allows_when_terminal_value_is_null(client):
+    claims = {"tenant": {"region": None}}
+    created, evidence, evidence_id = _receive_and_verify(client, claims)
+    policy = _policy(client, {"path": ["tenant", "region"], "equals": None})
+
+    response = _decide(client, evidence_id, created, evidence, policy["policy_id"])
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "allowed"
+
+
+def test_path_segment_with_dot_is_one_literal_field_name(client):
+    # "a.b" is a single top-level-ish field name at that level, not two
+    # segments; claims["a"]["b"] must not satisfy it.
+    created, evidence, evidence_id = _receive_and_verify(
+        client, {"a": {"b": "hit"}, "a.b": "literal"}
+    )
+
+    literal = _policy(
+        client, {"path": ["a.b"], "equals": "literal"}, name="literal"
+    )
+    assert (
+        _decide(client, evidence_id, created, evidence, literal["policy_id"])
+        .json()["status"]
+        == "allowed"
+    )
+
+    split = _policy(
+        client, {"path": ["a.b"], "equals": "hit"}, name="split"
+    )
+    assert (
+        _decide(client, evidence_id, created, evidence, split["policy_id"])
+        .json()["status"]
+        == "denied"
+    )
+
+
+def test_path_and_claim_rules_compose_in_one_tree(client):
+    claims = {
+        "measurement": "abc",
+        "tenant": {"region": "eu", "blocked": False},
+    }
+    created, evidence, evidence_id = _receive_and_verify(client, claims)
+    satisfied = _policy(
+        client,
+        {
+            "all": [
+                {"claim": "measurement", "equals": "abc"},
+                {"any": [
+                    {"path": ["tenant", "region"], "equals": "us"},
+                    {"path": ["tenant", "region"], "equals": "eu"},
+                ]},
+                {"not": {"path": ["tenant", "blocked"], "equals": True}},
+            ]
+        },
+        name="mixed-yes",
+    )
+    assert (
+        _decide(client, evidence_id, created, evidence, satisfied["policy_id"])
+        .json()["status"]
+        == "allowed"
+    )
+
+    unsatisfied = _policy(
+        client,
+        {"not": {"path": ["tenant", "blocked"], "equals": False}},
+        name="mixed-no",
+    )
+    assert (
+        _decide(client, evidence_id, created, evidence, unsatisfied["policy_id"])
+        .json()["status"]
+        == "denied"
+    )
+
+
+def test_path_rule_decision_is_immutable_on_retry(client):
+    claims = {"tenant": {"region": "eu"}}
+    created, evidence, evidence_id = _receive_and_verify(client, claims)
+    policy = _policy(client, {"path": ["tenant", "region"], "equals": "eu"})
+
+    first = _decide(client, evidence_id, created, evidence, policy["policy_id"])
+    second = _decide(client, evidence_id, created, evidence, policy["policy_id"])
+    assert first.status_code == 200
+    assert second.json() == first.json()

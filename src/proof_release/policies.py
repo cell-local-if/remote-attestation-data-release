@@ -1,16 +1,18 @@
 """Versioned release-policy rule trees.
 
-A rule is a small JSON tree with exactly four node forms::
+A rule is a small JSON tree with exactly five node forms::
 
     {"claim": "<top-level claim name>", "equals": <scalar>}
+    {"path": ["<segment>", ...], "equals": <scalar>}
     {"all": [rule, ...]}
     {"any": [rule, ...]}
     {"not": rule}
 
 Scalars are JSON scalars (string, number, boolean or null). Rules mention
-only claim *names* and expected scalar values — they never contain raw
-evidence, nonces or claim material — so persisting their canonical
-serialization is compatible with the no-raw-evidence guarantee.
+only claim *names* (or object paths) and expected scalar values — they
+never contain raw evidence, nonces or claim material — so persisting
+their canonical serialization is compatible with the no-raw-evidence
+guarantee.
 """
 
 from __future__ import annotations
@@ -26,6 +28,8 @@ __all__ = [
     "canonical_rule_json",
     "MAX_RULE_DEPTH",
     "MAX_RULE_NODES",
+    "MAX_PATH_SEGMENTS",
+    "MAX_PATH_SEGMENT_LENGTH",
 ]
 
 #: Defensive bounds so a submitted rule cannot exhaust the stack or the
@@ -33,9 +37,14 @@ __all__ = [
 MAX_RULE_DEPTH = 32
 MAX_RULE_NODES = 256
 
+#: Bounds on declared object paths so an unbounded path can never enter
+#: persisted state.
+MAX_PATH_SEGMENTS = 8
+MAX_PATH_SEGMENT_LENGTH = 128
+
 
 class InvalidRule(ValueError):
-    """Raised when a submitted rule tree is not one of the four forms."""
+    """Raised when a submitted rule tree is not one of the five forms."""
 
 
 def _is_scalar(value: Any) -> bool:
@@ -48,13 +57,37 @@ def _is_scalar(value: Any) -> bool:
     return False
 
 
+def _validate_path(path: Any) -> None:
+    """Validate the ``path`` sibling of a path leaf.
+
+    It must be a non-empty list of at most :data:`MAX_PATH_SEGMENTS`
+    segments; each segment is a non-blank string no longer than
+    :data:`MAX_PATH_SEGMENT_LENGTH` characters. A segment names exactly
+    one object field — dots embedded in a segment are literal characters
+    of that single name and never split it.
+    """
+    if not isinstance(path, list) or not path:
+        raise InvalidRule("path must be a non-empty list of segments")
+    if len(path) > MAX_PATH_SEGMENTS:
+        raise InvalidRule(f"path may name at most {MAX_PATH_SEGMENTS} segments")
+    for segment in path:
+        if not isinstance(segment, str) or not segment or not segment.strip():
+            raise InvalidRule("path segments must be non-empty strings")
+        if len(segment) > MAX_PATH_SEGMENT_LENGTH:
+            raise InvalidRule(
+                f"path segments may be at most {MAX_PATH_SEGMENT_LENGTH} "
+                "characters"
+            )
+
+
 def validate_rule(rule: Any) -> dict[str, Any]:
     """Validate a rule tree, returning it unchanged on success.
 
     Raises :class:`InvalidRule` for anything that is not exactly one of the
-    four documented forms: unknown node keys, multiple/unknown keys on a
+    five documented forms: unknown node keys, multiple/unknown keys on a
     node, missing siblings, non-scalar comparisons, empty ``all``/``any``
-    lists, or structures past the defensive size bounds.
+    lists, malformed ``path`` siblings, or structures past the defensive
+    size bounds.
     """
     nodes = 0
 
@@ -74,6 +107,11 @@ def validate_rule(rule: Any) -> dict[str, Any]:
             claim = node["claim"]
             if not isinstance(claim, str) or not claim:
                 raise InvalidRule("claim must name a top-level claim")
+            if not _is_scalar(node["equals"]):
+                raise InvalidRule("equals must compare against a scalar")
+            return
+        if keys == {"path", "equals"}:
+            _validate_path(node["path"])
             if not _is_scalar(node["equals"]):
                 raise InvalidRule("equals must compare against a scalar")
             return
@@ -126,17 +164,43 @@ def _scalar_equals(actual: Any, expected: Any) -> bool:
     return False
 
 
+_MISSING = object()
+
+
+def _read_path(claims: Any, segments: list[str]) -> Any:
+    """Read a declared path one object field at a time.
+
+    Only JSON object fields are descended through: encountering an array
+    or scalar before the last segment, or a missing field at any level,
+    means the path is absent. Array elements never expand and indexing is
+    not supported.
+    """
+    current = claims
+    for segment in segments:
+        if not isinstance(current, dict) or segment not in current:
+            return _MISSING
+        current = current[segment]
+    return current
+
+
 def evaluate_rule(rule: dict[str, Any], claims: dict[str, Any]) -> bool:
     """Evaluate a validated rule against top-level verified claims.
 
-    A missing claim simply fails its comparison (an absent key is *not*
-    equal to an explicit ``null``), and non-object claims never match.
+    A missing claim or object path simply fails its comparison (an absent
+    key is *not* equal to an explicit ``null``), and non-object values
+    encountered while descending a path block further descent. Compound
+    nodes keep their short-circuit semantics.
     """
     keys = set(rule.keys())
     if keys == {"claim", "equals"}:
         if not isinstance(claims, dict) or rule["claim"] not in claims:
             return False
         return _scalar_equals(claims[rule["claim"]], rule["equals"])
+    if keys == {"path", "equals"}:
+        actual = _read_path(claims, rule["path"])
+        if actual is _MISSING:
+            return False
+        return _scalar_equals(actual, rule["equals"])
     (key,) = keys
     if key == "all":
         return all(evaluate_rule(child, claims) for child in rule["all"])
