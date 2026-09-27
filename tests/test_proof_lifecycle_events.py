@@ -874,7 +874,9 @@ def test_fixed_snapshot_excludes_later_commit_with_older_business_time(
     backdated = t0 + (t1 - t0) / 2
 
     # Commits strictly after the first query, with a business time that
-    # sorts between the two rows already returned.
+    # sorts between the two rows already returned. The commit-order marker
+    # is reserved just as the receive/verify/decision transactions do, so
+    # it is necessarily greater than the fixed snapshot's cutoff.
     late_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     with app.state.session_factory() as session:
         session.add(
@@ -888,6 +890,7 @@ def test_fixed_snapshot_excludes_later_commit_with_older_business_time(
                 evidence_format="attested-nonce-json",
                 status="received",
                 occurred_at=backdated,
+                commit_seq=app_module._proof_commit_seq_for(session),
             )
         )
         session.commit()
@@ -913,6 +916,106 @@ def test_fixed_snapshot_excludes_later_commit_with_older_business_time(
 
 
 # --- read-only behaviour ---------------------------------------------------
+
+
+def _force_non_sqlite_dialect(monkeypatch, application):
+    """Make the app's engine take the locking-backend query branch.
+
+    The engine still runs on SQLite storage (whose writer remains
+    serialized), but its dialect reports a non-SQLite name and accepts the
+    REPEATABLE READ isolation pin without emitting a backend-specific SET
+    command. This exercises the same snapshot/cursor code path a PostgreSQL
+    or MySQL deployment takes, including the per-query connection option.
+    """
+    dialect = application.state.engine.dialect
+
+    monkeypatch.setattr(dialect, "name", "postgresql")
+    monkeypatch.setattr(
+        dialect,
+        "get_isolation_level_values",
+        lambda dbapi_conn: (
+            "SERIALIZABLE",
+            "AUTOCOMMIT",
+            "REPEATABLE READ",
+        ),
+    )
+    monkeypatch.setattr(
+        dialect, "set_isolation_level", lambda dbapi_conn, level: None
+    )
+
+
+def test_non_sqlite_snapshot_excludes_later_commit_with_older_time(
+    app, client, monkeypatch
+):
+    # Same commit-boundary guarantee through the non-SQLite branch: the
+    # fixed snapshot is bounded by the portable commit_seq marker, so an
+    # event committed after the first query but carrying an older (or equal)
+    # business time never enters the fixed pages — without relying on
+    # timestamps, rowid or any particular write interleaving.
+    _force_non_sqlite_dialect(monkeypatch, app)
+    monkeypatch.setattr(app_module, "PROOF_EVENT_PAGE_SIZE", 2)
+    _full_proof(client)  # received, verified, decision
+
+    first = _query(client).json()
+    assert len(first["events"]) == 2
+    cursor = first["next_cursor"]
+
+    t0 = datetime.fromisoformat(first["events"][0]["occurred_at"])
+    t1 = datetime.fromisoformat(first["events"][1]["occurred_at"])
+    # Split the difference (older business time) ...
+    backdated = t0 + (t1 - t0) / 2
+    # ... and an equal timestamp case, which must also be excluded purely
+    # by commit order rather than by a tie on occurred_at.
+    equal_time = t1
+
+    for idx, stamp in enumerate((backdated, equal_time)):
+        late_id = (
+            f"bbbbbbbb-bbbb-4bbb-8bbb-{idx:012d}"
+        )
+        with app.state.session_factory() as session:
+            session.add(
+                ProofLifecycleEvent(
+                    event_id=late_id,
+                    tenant_id=TENANT,
+                    workload_id=WORKLOAD,
+                    event_type="proof-received",
+                    evidence_id=late_id,
+                    policy_version=None,
+                    evidence_format="attested-nonce-json",
+                    status="received",
+                    occurred_at=stamp,
+                    commit_seq=app_module._proof_commit_seq_for(session),
+                )
+            )
+            session.commit()
+
+    second = _query(client, cursor=cursor).json()
+    assert len(second["events"]) == 1
+    assert second["complete"] is True
+    assert second["next_cursor"] == ""
+    late_ids = {
+        "bbbbbbbb-bbbb-4bbb-8bbb-000000000000",
+        "bbbbbbbb-bbbb-4bbb-8bbb-000000000001",
+    }
+    assert second["events"][0]["event_id"] not in late_ids
+
+    # Replay is stable, and a fresh first query observes all five exactly
+    # once in business-time/id order.
+    assert _query(client, cursor=cursor).json() == second
+    fresh = _walk(client, page_size=2, monkeypatch=monkeypatch)
+    assert len(fresh) == 5
+    assert {row["event_id"] for row in fresh} >= late_ids
+    keys = [(row["occurred_at"], row["event_id"]) for row in fresh]
+    assert keys == sorted(keys)
+
+
+def test_non_sqlite_empty_snapshot_stays_empty(app, client, monkeypatch):
+    _force_non_sqlite_dialect(monkeypatch, app)
+    empty = _query(client).json()
+    assert empty == {"events": [], "next_cursor": "", "complete": True}
+    _full_proof(client)
+    # The empty snapshot fixed at seq 0 admits nothing later.
+    assert _query(client).json()["events"]  # only a fresh query sees them
 
 
 def test_query_writes_no_state(app, client):

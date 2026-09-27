@@ -20,7 +20,6 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 class Base(DeclarativeBase):
     pass
 
-
 #: Finite, service-defined set of persisted verification outcome codes.
 #: The stored code is derived solely from the verifier's accept/reject
 #: verdict; plugin-supplied text is never persisted in any form.
@@ -951,14 +950,22 @@ class ProofLifecycleEvent(Base):
             name="uq_proof_lifecycle_event_evidence_type",
         ),
         # Covers the scoped listing ordered by the (occurred_at, event_id)
-        # keyset, including its exclusive cursor predicate and the fixed
-        # snapshot high-water mark.
+        # keyset, including its exclusive cursor predicate.
         Index(
             "ix_proof_lifecycle_events_scope_occurred",
             "tenant_id",
             "workload_id",
             "occurred_at",
             "event_id",
+        ),
+        # Covers the fixed-snapshot membership predicate bounded by the
+        # portable commit-order marker (commit_seq) on backends that do not
+        # expose a SQLite-style rowid.
+        Index(
+            "ix_proof_lifecycle_events_scope_commit_seq",
+            "tenant_id",
+            "workload_id",
+            "commit_seq",
         ),
     )
 
@@ -983,6 +990,45 @@ class ProofLifecycleEvent(Base):
     status: Mapped[str] = mapped_column(String(16))
     # Commit time of the recorded stage; the stable listing key.
     occurred_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+    # Portable, globally monotonic commit-order marker allocated inside the
+    # same transaction that inserts the event (one row per committed event,
+    # never reused on a rollback). It is the fixed-snapshot high-water mark
+    # on every backend: it orders events by *commit*, not by business time,
+    # so an event that commits after a query fixed its snapshot but carries
+    # an older ``occurred_at`` can never enter that snapshot, regardless of
+    # backend, writer interleaving or equal timestamps. Every event carries
+    # a value (the single global allocator serializes commit order), which
+    # also makes a fixed snapshot stable across restarts.
+    commit_seq: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+
+
+class ProofEventCommitCounter(Base):
+    """Singleton allocator for proof-lifecycle event commit-order markers.
+
+    A single row (``scope`` = the fixed global key) holds the next
+    :data:`ProofLifecycleEvent.commit_seq` value. A transaction that
+    records a proof stage locks this row, reads the value, bumps it and
+    uses the old value for its event, all inside the same business
+    transaction. Because the row lock is held until that transaction
+    commits, allocated values follow commit order on every locking
+    backend without depending on a database-specific insert marker
+    (SQLite serializes writers via ``BEGIN IMMEDIATE`` instead, so the
+    lock is a no-op there but ordering is identical). The bump commits
+    and rolls back together with the event, so a failed business
+    transaction consumes no value: committed events carry a strictly
+    increasing, gap-free marker order.
+
+    The table stores only a fixed key and an integer — never any event
+    content, identifier or secret.
+    """
+
+    __tablename__ = "proof_event_commit_counters"
+
+    #: Primary key of the one global allocator row.
+    GLOBAL_SCOPE = "global"
+
+    scope: Mapped[str] = mapped_column(String(32), primary_key=True)
+    next_seq: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
 class RateLimitCounter(Base):
