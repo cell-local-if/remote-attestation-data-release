@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
@@ -938,6 +939,18 @@ class ProofLifecycleEvent(Base):
     non-sensitive descriptors, not material. Columns that do not apply to
     an event type (``policy_version`` for non-decisions,
     ``evidence_format`` for non-receptions) are stored as NULL.
+
+    ``commit_seq`` fixes the snapshot the first audit query takes to the
+    business commit boundary rather than to ``occurred_at``: it is a
+    per-scope gap-free sequence allocated inside the same transaction as
+    the event, strictly increasing in commit order on every backend (not
+    just SQLite). Two events of one scope can therefore never share a
+    sequence and a later commit always takes the greater one, even when
+    its business time is older or identical; the audit query bounds its
+    replayable snapshot by this marker, never by write timing or equal
+    timestamps. Rows written by older deployments are backfilled
+    (SQLite) and fresh deployments always populate it; it is nullable
+    only for such legacy rows.
     """
 
     __tablename__ = "proof_lifecycle_events"
@@ -951,14 +964,27 @@ class ProofLifecycleEvent(Base):
             name="uq_proof_lifecycle_event_evidence_type",
         ),
         # Covers the scoped listing ordered by the (occurred_at, event_id)
-        # keyset, including its exclusive cursor predicate and the fixed
-        # snapshot high-water mark.
+        # keyset, including its exclusive cursor predicate.
         Index(
             "ix_proof_lifecycle_events_scope_occurred",
             "tenant_id",
             "workload_id",
             "occurred_at",
             "event_id",
+        ),
+        # Per-scope commit order: the immutable high-water mark that fixes
+        # the audit snapshot to committed business boundaries. Unique so
+        # two concurrent allocations can never mint the same sequence;
+        # together with the per-scope counter row taken FOR UPDATE (and
+        # BEGIN IMMEDIATE on SQLite) this makes the order gap-free on
+        # every backend, and the index covers the scoped snapshot
+        # predicate.
+        Index(
+            "ix_proof_lifecycle_events_scope_commit_seq",
+            "tenant_id",
+            "workload_id",
+            "commit_seq",
+            unique=True,
         ),
     )
 
@@ -970,6 +996,11 @@ class ProofLifecycleEvent(Base):
     # The evidence whose lifecycle stage this event records; all three
     # stages of one proof share this identifier.
     evidence_id: Mapped[str] = mapped_column(String(36), index=True)
+    # Gap-free per-scope sequence allocated in the event's own transaction,
+    # strictly increasing in business commit order on every backend. NULL
+    # only on rows written before the column existed (backfilled on
+    # SQLite); every new event carries a positive value.
+    commit_seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Set for proof-decision events (the version decided against); NULL
     # for reception and verification events.
     policy_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -983,6 +1014,40 @@ class ProofLifecycleEvent(Base):
     status: Mapped[str] = mapped_column(String(16))
     # Commit time of the recorded stage; the stable listing key.
     occurred_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+
+
+class ProofEventCommitCounter(Base):
+    """Per-scope monotonic allocator for proof-lifecycle ``commit_seq``.
+
+    Exactly one row exists per ``(tenant_id, workload_id)``. It is an
+    internal ordering device — never exposed on any response and holding
+    no business state, material or secret — whose sole purpose is to make
+    the proof audit's snapshot cutoff the business commit boundary on
+    every backend:
+
+    * allocating the next sequence reads this row ``FOR UPDATE`` (locking
+      backends) so concurrent proofs in one scope are serialized on the
+      counter row itself, not merely on the latest event (a lock that
+      would not gap-lock a new maximum);
+    * on SQLite every write transaction already begins as BEGIN
+      IMMEDIATE, serializing all writers process-wide;
+    * the scope's first allocation inserts the anchor inside a savepoint,
+      so the unique ``(tenant_id, workload_id)`` race costs only that
+      savepoint and never rolls the surrounding reception back.
+
+    The counter advances in the same transaction as the event it
+    sequences, so a committed event's sequence is final and strictly
+    greater than every event that committed before it, independent of
+    write timing or equal business timestamps.
+    """
+
+    __tablename__ = "proof_event_commit_counters"
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # Last per-scope commit sequence handed out; 1 for the scope's first
+    # event, strictly increasing thereafter.
+    last_seq: Mapped[int] = mapped_column(BigInteger)
 
 
 class RateLimitCounter(Base):

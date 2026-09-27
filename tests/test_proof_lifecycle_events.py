@@ -874,9 +874,15 @@ def test_fixed_snapshot_excludes_later_commit_with_older_business_time(
     backdated = t0 + (t1 - t0) / 2
 
     # Commits strictly after the first query, with a business time that
-    # sorts between the two rows already returned.
+    # sorts between the two rows already returned. It takes the next
+    # business commit boundary for the scope (sequence 4), so its older
+    # business time cannot smuggle it into the already-fixed snapshot.
     late_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     with app.state.session_factory() as session:
+        from proof_release.app import _next_proof_event_commit_seq
+
+        late_seq = _next_proof_event_commit_seq(session, TENANT, WORKLOAD)
+        assert late_seq == 4
         session.add(
             ProofLifecycleEvent(
                 event_id=late_id,
@@ -884,6 +890,7 @@ def test_fixed_snapshot_excludes_later_commit_with_older_business_time(
                 workload_id=WORKLOAD,
                 event_type="proof-received",
                 evidence_id=late_id,
+                commit_seq=late_seq,
                 policy_version=None,
                 evidence_format="attested-nonce-json",
                 status="received",
@@ -961,3 +968,221 @@ def test_events_available_after_restart(tmp_path, monkeypatch):
     assert keys == sorted(keys)
     assert data["complete"] is True
     second.state.engine.dispose()
+
+
+# --- per-scope business commit sequence ------------------------------------
+
+
+def test_commit_sequence_is_gap_free_in_commit_order(app, client):
+    # Two full proofs in one scope commit six events; the per-scope
+    # sequence is gap-free 1..6 in commit order, regardless of the
+    # business timestamps each stage carried.
+    _full_proof(client)
+    _full_proof(client)
+    with app.state.session_factory() as session:
+        seqs = [
+            row.commit_seq
+            for row in session.query(ProofLifecycleEvent)
+            .order_by(ProofLifecycleEvent.commit_seq)
+            .all()
+        ]
+        assert seqs == [1, 2, 3, 4, 5, 6]
+        # Each stage type is represented in its committed position.
+        ordered = [
+            (row.commit_seq, row.event_type)
+            for row in session.query(ProofLifecycleEvent)
+            .order_by(ProofLifecycleEvent.commit_seq)
+            .all()
+        ]
+    assert [ty for _, ty in ordered[0::3]] == ["proof-received", "proof-received"]
+
+
+def test_commit_sequence_counter_is_per_scope(app, client):
+    _full_proof(client)
+    with app.state.session_factory() as session:
+        from proof_release.db import ProofEventCommitCounter
+
+        first = session.get(ProofEventCommitCounter, (TENANT, WORKLOAD))
+        assert first is not None and first.last_seq == 3
+    # A different tenant/workload is an independent sequence starting at 1.
+    created, evidence, other_eid = _submit(
+        client, tenant=OTHER_TENANT, workload=OTHER_WORKLOAD
+    )
+    _verify(
+        client,
+        created,
+        evidence,
+        other_eid,
+        tenant=OTHER_TENANT,
+        workload=OTHER_WORKLOAD,
+    )
+    with app.state.session_factory() as session:
+        from proof_release.db import ProofEventCommitCounter
+
+        other = session.get(
+            ProofEventCommitCounter, (OTHER_TENANT, OTHER_WORKLOAD)
+        )
+        assert other is not None and other.last_seq == 2
+        first = session.get(ProofEventCommitCounter, (TENANT, WORKLOAD))
+        assert first.last_seq == 3  # untouched by the other scope
+
+
+def test_commit_sequence_continues_after_restart(tmp_path, monkeypatch):
+    monkeypatch.setenv("PROOF_RELEASE_ATTESTED_NONCE_SECRET", SECRET)
+    monkeypatch.setenv("PROOF_RELEASE_MASTER_KEY", KEY_V1)
+    url = f"sqlite:///{tmp_path}/seq_restart.db"
+    first = create_app(url)
+    client1 = TestClient(first)
+    _full_proof(client1)
+    first.state.engine.dispose()
+
+    second = create_app(url)
+    client2 = TestClient(second)
+    _full_proof(client2)
+    with second.state.session_factory() as session:
+        seqs = sorted(
+            row.commit_seq for row in session.query(ProofLifecycleEvent).all()
+        )
+        assert seqs == [1, 2, 3, 4, 5, 6]
+    second.state.engine.dispose()
+
+
+def test_later_commit_with_equal_business_time_keeps_old_snapshot(
+    app, client, monkeypatch
+):
+    # An event that commits strictly after the first query but carries the
+    # *same* business time as an already-seen event must not enter the
+    # fixed snapshot: membership is the commit boundary, never timestamp
+    # equality.
+    monkeypatch.setattr(app_module, "PROOF_EVENT_PAGE_SIZE", 1)
+    _, _, _, _, _ = _full_proof(client)
+
+    first = _query(client).json()
+    assert len(first["events"]) == 1
+    received_time = first["events"][0]["occurred_at"]
+    cursor = first["next_cursor"]
+
+    late_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    with app.state.session_factory() as session:
+        from proof_release.app import _next_proof_event_commit_seq
+
+        late_seq = _next_proof_event_commit_seq(session, TENANT, WORKLOAD)
+        session.add(
+            ProofLifecycleEvent(
+                event_id=late_id,
+                tenant_id=TENANT,
+                workload_id=WORKLOAD,
+                event_type="proof-received",
+                evidence_id=late_id,
+                commit_seq=late_seq,
+                policy_version=None,
+                evidence_format="attested-nonce-json",
+                status="received",
+                # Identical business time to the first, already-seen event.
+                occurred_at=datetime.fromisoformat(received_time),
+            )
+        )
+        session.commit()
+
+    # Pages of the fixed snapshot hold only the original proof's two
+    # remaining events; the equal-time late commit is absent.
+    fixed = []
+    token = cursor
+    for _ in range(10):
+        page = _query(client, cursor=token).json()
+        fixed.extend(page["events"])
+        if page["complete"]:
+            break
+        token = page["next_cursor"]
+    assert [row["event_type"] for row in fixed] == [
+        "proof-verified",
+        "proof-decision",
+    ]
+    assert late_id not in {row["event_id"] for row in fixed}
+
+    # A fresh snapshot includes it exactly once, ordered stably.
+    fresh = _walk(client, page_size=1, monkeypatch=monkeypatch)
+    assert len(fresh) == 4
+    assert [row["event_id"] for row in fresh].count(late_id) == 1
+
+
+# --- legacy SQLite migration ----------------------------------------------
+
+
+def test_legacy_sqlite_database_backfills_commit_sequence(tmp_path, monkeypatch):
+    # A database written by a deployment without commit_seq: open it with
+    # the current build and confirm a rowid-order (commit-order) per-scope
+    # backfill, a seeded per-scope counter and the unique index.
+    from sqlalchemy import create_engine, text
+
+    from proof_release.db import Base
+
+    url = f"sqlite:///{tmp_path}/legacy.db"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(
+            text("DROP INDEX ix_proof_lifecycle_events_scope_commit_seq")
+        )
+        conn.execute(
+            text("ALTER TABLE proof_lifecycle_events DROP COLUMN commit_seq")
+        )
+        conn.execute(text("DROP TABLE proof_event_commit_counters"))
+        conn.execute(
+            text(
+                """
+                INSERT INTO proof_lifecycle_events
+                (event_id, tenant_id, workload_id, event_type, evidence_id,
+                 policy_version, evidence_format, status, occurred_at)
+                VALUES
+                ('11111111-1111-4111-8111-111111111111','tA','w1',
+                 'proof-received','11111111-1111-4111-8111-111111111111',
+                 NULL,'f','received','2026-01-01T00:00:03+00:00'),
+                ('22222222-2222-4222-8222-222222222222','tA','w1',
+                 'proof-verified','11111111-1111-4111-8111-111111111111',
+                 NULL,NULL,'verified','2026-01-01T00:00:01+00:00'),
+                ('33333333-3333-4333-8333-333333333333','tB','w9',
+                 'proof-received','33333333-3333-4333-8333-333333333333',
+                 NULL,'f','received','2026-01-01T00:00:02+00:00')
+                """
+            )
+        )
+    engine.dispose()
+
+    application = create_app(url)
+    try:
+        with application.state.session_factory() as session:
+            backfilled = dict(
+                session.execute(
+                    text(
+                        "SELECT event_id, commit_seq "
+                        "FROM proof_lifecycle_events ORDER BY rowid"
+                    )
+                ).fetchall()
+            )
+            # Commit order within tA is preserved even though the second
+            # row's business time is older; the other scope restarts at 1.
+            assert backfilled["11111111-1111-4111-8111-111111111111"] == 1
+            assert backfilled["22222222-2222-4222-8222-222222222222"] == 2
+            assert backfilled["33333333-3333-4333-8333-333333333333"] == 1
+
+            counters = dict(
+                session.execute(
+                    text(
+                        "SELECT tenant_id, last_seq "
+                        "FROM proof_event_commit_counters"
+                    )
+                ).fetchall()
+            )
+            assert counters == {"tA": 2, "tB": 1}
+
+            indexed = session.execute(
+                text(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+                    "AND name = "
+                    "'ix_proof_lifecycle_events_scope_commit_seq'"
+                )
+            ).fetchall()
+            assert indexed
+    finally:
+        application.state.engine.dispose()
