@@ -80,6 +80,7 @@ from proof_release.db import (
     POLICY_STATUS_RETIRED,
     TRUST_ROOT_STATUS_ACTIVE,
     TRUST_ROOT_STATUS_RETIRED,
+    TRUST_ROOT_STATUS_CODES,
     AUDIT_EVENT_STATUS_CONSUMED,
     AUDIT_EVENT_STATUS_PENDING,
     AUDIT_EVENT_STATUS_REVOKED,
@@ -1133,6 +1134,170 @@ def _decode_revocation_cursor(
     return boundary_at, boundary_revocation, snapshot_at, snapshot_id
 
 
+def _trust_root_cursor_payload(
+    tenant_id: str,
+    workload_id: str,
+    boundary_at: str,
+    boundary_root: str,
+    *,
+    root_id: str,
+    name: str,
+    status: str,
+    created_after: str,
+    created_before: str,
+    snapshot_at: str,
+    snapshot_id: str,
+) -> bytes:
+    """Canonical byte payload authenticated inside a trust-root cursor.
+
+    The cursor marks an exclusive ``(created_at, root_id)`` position and
+    every active filter plus the fixed replayable snapshot high-water mark
+    ``(created_at, root_id)`` are part of the signed payload, so a cursor
+    minted for one filter set or snapshot cannot be replayed against
+    another. The kind tag distinguishes these cursors from the rewrap,
+    grant-audit, compliance audit-event and revocation families even
+    though all share the same HMAC secret.
+    """
+    return json.dumps(
+        {
+            "k": _TRUST_ROOT_CURSOR_KIND,
+            "t": tenant_id,
+            "w": workload_id,
+            "at": boundary_at,
+            "id": boundary_root,
+            "ri": root_id,
+            "n": name,
+            "s": status,
+            "a": created_after,
+            "b": created_before,
+            "sa": snapshot_at,
+            "si": snapshot_id,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _encode_trust_root_cursor(
+    tenant_id: str,
+    workload_id: str,
+    boundary_at: str,
+    boundary_root: str,
+    *,
+    root_id: str,
+    name: str,
+    status: str,
+    created_after: str,
+    created_before: str,
+    snapshot_at: str,
+    snapshot_id: str,
+) -> str:
+    """Build an opaque, scope- and filter-bound exclusive trust-root cursor."""
+    payload = _trust_root_cursor_payload(
+        tenant_id,
+        workload_id,
+        boundary_at,
+        boundary_root,
+        root_id=root_id,
+        name=name,
+        status=status,
+        created_after=created_after,
+        created_before=created_before,
+        snapshot_at=snapshot_at,
+        snapshot_id=snapshot_id,
+    )
+    mac = hmac.new(_cursor_secret(), payload, hashlib.sha256).digest()
+    return b64url_encode(payload + mac)
+
+
+def _decode_trust_root_cursor(
+    token: str,
+    tenant_id: str,
+    workload_id: str,
+    *,
+    root_id: str,
+    name: str,
+    status: str,
+    created_after: str,
+    created_before: str,
+) -> tuple[str, str, str, str] | None:
+    """Validate a trust-root cursor and return its exclusive boundary.
+
+    Returns ``(created_at, root_id, snapshot_at, snapshot_id)`` on
+    success or ``None`` for a malformed/forged token, a cursor of another
+    kind (rewrap, grant audit, compliance audit events or revocations),
+    or one minted for any other scope, filter combination or snapshot.
+    The beginning-of-range marker (``""``) never reaches this function.
+    """
+    if not _CURSOR_RE.fullmatch(token):
+        return None
+    try:
+        raw = b64url_decode(token)
+    except ValueError:
+        return None
+    # The MAC is a fixed 32-byte suffix; the JSON payload precedes it.
+    if len(raw) <= 32:
+        return None
+    payload, mac = raw[:-32], raw[-32:]
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    if decoded.get("k") != _TRUST_ROOT_CURSOR_KIND:
+        return None
+    boundary_at = decoded.get("at")
+    boundary_root = decoded.get("id")
+    if not isinstance(boundary_at, str) or boundary_at == "":
+        return None
+    if not isinstance(boundary_root, str) or not _UUID_RE.fullmatch(boundary_root):
+        return None
+    snapshot_at = decoded.get("sa")
+    snapshot_id = decoded.get("si")
+    # A resume cursor always names the snapshot high-water mark
+    # established by the range's first query.
+    if not isinstance(snapshot_at, str) or snapshot_at == "":
+        return None
+    if not isinstance(snapshot_id, str) or not _UUID_RE.fullmatch(snapshot_id):
+        return None
+    expected_mac = hmac.new(
+        _cursor_secret(),
+        _trust_root_cursor_payload(
+            tenant_id,
+            workload_id,
+            boundary_at,
+            boundary_root,
+            root_id=root_id,
+            name=name,
+            status=status,
+            created_after=created_after,
+            created_before=created_before,
+            snapshot_at=snapshot_at,
+            snapshot_id=snapshot_id,
+        ),
+        hashlib.sha256,
+    ).digest()
+    if not hmac.compare_digest(mac, expected_mac):
+        return None
+    # Defense in depth: the MAC already covers every field, but confirm
+    # the scope and each active filter explicitly.
+    if not hmac.compare_digest(str(decoded.get("t", "")), tenant_id):
+        return None
+    if not hmac.compare_digest(str(decoded.get("w", "")), workload_id):
+        return None
+    for key, expected in (
+        ("ri", root_id),
+        ("n", name),
+        ("s", status),
+        ("a", created_after),
+        ("b", created_before),
+    ):
+        if not hmac.compare_digest(str(decoded.get(key, "")), expected):
+            return None
+    return boundary_at, boundary_root, snapshot_at, snapshot_id
+
+
 def _rewrap_job_history_cursor_payload(
     tenant_id: str,
     workload_id: str,
@@ -1739,6 +1904,17 @@ REVOCATION_PAGE_SIZE = 100
 #: with the same secret) can never be replayed against the revocation
 #: listing, and vice versa.
 _REVOCATION_CURSOR_KIND = "certificate-revocations-v1"
+
+#: Fixed page size for the read-only trust-root registry listing. As with
+#: the other registry listings, the page size is internal and never part
+#: of the request or response contract.
+TRUST_ROOT_PAGE_SIZE = 100
+
+#: Discriminator embedded in trust-root registry cursors so a cursor from
+#: any other family (rewrap batch, grant audit, compliance audit events,
+#: revocations or job history — all authenticated with the same secret)
+#: can never be replayed against the trust-root listing, and vice versa.
+_TRUST_ROOT_CURSOR_KIND = "trust-roots-v1"
 
 #: Fixed page size for the read-only asynchronous rewrap job history.
 #: Like the other audit listings it is an internal constant and never
@@ -4817,6 +4993,321 @@ def create_app(
         """
         if await request.body() != b"":
             raise HTTPException(status_code=422, detail="query body must be empty")
+
+    @app.get("/v1/trust-roots")
+    def list_trust_roots(
+        request: Request,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        root_id: str | None = Query(default=None),
+        name: str | None = Query(default=None),
+        status: str | None = Query(default=None),
+        created_after: str | None = Query(default=None),
+        created_before: str | None = Query(default=None),
+        cursor: str | None = Query(default=None),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return a read-only, cursor-stable page of trust-root registrations.
+
+        The range is fixed by the mandatory tenant and workload and may be
+        narrowed by an explicit registration id, an exact name, a status
+        and an inclusive created-at window. Ordering is stable
+        ``(created_at, root_id)`` ascending with an exclusive keyset
+        cursor. The cursor carries its own kind tag, is HMAC-authenticated,
+        and is bound to the scope, every active filter *and* the fixed
+        snapshot established by the range's first (cursor-less) query, so
+        it can neither be forged nor replayed against a different scope,
+        filter set or snapshot, and a cursor from any other cursor family
+        is rejected. The first query's page is a replayable snapshot:
+        registrations committed afterwards never enter a replayed page and
+        surface only in a fresh first query. Retirement changes only the
+        current status/retirement-time values on a row — never its
+        ``(created_at, root_id)`` position — so a concurrent retirement
+        neither inserts nor removes a page position. The handler issues
+        only SELECTs: it never creates, retires or otherwise mutates a
+        trust root.
+        """
+        # --- request shape (all 422, no storage touched) ----------------
+        allowed_params = {
+            "tenant_id",
+            "workload_id",
+            "root_id",
+            "name",
+            "status",
+            "created_after",
+            "created_before",
+            "cursor",
+        }
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+        # Each parameter is a single scalar string; a repeated parameter
+        # (a multi-valued/list value) is the wrong shape, not a silently
+        # last-wins scalar.
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(
+                status_code=422, detail="query parameter must appear once"
+            )
+
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        root_filter: str | None = None
+        if root_id is not None:
+            if not root_id.strip() or not _UUID_RE.fullmatch(root_id):
+                raise HTTPException(
+                    status_code=422, detail="invalid trust root identifier"
+                )
+            root_filter = root_id
+
+        # Exact-text name filter. An explicit empty or whitespace name is
+        # a format error (422), never an implicit "unnamed roots" query:
+        # a root without a name carries null, not the empty string.
+        name_filter = ""
+        if name is not None:
+            if not name.strip():
+                raise HTTPException(status_code=422, detail="invalid name")
+            name_filter = name
+
+        if status is not None:
+            if not status.strip() or status not in TRUST_ROOT_STATUS_CODES:
+                raise HTTPException(status_code=422, detail="invalid status")
+        status_filter = status if status is not None else ""
+
+        def _time_bound(value: str | None, name: str) -> tuple[str, datetime | None]:
+            if value is None:
+                return "", None
+            if not value.strip():
+                raise HTTPException(
+                    status_code=422, detail=f"{name} must be UTC RFC3339"
+                )
+            try:
+                parsed = _parse_utc_rfc3339(value)
+            except ValueError:
+                raise HTTPException(
+                    status_code=422, detail=f"{name} must be UTC RFC3339"
+                )
+            # Normalize the spelling embedded into the cursor so two
+            # equivalent UTC spellings cannot mint different cursor domains.
+            return _rfc3339(parsed), parsed
+
+        after_raw, after_dt = _time_bound(created_after, "created_after")
+        before_raw, before_dt = _time_bound(created_before, "created_before")
+        # The window is closed on both ends; equality is a valid
+        # single-instant window and the start must not follow the end.
+        if after_dt is not None and before_dt is not None and after_dt > before_dt:
+            raise HTTPException(
+                status_code=422,
+                detail="created_after must not be later than created_before",
+            )
+
+        # Omitted cursor or an explicit empty string starts before the
+        # smallest registration and fixes the range's replayable snapshot.
+        # Whitespace, malformed, forged, cross-scope, cross-filter,
+        # cross-snapshot or foreign-kind cursors are indistinguishable 422s.
+        boundary_dt: datetime | None = None
+        boundary_root: str | None = None
+        snapshot_dt: datetime | None = None
+        decoded_boundary: tuple[str, str, str, str] | None = None
+        if cursor is not None and cursor != "":
+            if not cursor.strip() or not _CURSOR_RE.fullmatch(cursor):
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            decoded_boundary = _decode_trust_root_cursor(
+                cursor,
+                tenant_id,
+                workload_id,
+                root_id=root_filter or "",
+                name=name_filter,
+                status=status_filter,
+                created_after=after_raw,
+                created_before=before_raw,
+            )
+            if decoded_boundary is None:
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            boundary_at_raw, boundary_root, snapshot_at_raw, _ = decoded_boundary
+            try:
+                boundary_dt = _parse_utc_rfc3339(boundary_at_raw)
+                snapshot_dt = _parse_utc_rfc3339(snapshot_at_raw)
+            except ValueError:
+                raise HTTPException(status_code=422, detail="invalid cursor")
+
+        # --- read-only scan ---------------------------------------------
+        try:
+            with session_factory() as session:
+                # An explicitly named registration id is an exact resource
+                # selector: an unknown id or one belonging to another
+                # tenant/workload is an indistinguishable 404, so existence
+                # outside the range is never revealed. Name, status and the
+                # time window are mere range narrowing and yield an empty
+                # page instead when nothing matches.
+                if root_filter is not None:
+                    named = session.get(TrustRoot, root_filter)
+                    if (
+                        named is None
+                        or named.tenant_id != tenant_id
+                        or named.workload_id != workload_id
+                    ):
+                        raise HTTPException(
+                            status_code=404, detail="trust root not found"
+                        )
+
+                def _filtered(stmt):
+                    if root_filter is not None:
+                        stmt = stmt.where(TrustRoot.root_id == root_filter)
+                    if name_filter:
+                        stmt = stmt.where(TrustRoot.name == name_filter)
+                    if status_filter:
+                        stmt = stmt.where(TrustRoot.status == status_filter)
+                    if after_dt is not None:
+                        stmt = stmt.where(TrustRoot.created_at >= after_dt)
+                    if before_dt is not None:
+                        stmt = stmt.where(TrustRoot.created_at <= before_dt)
+                    return stmt
+
+                if snapshot_dt is None:
+                    # First query of the range: fix a replayable snapshot
+                    # as the greatest ``(created_at, root_id)`` among
+                    # currently committed, in-range rows. Registrations
+                    # committed afterwards lie beyond the high-water mark
+                    # and never enter this snapshot's pages.
+                    hwm_stmt = _filtered(
+                        select(TrustRoot.created_at, TrustRoot.root_id).where(
+                            TrustRoot.tenant_id == tenant_id,
+                            TrustRoot.workload_id == workload_id,
+                        )
+                    )
+                    hwm_row = session.execute(
+                        hwm_stmt.order_by(
+                            TrustRoot.created_at.desc(),
+                            TrustRoot.root_id.desc(),
+                        ).limit(1)
+                    ).first()
+                    if hwm_row is None:
+                        # No in-range registration at snapshot time: the
+                        # fixed first page is empty and already complete;
+                        # later commits belong to fresh first queries.
+                        rows = []
+                        hwm_created_at = None
+                        hwm_root = ""
+                    else:
+                        hwm_created_at, hwm_root = hwm_row
+                        snapshot_dt = hwm_created_at
+                else:
+                    # The snapshot high-water mark travels inside the
+                    # cursor (HMAC-verified above); its id component is
+                    # read alongside for the inclusive tie predicate.
+                    hwm_created_at = snapshot_dt
+                    hwm_root = decoded_boundary[3]
+
+                if hwm_created_at is not None:
+                    stmt = _filtered(
+                        select(TrustRoot).where(
+                            TrustRoot.tenant_id == tenant_id,
+                            TrustRoot.workload_id == workload_id,
+                            # Inclusive snapshot high-water mark.
+                            or_(
+                                TrustRoot.created_at < hwm_created_at,
+                                and_(
+                                    TrustRoot.created_at == hwm_created_at,
+                                    TrustRoot.root_id <= hwm_root,
+                                ),
+                            ),
+                        )
+                    )
+                    if boundary_dt is not None:
+                        # Exclusive (created_at, root_id) keyset.
+                        stmt = stmt.where(
+                            or_(
+                                TrustRoot.created_at > boundary_dt,
+                                and_(
+                                    TrustRoot.created_at == boundary_dt,
+                                    TrustRoot.root_id > boundary_root,
+                                ),
+                            )
+                        )
+                    stmt = stmt.order_by(
+                        TrustRoot.created_at.asc(),
+                        TrustRoot.root_id.asc(),
+                    ).limit(TRUST_ROOT_PAGE_SIZE + 1)
+                    # One extra row is the "more follows" probe. The scan
+                    # is a single read-only statement: a storage failure
+                    # aborts the whole request with a 500 rather than
+                    # returning a partial page.
+                    rows = list(session.scalars(stmt))
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("trust root query failed")
+            raise HTTPException(
+                status_code=500, detail="trust root registry unavailable"
+            )
+
+        if not rows:
+            page = []
+            has_more = False
+        else:
+            has_more = len(rows) > TRUST_ROOT_PAGE_SIZE
+            page = rows[:TRUST_ROOT_PAGE_SIZE]
+
+        trust_roots = [
+            {
+                # Field order follows the creation response, then the
+                # current lifecycle state. Values are strings except the
+                # nullable name and retirement time.
+                "root_id": row.root_id,
+                "tenant_id": row.tenant_id,
+                "workload_id": row.workload_id,
+                "name": row.name,
+                "created_at": _rfc3339(row.created_at),
+                "status": row.status,
+                "retired_at": (
+                    None if row.retired_at is None else _rfc3339(row.retired_at)
+                ),
+            }
+            for row in page
+        ]
+
+        if has_more:
+            last = page[-1]
+            next_cursor = _encode_trust_root_cursor(
+                tenant_id,
+                workload_id,
+                _rfc3339(last.created_at),
+                last.root_id,
+                root_id=root_filter or "",
+                name=name_filter,
+                status=status_filter,
+                created_after=after_raw,
+                created_before=before_raw,
+                snapshot_at=_rfc3339(hwm_created_at),
+                snapshot_id=hwm_root,
+            )
+            complete = False
+        else:
+            next_cursor = ""
+            complete = True
+
+        # Compact container (list, next_cursor, complete) with a single
+        # terminating newline. Every entry value is a string or null and
+        # complete is a boolean, so no floats, -0.0 or non-finite values
+        # can appear.
+        body = (
+            json.dumps(
+                {
+                    "trust_roots": trust_roots,
+                    "next_cursor": next_cursor,
+                    "complete": complete,
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
 
     @app.get("/v1/workload-identities")
     def list_workload_identities(
