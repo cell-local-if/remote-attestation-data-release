@@ -224,6 +224,21 @@ TRUST_ROOT_STATUS_CODES = frozenset(
 )
 
 
+#: Finite, service-defined set of release-policy lifecycle statuses. A
+#: policy version is born active and is retired exactly once; retirement
+#: is terminal and version-scoped: it retires exactly the addressed
+#: version, never other versions of the same (tenant, workload, name). A
+#: retired version keeps its row (so prior decisions stay explainable by
+#: id, version and time) but can no longer produce new decisions; the
+#: version cannot be deleted, overwritten or re-created, so retirement
+#: cannot be bypassed. A retired version is never made active again.
+POLICY_STATUS_ACTIVE = "active"
+POLICY_STATUS_RETIRED = "retired"
+POLICY_STATUS_CODES = frozenset(
+    {POLICY_STATUS_ACTIVE, POLICY_STATUS_RETIRED}
+)
+
+
 class UTCDateTime(TypeDecorator):
     """Store datetimes as UTC and always return timezone-aware UTC values."""
 
@@ -532,6 +547,18 @@ class Policy(Base):
     # comparison values — never evidence or claims values.
     rule_json: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    # One of POLICY_STATUS_*; active -> retired exactly once per version.
+    # A retired version remains stored (so decisions already taken against
+    # it keep their policy_version and stay explainable) but is terminal:
+    # it produces no new decisions and is never made active again.
+    status: Mapped[str] = mapped_column(
+        String(16), default=POLICY_STATUS_ACTIVE
+    )
+    # Set exactly once, by the winning active -> retired transition; a
+    # repeated retire observes the stored value and never rewrites it.
+    retired_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
 
 
 class Decision(Base):
