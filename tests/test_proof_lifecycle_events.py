@@ -853,6 +853,65 @@ def test_filtered_snapshot_excludes_later_in_filter_commits(client, monkeypatch)
     assert len(fresh_rows) == 3
 
 
+def test_fixed_snapshot_excludes_later_commit_with_older_business_time(
+    app, client, monkeypatch
+):
+    # A writer that stamps its business time before taking the (serialized)
+    # write lock can commit *after* the first query yet carry an older
+    # occurred_at. Snapshot membership is bounded by commit order, so such a
+    # row must never enter the already-fixed snapshot even though it sorts
+    # inside its business-time window.
+    monkeypatch.setattr(app_module, "PROOF_EVENT_PAGE_SIZE", 2)
+    _, _, _, _, _ = _full_proof(client)  # received, verified, decision
+
+    first = _query(client).json()
+    assert len(first["events"]) == 2
+    assert first["complete"] is False
+    cursor = first["next_cursor"]
+
+    t0 = datetime.fromisoformat(first["events"][0]["occurred_at"])
+    t1 = datetime.fromisoformat(first["events"][1]["occurred_at"])
+    backdated = t0 + (t1 - t0) / 2
+
+    # Commits strictly after the first query, with a business time that
+    # sorts between the two rows already returned.
+    late_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    with app.state.session_factory() as session:
+        session.add(
+            ProofLifecycleEvent(
+                event_id=late_id,
+                tenant_id=TENANT,
+                workload_id=WORKLOAD,
+                event_type="proof-received",
+                evidence_id=late_id,
+                policy_version=None,
+                evidence_format="attested-nonce-json",
+                status="received",
+                occurred_at=backdated,
+            )
+        )
+        session.commit()
+
+    # The fixed snapshot's next page is unchanged: only the original third
+    # event, already complete — the late, backdated commit is excluded.
+    second = _query(client, cursor=cursor).json()
+    assert len(second["events"]) == 1
+    assert second["complete"] is True
+    assert second["next_cursor"] == ""
+    assert second["events"][0]["event_id"] != late_id
+
+    # Replaying the cursor is byte-identical.
+    assert _query(client, cursor=cursor).json() == second
+
+    # A fresh snapshot observes the late commit exactly once, in stable
+    # business-time order.
+    fresh = _walk(client, page_size=2, monkeypatch=monkeypatch)
+    assert len(fresh) == 4
+    assert [row["event_id"] for row in fresh].count(late_id) == 1
+    keys = [(row["occurred_at"], row["event_id"]) for row in fresh]
+    assert keys == sorted(keys)
+
+
 # --- read-only behaviour ---------------------------------------------------
 
 

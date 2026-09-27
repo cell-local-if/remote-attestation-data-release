@@ -31,6 +31,7 @@ from sqlalchemy import (
     delete,
     event,
     func,
+    literal_column,
     or_,
     select,
     text,
@@ -1309,15 +1310,23 @@ def _proof_event_cursor_payload(
     occurred_before: str,
     snapshot_at: str,
     snapshot_id: str,
+    snapshot_rowid: int,
 ) -> bytes:
     """Canonical byte payload authenticated inside a proof-event cursor.
 
     The cursor marks an exclusive ``(occurred_at, event_id)`` position and
-    every active filter plus the fixed replayable snapshot high-water
-    mark ``(occurred_at, event_id)`` are part of the signed payload, so a
-    cursor minted for one filter set or snapshot cannot be replayed
-    against another. The kind tag distinguishes these cursors from every
-    other cursor family even though all share the same HMAC secret.
+    every active filter plus the fixed replayable snapshot are part of the
+    signed payload, so a cursor minted for one filter set or snapshot cannot
+    be replayed against another. The snapshot membership cutoff is carried
+    two ways: ``sr`` is the greatest committed insert order (the table's
+    ``rowid`` on SQLite, whose single serialized writer allocates it in
+    commit order) and ``sa``/``si`` are the greatest business-time key used
+    only on backends without a comparable commit-order marker. Bounding
+    membership by commit order — rather than by ``occurred_at`` — is what
+    keeps an event that commits *after* the first query but carries an
+    older business time out of the fixed snapshot. The kind tag
+    distinguishes these cursors from every other cursor family even though
+    all share the same HMAC secret.
     """
     return json.dumps(
         {
@@ -1333,6 +1342,7 @@ def _proof_event_cursor_payload(
             "b": occurred_before,
             "sa": snapshot_at,
             "si": snapshot_id,
+            "sr": snapshot_rowid,
         },
         separators=(",", ":"),
         sort_keys=True,
@@ -1352,6 +1362,7 @@ def _encode_proof_event_cursor(
     occurred_before: str,
     snapshot_at: str,
     snapshot_id: str,
+    snapshot_rowid: int,
 ) -> str:
     """Build an opaque, scope/filter/snapshot-bound exclusive proof cursor."""
     payload = _proof_event_cursor_payload(
@@ -1366,6 +1377,7 @@ def _encode_proof_event_cursor(
         occurred_before=occurred_before,
         snapshot_at=snapshot_at,
         snapshot_id=snapshot_id,
+        snapshot_rowid=snapshot_rowid,
     )
     mac = hmac.new(_cursor_secret(), payload, hashlib.sha256).digest()
     return b64url_encode(payload + mac)
@@ -1381,15 +1393,15 @@ def _decode_proof_event_cursor(
     status: str,
     occurred_after: str,
     occurred_before: str,
-) -> tuple[str, str, str, str] | None:
+) -> tuple[str, str, str, str, int] | None:
     """Validate a proof-event cursor and return its exclusive boundary.
 
-    Returns ``(occurred_at, event_id, snapshot_at, snapshot_id)`` on
-    success or ``None`` for a malformed/forged token, a cursor of another
-    kind (rewrap batch, grant audit, compliance audit events, revocations
-    or rewrap job listings), or one minted for any other scope, filter
-    combination or snapshot. The beginning marker (``""``) never reaches
-    this function.
+    Returns ``(occurred_at, event_id, snapshot_at, snapshot_id,
+    snapshot_rowid)`` on success or ``None`` for a malformed/forged token,
+    a cursor of another kind (rewrap batch, grant audit, compliance audit
+    events, revocations or rewrap job listings), or one minted for any
+    other scope, filter combination or snapshot. The beginning marker
+    (``""``) never reaches this function.
     """
     if not _CURSOR_RE.fullmatch(token):
         return None
@@ -1423,6 +1435,15 @@ def _decode_proof_event_cursor(
         return None
     if not isinstance(snapshot_id, str) or not _UUID_RE.fullmatch(snapshot_id):
         return None
+    # The commit-order membership cutoff. A non-negative integer (bools
+    # rejected) bound by the MAC: -1/0 denotes "no commit-order marker on
+    # this backend", in which case the business-time high-water mark alone
+    # bounds the snapshot.
+    snapshot_rowid = decoded.get("sr")
+    if not isinstance(snapshot_rowid, int) or isinstance(snapshot_rowid, bool):
+        return None
+    if snapshot_rowid < 0:
+        return None
     expected_mac = hmac.new(
         _cursor_secret(),
         _proof_event_cursor_payload(
@@ -1437,6 +1458,7 @@ def _decode_proof_event_cursor(
             occurred_before=occurred_before,
             snapshot_at=snapshot_at,
             snapshot_id=snapshot_id,
+            snapshot_rowid=snapshot_rowid,
         ),
         hashlib.sha256,
     ).digest()
@@ -1457,7 +1479,7 @@ def _decode_proof_event_cursor(
     ):
         if not hmac.compare_digest(str(decoded.get(key, "")), expected):
             return None
-    return boundary_at, boundary_event, snapshot_at, snapshot_id
+    return boundary_at, boundary_event, snapshot_at, snapshot_id, snapshot_rowid
 
 
 #: Fixed page size for the read-only compliance audit-event listing. As
@@ -5727,6 +5749,12 @@ def create_app(
         boundary_event: str | None = None
         snapshot_dt: datetime | None = None
         hwm_id = ""
+        # Commit-order membership cutoff carried by a resume cursor. When
+        # the backend exposes a monotonic insert marker (SQLite ``rowid``)
+        # the snapshot is bounded by it; 0 marks the absence of such a
+        # marker, in which case the business-time high-water mark bounds
+        # the snapshot instead.
+        snapshot_rowid = 0
         if cursor is not None and cursor != "":
             if not cursor.strip() or not _CURSOR_RE.fullmatch(cursor):
                 raise HTTPException(status_code=422, detail="invalid cursor")
@@ -5742,9 +5770,13 @@ def create_app(
             )
             if decoded_boundary is None:
                 raise HTTPException(status_code=422, detail="invalid cursor")
-            boundary_at_raw, boundary_event, snapshot_at_raw, hwm_id = (
-                decoded_boundary
-            )
+            (
+                boundary_at_raw,
+                boundary_event,
+                snapshot_at_raw,
+                hwm_id,
+                snapshot_rowid,
+            ) = decoded_boundary
             try:
                 boundary_dt = _parse_utc_rfc3339(boundary_at_raw)
                 snapshot_dt = _parse_utc_rfc3339(snapshot_at_raw)
@@ -5752,8 +5784,22 @@ def create_app(
                 raise HTTPException(status_code=422, detail="invalid cursor")
 
         # --- read-only proof timeline scan ------------------------------
+        rows: list = []
         try:
             with session_factory() as session:
+                # SQLite exposes a table ``rowid`` allocated under its
+                # single serialized writer (BEGIN IMMEDIATE), so it is a
+                # monotonic commit-order marker that survives restarts and
+                # needs no extra persisted column. Business time alone is
+                # not commit order — a blocked/slow writer can commit after
+                # the first query with an earlier ``occurred_at`` — so on
+                # SQLite snapshot membership is bounded by rowid, never by
+                # business time. Other backends keep the timestamp
+                # high-water mark fallback.
+                use_rowid = session.get_bind().dialect.name == "sqlite"
+                if use_rowid:
+                    rowid_col = literal_column("proof_lifecycle_events.rowid")
+
                 # An explicitly named proof must exist in exactly this
                 # tenant/workload; an unknown or cross-scope identifier is
                 # an indistinguishable 404 rather than an empty page.
@@ -5794,58 +5840,97 @@ def create_app(
 
                 if snapshot_dt is None:
                     # First query of the range: fix a replayable snapshot
-                    # as the greatest (occurred_at, event_id) among
-                    # currently committed, in-filter rows. Events committed
-                    # afterwards lie beyond the high-water mark and never
-                    # enter this snapshot's pages.
-                    hwm_stmt = _filtered(
-                        select(
-                            ProofLifecycleEvent.occurred_at,
-                            ProofLifecycleEvent.event_id,
-                        ).where(
-                            ProofLifecycleEvent.tenant_id == tenant_id,
-                            ProofLifecycleEvent.workload_id == workload_id,
-                        )
-                    )
-                    hwm_row = session.execute(
-                        hwm_stmt.order_by(
-                            ProofLifecycleEvent.occurred_at.desc(),
-                            ProofLifecycleEvent.event_id.desc(),
-                        ).limit(1)
-                    ).first()
-                    if hwm_row is None:
-                        # No in-filter event at snapshot time: the fixed
-                        # first page is empty and already complete; later
-                        # commits belong to fresh first queries.
-                        rows = []
-                        hwm_at = None
-                        hwm_id = ""
+                    # over the currently committed, in-filter rows. On
+                    # SQLite the cutoff is the greatest committed rowid; an
+                    # event committing afterwards takes a greater rowid and
+                    # can never enter this snapshot, even when its business
+                    # time is older. Elsewhere the greatest business-time
+                    # key is the high-water mark.
+                    if use_rowid:
+                        anchor_row = session.execute(
+                            _filtered(
+                                select(
+                                    rowid_col,
+                                    ProofLifecycleEvent.occurred_at,
+                                    ProofLifecycleEvent.event_id,
+                                ).where(
+                                    ProofLifecycleEvent.tenant_id == tenant_id,
+                                    ProofLifecycleEvent.workload_id
+                                    == workload_id,
+                                )
+                            ).order_by(rowid_col.desc()).limit(1)
+                        ).first()
+                        if anchor_row is None:
+                            # No in-filter event at snapshot time: the
+                            # fixed first page is empty and already
+                            # complete; later commits belong to fresh first
+                            # queries.
+                            rows = []
+                            hwm_at = None
+                            hwm_id = ""
+                            snapshot_rowid = 0
+                        else:
+                            snapshot_rowid, hwm_at, hwm_id = anchor_row
+                            snapshot_dt = hwm_at
                     else:
-                        hwm_at, hwm_id = hwm_row
-                        snapshot_dt = hwm_at
+                        hwm_stmt = _filtered(
+                            select(
+                                ProofLifecycleEvent.occurred_at,
+                                ProofLifecycleEvent.event_id,
+                            ).where(
+                                ProofLifecycleEvent.tenant_id == tenant_id,
+                                ProofLifecycleEvent.workload_id
+                                == workload_id,
+                            )
+                        )
+                        hwm_row = session.execute(
+                            hwm_stmt.order_by(
+                                ProofLifecycleEvent.occurred_at.desc(),
+                                ProofLifecycleEvent.event_id.desc(),
+                            ).limit(1)
+                        ).first()
+                        if hwm_row is None:
+                            rows = []
+                            hwm_at = None
+                            hwm_id = ""
+                        else:
+                            hwm_at, hwm_id = hwm_row
+                            snapshot_dt = hwm_at
                 else:
-                    # The snapshot high-water mark travels inside the
-                    # cursor (HMAC-verified above); its id component is
-                    # read alongside for the inclusive tie predicate.
+                    # The snapshot cutoff travels inside the cursor
+                    # (HMAC-verified above): the rowid cutoff on SQLite, the
+                    # business-time high-water mark on other backends (the
+                    # id component feeds the inclusive tie predicate).
                     hwm_at = snapshot_dt
 
-                if hwm_at is not None:
-                    stmt = _filtered(
-                        select(ProofLifecycleEvent).where(
-                            ProofLifecycleEvent.tenant_id == tenant_id,
-                            ProofLifecycleEvent.workload_id == workload_id,
-                            # Inclusive snapshot high-water mark.
+                if (use_rowid and snapshot_rowid > 0) or (
+                    not use_rowid and hwm_at is not None
+                ):
+                    scope_clause = [
+                        ProofLifecycleEvent.tenant_id == tenant_id,
+                        ProofLifecycleEvent.workload_id == workload_id,
+                    ]
+                    if use_rowid:
+                        # Inclusive fixed-snapshot cutoff by commit order.
+                        scope_clause.append(rowid_col <= snapshot_rowid)
+                    else:
+                        # Inclusive business-time high-water mark.
+                        scope_clause.append(
                             or_(
                                 ProofLifecycleEvent.occurred_at < hwm_at,
                                 and_(
                                     ProofLifecycleEvent.occurred_at == hwm_at,
                                     ProofLifecycleEvent.event_id <= hwm_id,
                                 ),
-                            ),
+                            )
                         )
+                    stmt = _filtered(
+                        select(ProofLifecycleEvent).where(*scope_clause)
                     )
                     if boundary_dt is not None:
-                        # Exclusive (occurred_at, event_id) keyset.
+                        # Exclusive (occurred_at, event_id) keyset. Snapshot
+                        # membership is fixed above; the boundary only walks
+                        # the same immutable set in business-time order.
                         stmt = stmt.where(
                             or_(
                                 ProofLifecycleEvent.occurred_at > boundary_dt,
@@ -5908,6 +5993,7 @@ def create_app(
                 occurred_before=before_raw,
                 snapshot_at=_rfc3339(hwm_at),
                 snapshot_id=hwm_id,
+                snapshot_rowid=snapshot_rowid,
             )
             complete = False
         else:
