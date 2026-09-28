@@ -69,6 +69,29 @@ RELEASE_GRANT_STATUS_CODES = frozenset(
     }
 )
 
+
+#: Finite, service-defined set of reasons recorded by a per-grant state
+#: migration timeline event. Every event is one committed state migration
+#: and its reason explains only *which* action committed it: ``issued``
+#: for the no-prior-state -> pending mint, ``consume`` for a pending ->
+#: consumed settlement via the consume endpoint, ``release`` for a
+#: pending -> consumed settlement committed by an authorized payload
+#: release (the same terminal status, a different action), and
+#: ``revoked`` for the pending -> revoked settlement. Exception text is
+#: never persisted: only one of the fixed codes below is stored.
+RELEASE_GRANT_EVENT_REASON_ISSUED = "issued"
+RELEASE_GRANT_EVENT_REASON_CONSUME = "consume"
+RELEASE_GRANT_EVENT_REASON_RELEASE = "release"
+RELEASE_GRANT_EVENT_REASON_REVOKED = "revoked"
+RELEASE_GRANT_EVENT_REASON_CODES = frozenset(
+    {
+        RELEASE_GRANT_EVENT_REASON_ISSUED,
+        RELEASE_GRANT_EVENT_REASON_CONSUME,
+        RELEASE_GRANT_EVENT_REASON_RELEASE,
+        RELEASE_GRANT_EVENT_REASON_REVOKED,
+    }
+)
+
 #: Per-envelope outcome codes recorded by a rewrap batch. ``rewrapped``
 #: means the wrapping key was replaced by the current master key version;
 #: ``skipped`` means the envelope was already wrapped under the current
@@ -892,6 +915,61 @@ class ReleaseGrant(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(
         UTCDateTime(), nullable=True
     )
+
+
+class ReleaseGrantEvent(Base):
+    """One immutable state-migration event in a single grant's timeline.
+
+    A row is inserted in the *same* committed transaction as the grant
+    migration it records: the no-prior-state -> ``pending`` issuance, the
+    pending -> ``consumed`` settlement of the consume endpoint or an
+    authorized payload release (``reason`` distinguishes the two, the new
+    status is identical), and the pending -> ``revoked`` settlement. A
+    consume, release or repeated settlement attempted after the grant is
+    already terminal appends nothing, and a transaction whose guarded
+    update loses (or that fails/rolls back) leaves no event: exactly one
+    event exists per migration that ever committed. The table is never
+    updated or deleted by the service.
+
+    The per-grant ``seq`` is a gap-free, strictly increasing, immutable
+    ordering key (1 for issuance, +1 per later committed migration)
+    allocated in the migration transaction, so the recorded order is the
+    order the migrations committed regardless of identical timestamps;
+    the timeline query orders and paginates by it.
+
+    Only identifiers, the sequence, the old/new status codes, the fixed
+    reason code and a UTC timestamp are stored — never the capability
+    (not even its digest), exception text, payload, envelope or key
+    material.
+    """
+
+    __tablename__ = "release_grant_events"
+    __table_args__ = (
+        # The gap-free per-grant sequence, both for allocation and for
+        # the timeline listing ordered by seq.
+        Index(
+            "ix_release_grant_events_grant_seq", "grant_id", "seq", unique=True
+        ),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    grant_id: Mapped[str] = mapped_column(String(36), index=True)
+    # Gap-free, immutable, per-grant sequence number in committed
+    # migration order: 1 for the issuance event, increasing by exactly
+    # one per later committed migration. It is the stable listing key.
+    seq: Mapped[int] = mapped_column(Integer)
+    # Status the grant moved away from; NULL only for issuance, whose old
+    # state is "no prior state".
+    old_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # One of RELEASE_GRANT_STATUS_*: the status the migration committed.
+    new_status: Mapped[str] = mapped_column(String(16))
+    # One of RELEASE_GRANT_EVENT_REASON_*; a fixed, service-defined code
+    # only. Exception text is never persisted in any column.
+    reason: Mapped[str] = mapped_column(String(16))
+    # Commit time of the recorded migration.
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
 class RewrapBatch(Base):
