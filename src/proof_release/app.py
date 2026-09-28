@@ -8694,6 +8694,233 @@ def create_app(
         )
         return Response(content=body, media_type="application/json")
 
+    @app.get("/v1/release-grants//trace")
+    def get_release_grant_trace_identifier_required() -> Response:
+        # An empty path segment is a missing grant identifier: a 422 client
+        # error rather than a routing-level 404. It never reads a grant,
+        # decision, envelope or outcome.
+        raise HTTPException(status_code=422, detail="invalid grant identifier")
+
+    @app.get("/v1/release-grants/{grant_id}/trace")
+    def get_release_grant_trace(
+        request: Request,
+        grant_id: str,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Read-only full-chain trace of one release grant.
+
+        Joins exactly one grant in the named scope to its decision
+        (identifier, evidence, policy version, conclusion and decision
+        time — never proof text, nonces or claim values), the existing
+        envelope the grant was minted against (identifier, scope, key
+        version and creation time only — never any cryptographic
+        material), and the grant's final outcome (pending, consumed or
+        revoked with the corresponding time).
+
+        Every request-shape failure is a 422 returned before any state is
+        read: the body must be missing or zero-length (any other bytes,
+        including whitespace, are rejected), exactly one non-blank
+        ``tenant_id`` and ``workload_id`` may be supplied as query
+        parameters (an unknown or repeated parameter is a 422), and the
+        path id must be a canonical lowercase UUID with no surrounding
+        whitespace. An unknown grant, or one belonging to another tenant
+        or workload, is one indistinguishable 404 — existence in any other
+        scope is never revealed, and the response never reveals whether
+        the referenced decision or envelope exists.
+
+        The handler issues only SELECTs of committed state: it never
+        writes a grant, decision, envelope or audit row and it never
+        touches the shared grant rate-limit budget. A storage failure at
+        any point of the chain is a 500 with the half-built result
+        discarded entirely. The capability appears only as its SHA-256
+        digest; plaintext capabilities, payloads, data keys, master
+        keys, certificate material and exception text never appear.
+        """
+        # --- request shape (all 422, no storage touched) ----------------
+        allowed_params = {"tenant_id", "workload_id"}
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+        # Each parameter is a single scalar string; a repeated parameter
+        # (even of an allowed name) is rejected rather than silently
+        # treated as last-wins.
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(
+                status_code=422, detail="query parameter must appear once"
+            )
+
+        # The raw path value must be a canonical lowercase UUID: missing
+        # (handled by the dedicated empty-segment route above), blank,
+        # whitespace-padded, uppercase or otherwise non-canonical values
+        # are format errors rejected before any state is read.
+        if not grant_id or not _UUID_RE.fullmatch(grant_id):
+            raise HTTPException(
+                status_code=422, detail="invalid grant identifier"
+            )
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        # --- read-only grant -> decision -> envelope chain --------------
+        try:
+            with session_factory() as session:
+                grant = session.get(ReleaseGrant, grant_id)
+                if (
+                    grant is None
+                    or grant.tenant_id != tenant_id
+                    or grant.workload_id != workload_id
+                ):
+                    # Do not reveal whether an unknown or out-of-scope
+                    # grant exists under another scope: both share one
+                    # indistinguishable 404, and no later lookup may hint
+                    # at whether the decision or envelope exists.
+                    raise HTTPException(
+                        status_code=404, detail="grant not found"
+                    )
+
+                decision = session.get(Decision, grant.decision_id)
+                envelope = session.get(
+                    DataEnvelope,
+                    (grant.tenant_id, grant.workload_id, grant.data_id),
+                )
+                # A grant always references a settled decision: a missing
+                # or out-of-scope row here is an integrity/storage
+                # failure, never a client error. The half-built trace is
+                # discarded rather than answering without a chain
+                # section or fabricating one.
+                if (
+                    decision is None
+                    or decision.tenant_id != tenant_id
+                    or decision.workload_id != workload_id
+                ):
+                    raise HTTPException(
+                        status_code=500,
+                        detail="grant trace unavailable",
+                    )
+                # The envelope is read metadata-only and is never
+                # unwrapped or decrypted. A grant may be minted before
+                # its envelope row exists, so a missing in-scope
+                # envelope is not an error and never a 404 (that would
+                # reveal whether the data item exists): the section
+                # carries the grant's own identifier and scope with the
+                # envelope-only fields null until the material exists.
+
+                grant_view = {
+                    "grant_id": grant.grant_id,
+                    "decision_id": grant.decision_id,
+                    "data_id": grant.data_id,
+                    "status": grant.status,
+                    "issued_at": _rfc3339(grant.issued_at),
+                    "expires_at": _rfc3339(grant.expires_at),
+                    "consumed_at": (
+                        _rfc3339(grant.consumed_at)
+                        if grant.consumed_at is not None
+                        else None
+                    ),
+                    "revoked_at": (
+                        _rfc3339(grant.revoked_at)
+                        if grant.revoked_at is not None
+                        else None
+                    ),
+                    # The capability is exposed only as its SHA-256
+                    # digest; the plaintext capability exists nowhere on
+                    # this path.
+                    "capability_sha256": grant.capability_digest,
+                }
+                decision_view = {
+                    "decision_id": decision.decision_id,
+                    # The associated proof (evidence): an identifier,
+                    # never the proof itself.
+                    "evidence_id": decision.evidence_id,
+                    # The integer policy version decided against.
+                    "policy_version": decision.policy_version,
+                    # The fixed allowed/denied conclusion code.
+                    "status": decision.status,
+                    # The original UTC decision time, never rewritten.
+                    "decided_at": _rfc3339(decision.decided_at),
+                }
+                envelope_view = {
+                    "data_id": grant.data_id,
+                    "tenant_id": grant.tenant_id,
+                    "workload_id": grant.workload_id,
+                    # Integer master key version recorded on the stored
+                    # material; null until the envelope exists. The
+                    # material itself is never read out.
+                    "key_version": (
+                        envelope.key_version if envelope is not None else None
+                    ),
+                    "created_at": (
+                        _rfc3339(envelope.created_at)
+                        if envelope is not None
+                        else None
+                    ),
+                }
+                # The final outcome derives solely from the grant row's
+                # committed status: pending while unsettled, otherwise
+                # the single terminal state with its first-and-final
+                # settlement time. Expiry is not an outcome — a grant
+                # expired while pending still reports pending — so
+                # repeated reads keep returning the identical result as
+                # the one-time state settles at most once.
+                if grant.status == RELEASE_GRANT_STATUS_CONSUMED:
+                    outcome_view = {
+                        "status": RELEASE_GRANT_STATUS_CONSUMED,
+                        "at": (
+                            _rfc3339(grant.consumed_at)
+                            if grant.consumed_at is not None
+                            else None
+                        ),
+                    }
+                elif grant.status == RELEASE_GRANT_STATUS_REVOKED:
+                    outcome_view = {
+                        "status": RELEASE_GRANT_STATUS_REVOKED,
+                        "at": (
+                            _rfc3339(grant.revoked_at)
+                            if grant.revoked_at is not None
+                            else None
+                        ),
+                    }
+                else:
+                    outcome_view = {
+                        "status": RELEASE_GRANT_STATUS_PENDING,
+                        "at": None,
+                    }
+        except HTTPException:
+            raise
+        except Exception:
+            # Fixed message only: exception text might carry protected
+            # material and is never logged or returned.
+            logger.error("release grant trace query failed")
+            raise HTTPException(
+                status_code=500, detail="grant trace unavailable"
+            )
+
+        # Compact JSON with a single terminating newline. Every value is
+        # a JSON string, null or an integer (key_version,
+        # policy_version) — no floats, -0.0 or non-finite values. No
+        # plaintext capability, evidence text, nonce, claim value,
+        # payload, ciphertext, wrapped/raw key, certificate or exception
+        # text appears.
+        body = (
+            json.dumps(
+                {
+                    "grant": grant_view,
+                    "decision": decision_view,
+                    "envelope": envelope_view,
+                    "outcome": outcome_view,
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
+
     @app.get("/v1/revocations")
     def list_certificate_revocations(
         request: Request,
