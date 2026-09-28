@@ -53,6 +53,10 @@ from proof_release.db import (
     RELEASE_GRANT_STATUS_CONSUMED,
     RELEASE_GRANT_STATUS_PENDING,
     RELEASE_GRANT_STATUS_REVOKED,
+    RELEASE_GRANT_EVENT_REASON_ISSUED,
+    RELEASE_GRANT_EVENT_REASON_CONSUME,
+    RELEASE_GRANT_EVENT_REASON_RELEASE,
+    RELEASE_GRANT_EVENT_REASON_REVOKED,
     REWRAP_RESULT_KEYRING,
     REWRAP_RESULT_MISSING_KEY,
     REWRAP_RESULT_REWRAP_FAILED,
@@ -114,6 +118,7 @@ from proof_release.db import (
     ProofLifecycleEvent,
     RateLimitCounter,
     ReleaseGrant,
+    ReleaseGrantEvent,
     RewrapBatch,
     RewrapBatchItem,
     RewrapJob,
@@ -258,6 +263,48 @@ def _record_rewrap_job_event(
             new_status=new_status,
             reason=reason,
             created_at=now,
+        )
+    )
+
+
+def _record_release_grant_event(
+    session,
+    *,
+    tenant_id: str,
+    workload_id: str,
+    grant_id: str,
+    old_status: str | None,
+    new_status: str,
+    reason: str,
+    now: datetime,
+) -> None:
+    """Append one per-grant migration event inside the caller's transaction.
+
+    The per-grant ``seq`` is the current maximum plus one, allocated in the
+    same transaction as the status migration it records, so it is gap-free
+    and commits atomically with that migration. Every writer transaction on
+    SQLite begins as BEGIN IMMEDIATE (and locking backends serialize the
+    status-guarded updates), so the MAX+1 allocation can never race another
+    migration of the same grant. The caller commits (or rolls back) the
+    unit of work; a migration whose guarded status update loses is rolled
+    back together with its event.
+    """
+    max_seq = session.scalar(
+        select(func.max(ReleaseGrantEvent.seq)).where(
+            ReleaseGrantEvent.grant_id == grant_id
+        )
+    )
+    session.add(
+        ReleaseGrantEvent(
+            event_id=str(uuid.uuid4()),
+            tenant_id=tenant_id,
+            workload_id=workload_id,
+            grant_id=grant_id,
+            seq=(max_seq or 0) + 1,
+            old_status=old_status,
+            new_status=new_status,
+            reason=reason,
+            occurred_at=now,
         )
     )
 
@@ -1415,6 +1462,123 @@ def _decode_rewrap_job_event_cursor(
     return boundary_seq, snapshot_seq
 
 
+def _release_grant_event_cursor_payload(
+    tenant_id: str,
+    workload_id: str,
+    grant_id: str,
+    boundary_seq: int,
+    *,
+    snapshot_seq: int,
+) -> bytes:
+    """Canonical byte payload authenticated inside a grant-event cursor.
+
+    The cursor marks an exclusive per-grant ``seq`` position and carries
+    the fixed replayable snapshot high-water mark (the greatest ``seq``
+    the range's first query saw) in the signed payload, so a cursor minted
+    for one scope, grant or snapshot cannot be replayed against another.
+    The kind tag distinguishes these cursors from every other cursor
+    family even though all share the same HMAC secret.
+    """
+    return json.dumps(
+        {
+            "k": _RELEASE_GRANT_EVENT_CURSOR_KIND,
+            "t": tenant_id,
+            "w": workload_id,
+            "g": grant_id,
+            "q": boundary_seq,
+            "h": snapshot_seq,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _encode_release_grant_event_cursor(
+    tenant_id: str,
+    workload_id: str,
+    grant_id: str,
+    boundary_seq: int,
+    *,
+    snapshot_seq: int,
+) -> str:
+    """Build an opaque, scope/grant/snapshot-bound exclusive event cursor."""
+    payload = _release_grant_event_cursor_payload(
+        tenant_id,
+        workload_id,
+        grant_id,
+        boundary_seq,
+        snapshot_seq=snapshot_seq,
+    )
+    mac = hmac.new(_cursor_secret(), payload, hashlib.sha256).digest()
+    return b64url_encode(payload + mac)
+
+
+def _decode_release_grant_event_cursor(
+    token: str,
+    tenant_id: str,
+    workload_id: str,
+    grant_id: str,
+) -> tuple[int, int] | None:
+    """Validate a grant-event cursor and return ``(boundary_seq, snapshot_seq)``.
+
+    Returns the exclusive sequence boundary and the fixed snapshot
+    high-water mark on success, or ``None`` for a malformed/forged token,
+    a cursor of another kind (rewrap batch, grant audit, compliance audit
+    events, proof-lifecycle events, decisions, revocations, trust roots,
+    policies or rewrap job listings), or one minted for any other scope
+    or grant. The beginning marker (``""``) never reaches this function.
+    """
+    if not _CURSOR_RE.fullmatch(token):
+        return None
+    try:
+        raw = b64url_decode(token)
+    except ValueError:
+        return None
+    # The MAC is a fixed 32-byte suffix; the JSON payload precedes it.
+    if len(raw) <= 32:
+        return None
+    payload, mac = raw[:-32], raw[-32:]
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    if decoded.get("k") != _RELEASE_GRANT_EVENT_CURSOR_KIND:
+        return None
+    boundary_seq = decoded.get("q")
+    snapshot_seq = decoded.get("h")
+    # Sequence positions are positive ints (bools are rejected as ints).
+    if not isinstance(boundary_seq, int) or isinstance(boundary_seq, bool):
+        return None
+    if not isinstance(snapshot_seq, int) or isinstance(snapshot_seq, bool):
+        return None
+    if boundary_seq < 1 or snapshot_seq < boundary_seq:
+        return None
+    expected_mac = hmac.new(
+        _cursor_secret(),
+        _release_grant_event_cursor_payload(
+            tenant_id,
+            workload_id,
+            grant_id,
+            boundary_seq,
+            snapshot_seq=snapshot_seq,
+        ),
+        hashlib.sha256,
+    ).digest()
+    if not hmac.compare_digest(mac, expected_mac):
+        return None
+    # Defense in depth: the MAC already covers every field, but confirm
+    # the scope and grant explicitly.
+    if not hmac.compare_digest(str(decoded.get("t", "")), tenant_id):
+        return None
+    if not hmac.compare_digest(str(decoded.get("w", "")), workload_id):
+        return None
+    if not hmac.compare_digest(str(decoded.get("g", "")), grant_id):
+        return None
+    return boundary_seq, snapshot_seq
+
+
 def _proof_event_cursor_payload(
     tenant_id: str,
     workload_id: str,
@@ -2173,6 +2337,18 @@ POLICY_PAGE_SIZE = 100
 #: secret) can never be replayed against the policy listing, and vice
 #: versa.
 _POLICY_CURSOR_KIND = "policies-v1"
+
+#: Fixed page size for the read-only per-grant state-migration event
+#: timeline. Like the other audit listings it is an internal constant and
+#: never part of the request or response contract.
+RELEASE_GRANT_EVENT_PAGE_SIZE = 100
+
+#: Discriminator embedded in release-grant event cursors so a cursor from
+#: any other family (rewrap batch, grant audit, compliance audit events,
+#: proof-lifecycle events, decisions, revocations, trust roots, policies
+#: or rewrap job listings — all authenticated with the same secret) can
+#: never be replayed against a grant's event timeline, and vice versa.
+_RELEASE_GRANT_EVENT_CURSOR_KIND = "release-grant-events-v1"
 
 
 class CreateChallengeRequest(BaseModel):
@@ -3485,6 +3661,122 @@ def _migrate_policy_commit_sequence(engine) -> None:
                 model_index.create(conn, checkfirst=True)
 
 
+def _rebuild_release_grant_events(engine) -> None:
+    """Reconstruct per-grant timeline events for a pre-feature database.
+
+    The per-grant event timeline shipped after release grants themselves,
+    so a database written by an older deployment holds grant rows (and the
+    existing compliance audit rows) but no ``release_grant_events`` rows.
+    ``create_all`` has just created the empty event table, so on open each
+    existing grant is reconstructed into its gap-free per-grant sequence:
+
+    * seq 1 is always the birth: no old status -> ``pending`` with reason
+      ``issued`` at the grant's ``issued_at``;
+    * a ``consumed`` grant gets seq 2 ``pending`` -> ``consumed`` at
+      ``consumed_at``;
+    * a ``revoked`` grant gets seq 2 ``pending`` -> ``revoked`` at
+      ``revoked_at``.
+
+    The pre-feature audit trail records a consume presentation and a
+    payload release with the same (``grant``/``consumed``) event pair, so
+    the two reasons cannot be told apart for a legacy settlement; the
+    reconstructed seq 2 uses ``consume`` (the distinguishing reason exists
+    only for migrations written by this and later deployments, which
+    always record it faithfully). Event ids are deterministic from
+    ``(grant_id, seq)`` so reopening the same database reproduces the same
+    rows. The whole reconstruction is one transaction and is a no-op once
+    any timeline event exists, so a fresh database and an already-upgraded
+    one are both untouched; no grant, audit row, response shape or
+    secret-handling rule changes.
+    """
+    events_tbl = ReleaseGrantEvent.__table__
+    with engine.begin() as conn:
+        existing = conn.execute(select(func.count()).select_from(events_tbl)).scalar()
+        if existing:
+            return
+        legacy_grants = conn.execute(
+            select(
+                ReleaseGrant.grant_id,
+                ReleaseGrant.tenant_id,
+                ReleaseGrant.workload_id,
+                ReleaseGrant.status,
+                ReleaseGrant.issued_at,
+                ReleaseGrant.consumed_at,
+                ReleaseGrant.revoked_at,
+            ).order_by(ReleaseGrant.grant_id)
+        ).all()
+        rows: list[dict] = []
+        for (
+            grant_id,
+            tenant_id,
+            workload_id,
+            status,
+            issued_at,
+            consumed_at,
+            revoked_at,
+        ) in legacy_grants:
+            rows.append(
+                {
+                    "event_id": str(
+                        uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"release-grant-event:{grant_id}:1",
+                        )
+                    ),
+                    "tenant_id": tenant_id,
+                    "workload_id": workload_id,
+                    "grant_id": grant_id,
+                    "seq": 1,
+                    "old_status": None,
+                    "new_status": RELEASE_GRANT_STATUS_PENDING,
+                    "reason": RELEASE_GRANT_EVENT_REASON_ISSUED,
+                    "occurred_at": issued_at,
+                }
+            )
+            if status == RELEASE_GRANT_STATUS_CONSUMED:
+                rows.append(
+                    {
+                        "event_id": str(
+                            uuid.uuid5(
+                                uuid.NAMESPACE_URL,
+                                f"release-grant-event:{grant_id}:2",
+                            )
+                        ),
+                        "tenant_id": tenant_id,
+                        "workload_id": workload_id,
+                        "grant_id": grant_id,
+                        "seq": 2,
+                        "old_status": RELEASE_GRANT_STATUS_PENDING,
+                        "new_status": RELEASE_GRANT_STATUS_CONSUMED,
+                        # The pre-feature audit cannot distinguish a
+                        # payload release from a consume presentation.
+                        "reason": RELEASE_GRANT_EVENT_REASON_CONSUME,
+                        "occurred_at": consumed_at or issued_at,
+                    }
+                )
+            elif status == RELEASE_GRANT_STATUS_REVOKED:
+                rows.append(
+                    {
+                        "event_id": str(
+                            uuid.uuid5(
+                                uuid.NAMESPACE_URL,
+                                f"release-grant-event:{grant_id}:2",
+                            )
+                        ),
+                        "tenant_id": tenant_id,
+                        "workload_id": workload_id,
+                        "grant_id": grant_id,
+                        "seq": 2,
+                        "old_status": RELEASE_GRANT_STATUS_PENDING,
+                        "new_status": RELEASE_GRANT_STATUS_REVOKED,
+                        "reason": RELEASE_GRANT_EVENT_REASON_REVOKED,
+                        "occurred_at": revoked_at or issued_at,
+                    }
+                )
+        if rows:
+            conn.execute(events_tbl.insert(), rows)
+
+
 async def _require_empty_query_body(request: Request) -> None:
     """Reject a read-only query carrying any request body (422).
 
@@ -3522,6 +3814,9 @@ def create_app(
 
     Base.metadata.create_all(engine)
     _migrate_additive(engine)
+    # Reconstruct the per-grant event timeline for grants written before
+    # the timeline existed; a no-op on a fresh or already-upgraded database.
+    _rebuild_release_grant_events(engine)
     session_factory = sessionmaker(bind=engine, expire_on_commit=False)
     registry = verifier_registry or default_registry
 
@@ -7209,6 +7504,20 @@ def create_app(
                 consumed_at=None,
             )
             session.add(grant)
+            # The per-grant migration timeline records exactly one event
+            # per committed state transition in the same transaction as the
+            # grant row (and the unchanged compliance audit below): the
+            # empty-state birth into pending with reason "issued".
+            _record_release_grant_event(
+                session,
+                tenant_id=body.tenant_id,
+                workload_id=body.workload_id,
+                grant_id=grant_id,
+                old_status=None,
+                new_status=RELEASE_GRANT_STATUS_PENDING,
+                reason=RELEASE_GRANT_EVENT_REASON_ISSUED,
+                now=now,
+            )
             # The compliance event commits in the same transaction as the
             # grant row, so a pending event exists if and only if the grant
             # did. Only identifiers, the fixed status, the timestamp and
@@ -8921,6 +9230,198 @@ def create_app(
         )
         return Response(content=body, media_type="application/json")
 
+    @app.get("/v1/release-grants//events")
+    def get_release_grant_events_identifier_required() -> Response:
+        # An empty path segment is a missing grant identifier: a 422 client
+        # error rather than a routing-level 404. It never reads a grant or
+        # any event.
+        raise HTTPException(status_code=422, detail="invalid grant identifier")
+
+    @app.get("/v1/release-grants/{grant_id}/events")
+    def list_release_grant_events(
+        request: Request,
+        grant_id: str,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        cursor: str | None = Query(default=None),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return the read-only state-migration timeline of one release grant.
+
+        The range is exactly one grant fixed by the mandatory
+        tenant/workload scope and the canonical-lowercase-UUID path id;
+        only ``tenant_id``, ``workload_id`` and the optional ``cursor``
+        are accepted and the body must be missing or zero-length. Events
+        are the grant's committed state migrations in stable, immutable
+        per-grant sequence order: issuance (no old status -> pending,
+        reason ``issued``), the one settlement to consumed by either a
+        consume presentation (``consume``) or a payload release
+        (``release``), or the settlement to revoked (``revoked``).
+        Exactly one event exists per migration that committed; a failed
+        or rolled-back request and a request that lost the settlement
+        race leave no event, and a consume, release or repeated
+        settlement against an already-terminal grant appends nothing.
+
+        The first (cursor-less or explicit-empty-cursor) query, which
+        starts before the first event, fixes a replayable snapshot
+        high-water mark (the greatest event seq then committed);
+        migrations committed afterwards — even with an older business
+        time — surface only in a fresh first query, never in a later
+        page of this one. The resume cursor is HMAC-authenticated,
+        carries its own kind tag and is bound to the scope, grant and
+        snapshot, so it cannot be forged, tampered with, or replayed
+        against another scope, grant, snapshot or cursor family. The
+        handler issues only SELECTs: it never settles a grant, consumes
+        budget, appends an audit row or changes any state, and a storage
+        failure aborts the whole request with a 500 rather than
+        returning half a page. The existing grant audit is untouched; no
+        capability (plaintext or digest), payload or key ever appears.
+        """
+        # --- request shape (all 422, no storage touched) ----------------
+        allowed_params = {"tenant_id", "workload_id", "cursor"}
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+        # Each parameter is a single scalar string; a repeated parameter
+        # (even of an allowed name) is ambiguous and rejected rather than
+        # silently treated as last-wins.
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(status_code=422, detail="query parameter must appear once")
+
+        # The raw path value must be a canonical lowercase UUID; an empty
+        # segment is handled by the dedicated route above, and blank,
+        # whitespace-padded, uppercase or otherwise non-canonical values
+        # are format errors rejected before any state is read.
+        if not grant_id or not _UUID_RE.fullmatch(grant_id):
+            raise HTTPException(
+                status_code=422, detail="invalid grant identifier"
+            )
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        # Omitted cursor or an explicit empty string starts before the
+        # first event and fixes the query family's snapshot. Whitespace,
+        # malformed, forged, tampered, cross-scope, cross-grant,
+        # cross-snapshot or foreign-kind cursors are indistinguishable
+        # 422s and are rejected without reading any state.
+        boundary_seq: int = 0
+        snapshot_seq: int | None = None
+        if cursor is not None and cursor != "":
+            if not cursor.strip() or not _CURSOR_RE.fullmatch(cursor):
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            decoded = _decode_release_grant_event_cursor(
+                cursor, tenant_id, workload_id, grant_id
+            )
+            if decoded is None:
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            boundary_seq, snapshot_seq = decoded
+
+        # --- read-only timeline scan ------------------------------------
+        try:
+            with session_factory() as session:
+                # The named grant must exist in exactly this scope; an
+                # unknown grant and a cross-scope grant are one
+                # indistinguishable 404 — existence in any other scope is
+                # never revealed.
+                grant = session.get(ReleaseGrant, grant_id)
+                if (
+                    grant is None
+                    or grant.tenant_id != tenant_id
+                    or grant.workload_id != workload_id
+                ):
+                    raise HTTPException(status_code=404, detail="grant not found")
+
+                if snapshot_seq is None:
+                    # First query of the family: fix the replayable
+                    # snapshot at the greatest currently committed seq.
+                    # Every grant, legacy or new, always has its issuance
+                    # event; a zero here is only possible transiently.
+                    fixed_snapshot = session.scalar(
+                        select(func.max(ReleaseGrantEvent.seq)).where(
+                            ReleaseGrantEvent.grant_id == grant_id
+                        )
+                    )
+                    snapshot_seq = int(fixed_snapshot or 0)
+
+                stmt = (
+                    select(ReleaseGrantEvent)
+                    .where(
+                        ReleaseGrantEvent.grant_id == grant_id,
+                        ReleaseGrantEvent.seq > boundary_seq,
+                        # Inclusive fixed snapshot: migrations committed
+                        # after the first query never enter these pages.
+                        ReleaseGrantEvent.seq <= snapshot_seq,
+                    )
+                    .order_by(ReleaseGrantEvent.seq.asc())
+                    .limit(RELEASE_GRANT_EVENT_PAGE_SIZE + 1)
+                )
+                # One extra row is the "more follows" probe. The scan is a
+                # single read-only statement: a storage failure aborts the
+                # whole request with a 500 rather than returning a partial
+                # page.
+                rows = list(session.scalars(stmt))
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("release grant event query failed")
+            raise HTTPException(
+                status_code=500, detail="release grant events unavailable"
+            )
+
+        has_more = len(rows) > RELEASE_GRANT_EVENT_PAGE_SIZE
+        page = rows[:RELEASE_GRANT_EVENT_PAGE_SIZE]
+
+        events = [
+            {
+                "event_id": row.event_id,
+                # Stable, immutable per-grant sequence in committed order.
+                "seq": row.seq,
+                # Null only for the birth migration; a string otherwise.
+                "old_status": row.old_status,
+                "new_status": row.new_status,
+                # A fixed service code (issued/consume/release/revoked),
+                # never exception text.
+                "reason": row.reason,
+                "at": _rfc3339(row.occurred_at),
+            }
+            for row in page
+        ]
+
+        if has_more:
+            next_cursor = _encode_release_grant_event_cursor(
+                tenant_id,
+                workload_id,
+                grant_id,
+                page[-1].seq,
+                snapshot_seq=snapshot_seq,
+            )
+            complete = False
+        else:
+            next_cursor = ""
+            complete = True
+
+        # Compact container (events, next_cursor, complete) with a single
+        # terminating newline. seq is an int, old_status may be null,
+        # complete is a bool and every other value is a string — no
+        # floats, -0.0 or non-finite values can appear.
+        body = (
+            json.dumps(
+                {
+                    "events": events,
+                    "next_cursor": next_cursor,
+                    "complete": complete,
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
+
     @app.get("/v1/revocations")
     def list_certificate_revocations(
         request: Request,
@@ -9348,6 +9849,20 @@ def create_app(
                         status_code=409, detail="grant already revoked"
                     )
                 raise HTTPException(status_code=410, detail="grant expired")
+            # Exactly one immutable timeline event per committed
+            # settlement: this consume presentation won pending ->
+            # consumed (reason "consume"), in the same transaction as the
+            # guarded status flip and the unchanged compliance audit.
+            _record_release_grant_event(
+                session,
+                tenant_id=grant.tenant_id,
+                workload_id=grant.workload_id,
+                grant_id=grant_id,
+                old_status=RELEASE_GRANT_STATUS_PENDING,
+                new_status=RELEASE_GRANT_STATUS_CONSUMED,
+                reason=RELEASE_GRANT_EVENT_REASON_CONSUME,
+                now=now,
+            )
             session.add(
                 AuditEvent(
                     event_id=str(uuid.uuid4()),
@@ -9463,6 +9978,20 @@ def create_app(
                         status_code=409, detail="grant already revoked"
                     )
                 raise HTTPException(status_code=410, detail="grant expired")
+            # Exactly one immutable timeline event for the winning pending
+            # -> revoked settlement (reason "revoked"), in the same
+            # transaction as the guarded status flip and the unchanged
+            # compliance audit.
+            _record_release_grant_event(
+                session,
+                tenant_id=grant.tenant_id,
+                workload_id=grant.workload_id,
+                grant_id=grant_id,
+                old_status=RELEASE_GRANT_STATUS_PENDING,
+                new_status=RELEASE_GRANT_STATUS_REVOKED,
+                reason=RELEASE_GRANT_EVENT_REASON_REVOKED,
+                now=now,
+            )
             session.add(
                 AuditEvent(
                     event_id=str(uuid.uuid4()),
@@ -9625,6 +10154,21 @@ def create_app(
                         status_code=409, detail="grant already revoked"
                     )
                 raise HTTPException(status_code=410, detail="grant expired")
+            # Exactly one immutable timeline event for the winning payload
+            # release settlement: pending -> consumed with reason
+            # "release" (distinct from a plain consume presentation), in
+            # the same transaction as the guarded status flip and the
+            # unchanged compliance audit.
+            _record_release_grant_event(
+                session,
+                tenant_id=grant.tenant_id,
+                workload_id=grant.workload_id,
+                grant_id=grant_id,
+                old_status=RELEASE_GRANT_STATUS_PENDING,
+                new_status=RELEASE_GRANT_STATUS_CONSUMED,
+                reason=RELEASE_GRANT_EVENT_REASON_RELEASE,
+                now=now,
+            )
             session.add(
                 AuditEvent(
                     event_id=str(uuid.uuid4()),
