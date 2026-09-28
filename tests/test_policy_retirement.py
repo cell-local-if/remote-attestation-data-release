@@ -847,6 +847,8 @@ def test_retire_never_echoes_rule_or_sensitive_material(client, app):
             "created_at",
             "status",
             "retired_at",
+            "commit_seq",
+            "retired_seq",
         }
 
 

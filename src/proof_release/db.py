@@ -611,6 +611,28 @@ class Policy(Base):
             "version",
             name="uq_policy_scope_name_version",
         ),
+        # Per-scope commit order: the immutable high-water mark that fixes
+        # the lifecycle query's replayable snapshot. Unique so two
+        # concurrent allocations can never mint the same sequence; together
+        # with the per-scope counter row taken FOR UPDATE (and BEGIN
+        # IMMEDIATE on SQLite) this makes the order gap-free on every
+        # backend, and the index covers the scoped snapshot predicate.
+        Index(
+            "ix_policies_scope_commit_seq",
+            "tenant_id",
+            "workload_id",
+            "commit_seq",
+            unique=True,
+        ),
+        # Covers the scoped lifecycle listing ordered by the
+        # (created_at, policy_id) keyset together with its snapshot cutoff.
+        Index(
+            "ix_policies_scope_created",
+            "tenant_id",
+            "workload_id",
+            "created_at",
+            "policy_id",
+        ),
     )
 
     policy_id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -636,6 +658,56 @@ class Policy(Base):
     retired_at: Mapped[datetime | None] = mapped_column(
         UTCDateTime(), nullable=True
     )
+    # Gap-free per-scope sequence allocated in the version's own creation
+    # transaction from the shared policy lifecycle counter, strictly
+    # increasing in business commit order on every backend. NULL only on
+    # rows written before the column existed (backfilled on open); every
+    # new version carries a positive value. The lifecycle listing bounds
+    # its replayable snapshot membership by this marker, never by write
+    # timing.
+    commit_seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # The lifecycle counter sequence allocated inside the winning
+    # active -> retired transaction; NULL while the version is active. The
+    # lifecycle query reconstructs a version's status *as of* its fixed
+    # snapshot from this marker: retired exactly when retired_seq is at or
+    # before the snapshot high-water mark. A retirement that commits after
+    # a snapshot's first query therefore never changes a replayed page,
+    # even though the row itself is updated in place.
+    retired_seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+
+class PolicyCommitCounter(Base):
+    """Per-scope monotonic allocator for the policy lifecycle sequence.
+
+    Exactly one row exists per ``(tenant_id, workload_id)``. It is an
+    internal ordering device — never exposed on any response and holding
+    no rule, claim, material or secret — whose sole purpose is to make the
+    policy lifecycle query's replayable snapshot track the business commit
+    boundary on every backend:
+
+    * the next value is read ``FOR UPDATE`` (locking backends) so
+      concurrent version creations and retirements in one scope serialize
+      on the counter row itself;
+    * on SQLite every write transaction already begins as BEGIN
+      IMMEDIATE, serializing all writers process-wide;
+    * the scope's first allocation inserts the anchor inside a savepoint,
+      so the unique-anchor race never rolls the surrounding write back.
+
+    Both creation (stored as ``Policy.commit_seq``) and the terminal
+    retirement (stored as ``Policy.retired_seq``) advance this one counter
+    in their own transactions, so the counter's last value is the scope's
+    total commit high-water mark: a snapshot fixed at that value sees
+    neither a later creation (a new row) nor a later retirement (an
+    in-place status change), while a fresh first query observes both.
+    """
+
+    __tablename__ = "policy_commit_counters"
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # Last per-scope lifecycle sequence handed out; 1 for the scope's
+    # first creation, strictly increasing for every later commit.
+    last_seq: Mapped[int] = mapped_column(BigInteger)
 
 
 class Decision(Base):
