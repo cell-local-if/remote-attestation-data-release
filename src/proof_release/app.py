@@ -8542,6 +8542,160 @@ def create_app(
         )
         return Response(content=body, media_type="application/json")
 
+    @app.get("/v1/decisions//trace")
+    def get_decision_trace_identifier_required() -> Response:
+        # An empty path segment is a missing decision identifier: a 422
+        # client error rather than a routing-level 404 or 405. It never
+        # reads a decision.
+        raise HTTPException(status_code=422, detail="invalid decision identifier")
+
+    @app.get("/v1/decisions/{decision_id}/trace")
+    def get_decision_trace(
+        request: Request,
+        decision_id: str,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return the immutable trace of one recorded release decision.
+
+        The trace links one decision — its original identifier, associated
+        proof (evidence id), policy version number, conclusion and UTC
+        decision time — to the concrete policy version it was taken
+        against: the version id, name, integer version and the immutable
+        rule tree as adopted at decision time, so the conditions in force
+        then can be re-reviewed even after the version is later retired
+        (retirement never rewrites or removes a version's rule and never
+        touches a recorded decision).
+
+        All validation precedes every state read: the path id must be a
+        canonical lowercase UUID with no surrounding whitespace, the body
+        must be absent or zero-length, and only the two non-blank scope
+        parameters are accepted (an unknown or repeated parameter is a
+        422). An unknown decision, or one belonging to another tenant or
+        workload, is one indistinguishable 404 — existence in another
+        scope is never revealed. The handler issues only SELECTs of
+        committed audit metadata and the saved rule structure: it appends
+        no audit, event or decision and never rewrites the rule, decision
+        time or status. Raw evidence, nonces, claim values, capabilities,
+        payloads, keys and exception text are never returned, stored in a
+        new field, or logged. A query or storage failure is a 500 with the
+        half result discarded entirely.
+        """
+        # --- request shape (all 422, no storage touched) ----------------
+        allowed_params = {"tenant_id", "workload_id"}
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+        # Each scope parameter is a single scalar string; a repeated
+        # parameter (even of an allowed name) is rejected rather than
+        # silently treated as last-wins.
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(
+                status_code=422, detail="query parameter must appear once"
+            )
+
+        # The path identifier must be a canonical lowercase UUID with no
+        # surrounding whitespace (whitespace-padded or uppercase spellings
+        # are format errors). This runs before any storage access, so a
+        # malformed path id neither reads nor modifies any state.
+        if not decision_id or not _UUID_RE.fullmatch(decision_id):
+            raise HTTPException(status_code=422, detail="invalid decision identifier")
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        # --- read-only decision/policy lookup ---------------------------
+        try:
+            with session_factory() as session:
+                # The path id together with the scope names exactly one
+                # decision; an unknown id or a scope mismatch is one
+                # indistinguishable 404 (existence is never revealed).
+                decision = session.get(Decision, decision_id)
+                if (
+                    decision is None
+                    or decision.tenant_id != tenant_id
+                    or decision.workload_id != workload_id
+                ):
+                    raise HTTPException(
+                        status_code=404, detail="decision not found"
+                    )
+
+                policy = session.get(Policy, decision.policy_id)
+                if (
+                    policy is None
+                    or policy.tenant_id != tenant_id
+                    or policy.workload_id != workload_id
+                ):
+                    # A recorded decision always references its own
+                    # in-scope immutable version; the absence of that
+                    # version is storage corruption or a backend failure,
+                    # never a client-addressable 404.
+                    logger.error("decision policy version missing")
+                    raise HTTPException(
+                        status_code=500, detail="decision trace unavailable"
+                    )
+
+                # Parse the saved rule snapshot only — the persisted
+                # canonical serialization is the rule adopted at decision
+                # time and is never rewritten here or by retirement.
+                try:
+                    rule_snapshot = json.loads(policy.rule_json)
+                except (ValueError, TypeError):
+                    logger.error("decision trace rule snapshot unreadable")
+                    raise HTTPException(
+                        status_code=500, detail="decision trace unavailable"
+                    )
+
+                payload = {
+                    "decision": {
+                        # Original identifier, associated proof, the
+                        # decided integer version, the fixed conclusion and
+                        # the UTC decision time — audit metadata only. The
+                        # concrete version identifier lives in the
+                        # policy_version section below.
+                        "decision_id": decision.decision_id,
+                        "evidence_id": decision.evidence_id,
+                        "policy_version": decision.policy_version,
+                        "status": decision.status,
+                        "decided_at": _rfc3339(decision.decided_at),
+                    },
+                    "policy_version": {
+                        # Version identity plus the immutable rule tree the
+                        # decision actually used, for re-review.
+                        "policy_id": policy.policy_id,
+                        "name": policy.name,
+                        "version": policy.version,
+                        "rule": rule_snapshot,
+                    },
+                }
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("decision trace query failed")
+            raise HTTPException(
+                status_code=500, detail="decision trace unavailable"
+            )
+
+        # Compact JSON with a single terminating newline. Text and
+        # timestamps are JSON strings; the version integers and rule node
+        # types are emitted as stored (rule numbers round-trip verbatim,
+        # including decimals and -0.0), and no other metadata produces a
+        # float or a non-finite value. No evidence, nonce, claim value,
+        # capability, payload, key or exception text is ever present.
+        body = (
+            json.dumps(
+                payload,
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
+
     @app.get("/v1/revocations")
     def list_certificate_revocations(
         request: Request,
