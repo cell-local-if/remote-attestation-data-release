@@ -107,6 +107,8 @@ from proof_release.db import (
     AuditEvent,
     Base,
     CertificateRevocation,
+    CRLRevokedEntry,
+    CRLSnapshot,
     Challenge,
     DataEnvelope,
     Decision,
@@ -690,6 +692,132 @@ def _ordered_chain_certificates(evidence: str) -> list | None:
         except (ValueError, TypeError):
             return None
     return certificates
+
+
+#: Bound on the decimal length of a revoked-entry serial stored as text.
+#: X.509 certificate serials are at most 20 octets (159 significant bits);
+#: decimal text of a 160-bit value is at most 49 characters, so 78 is a
+#: generous hard ceiling that rejects malformed oversized encodings.
+_CRL_MAX_SERIAL_DIGITS = 78
+
+
+class _CRLInvalid(Exception):
+    """Raised for any client-supplied CRL that fails validation.
+
+    Every raise maps to one indistinguishable 422 at the handler boundary;
+    the exception carries no material or detail and is never surfaced.
+    """
+
+
+def _load_validated_crl(
+    crl_pem: str, root_certificate: x509.Certificate, now: datetime
+) -> tuple[
+    int,
+    str,
+    datetime,
+    datetime,
+    list[tuple[str, datetime]],
+    int,
+]:
+    """Parse and fully validate a PEM CRL against its claimed trust root.
+
+    Returns the CRLNumber, hex SHA-256 of the DER content, aware-UTC
+    thisUpdate/nextUpdate, the revoked entries as ``(decimal serial text,
+    aware revocationDate)`` pairs in first-seen order, and the count of
+    entries whose revocationDate has arrived by ``now``. Raises
+    :class:`_CRLInvalid` for every malformed or non-conforming input; the
+    handler turns any such failure into a single 422 without echoing
+    material or exception detail.
+    """
+    try:
+        try:
+            crl = x509.load_pem_x509_crl(crl_pem.encode("utf-8"))
+        except (ValueError, TypeError, UnicodeEncodeError) as exc:
+            raise _CRLInvalid("crl pem") from exc
+        if not isinstance(crl, x509.CertificateRevocationList):
+            raise _CRLInvalid("crl type")
+
+        # A v2 CRL must carry the CRLNumber extension; its absence is the v1
+        # marker and is rejected.
+        try:
+            crl_number = crl.extensions.get_extension_for_class(
+                x509.CRLNumber
+            ).value.crl_number
+        except x509.ExtensionNotFound as exc:
+            raise _CRLInvalid("crl number missing") from exc
+        if not isinstance(crl_number, int) or crl_number < 1:
+            # RFC 5280: CRLNumber is a positive monotonically increasing
+            # integer; zero or negative encodings are non-conforming.
+            raise _CRLInvalid("crl number range")
+
+        this_update = crl.last_update_utc
+        next_update = crl.next_update_utc
+        if this_update is None or next_update is None:
+            # nextUpdate is mandatory for this service; a CRL without it can
+            # never be enrolled.
+            raise _CRLInvalid("crl validity window")
+        if this_update > now:
+            raise _CRLInvalid("this update in the future")
+        if next_update <= this_update:
+            raise _CRLInvalid("next update not after this update")
+        if next_update <= now:
+            raise _CRLInvalid("crl already expired")
+
+        # The issuer DN must name exactly the trust root subject.
+        if crl.issuer != root_certificate.subject:
+            raise _CRLInvalid("issuer mismatch")
+
+        # The CRL signature must verify under the trust root public key. The
+        # library performs key-type-specific verification; an unsupported
+        # algorithm or incompatible key is treated as a signature mismatch,
+        # never a service error.
+        try:
+            signature_ok = crl.is_signature_valid(root_certificate.public_key())
+        except Exception as exc:
+            raise _CRLInvalid("signature mismatch") from exc
+        if not signature_ok:
+            raise _CRLInvalid("signature mismatch")
+
+        entries: list[tuple[str, datetime]] = []
+        seen_serials: set[str] = set()
+        revoked_count = 0
+        for revoked in crl:
+            serial = revoked.serial_number
+            if not isinstance(serial, int) or serial <= 0:
+                # X.509 serial integers are positive; a zero or negative DER
+                # value is illegal for a revoked-certificate entry.
+                raise _CRLInvalid("serial range")
+            serial_text = str(serial)
+            if len(serial_text) > _CRL_MAX_SERIAL_DIGITS:
+                raise _CRLInvalid("serial too large")
+            if serial_text in seen_serials:
+                # A serial may appear at most once in one CRL.
+                raise _CRLInvalid("duplicate serial")
+            seen_serials.add(serial_text)
+            revocation_date = revoked.revocation_date_utc
+            if revocation_date is None:
+                raise _CRLInvalid("revocation date missing")
+            entries.append((serial_text, revocation_date))
+            if revocation_date <= now:
+                revoked_count += 1
+
+        content_sha256 = hashlib.sha256(
+            crl.public_bytes(Encoding.DER)
+        ).hexdigest()
+    except _CRLInvalid:
+        raise
+    except Exception as exc:
+        # Any other failure decoding attacker-controlled ASN.1 or reading a
+        # malformed field is an indistinguishable content error.
+        raise _CRLInvalid("crl content") from exc
+    return (
+        crl_number,
+        content_sha256,
+        this_update,
+        next_update,
+        entries,
+        revoked_count,
+    )
 
 
 def _canonical_claim_set(
@@ -2475,6 +2603,24 @@ class CreateRevocationRequest(BaseModel):
         _certificate_fingerprint_format
     )
     _effective_at_shape = field_validator("effective_at")(_utc_rfc3339_field)
+
+
+class CreateCRLRequest(BaseModel):
+    # Unknown fields are rejected rather than dropped, so a client learns
+    # immediately that the service did not act on them.
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    # Canonical lowercase UUID of a trust root in exactly this scope.
+    trust_root_id: StrictStr = Field(min_length=1)
+    # PEM-encoded X.509 v2 CRL signed by the trust root's subject key.
+    crl_pem: StrictStr = Field(min_length=1)
+
+    _non_blank = field_validator("tenant_id", "workload_id", "crl_pem")(
+        _require_non_blank
+    )
+    _trust_root_shape = field_validator("trust_root_id")(_canonical_uuid)
 
 
 class IdentityClaimModel(BaseModel):
@@ -5179,6 +5325,110 @@ def create_app(
                                     detail="revocation registry unavailable",
                                 )
                             revoked = hit is not None
+
+                            # CRL revocation check, consulted after the
+                            # retired-anchor short-circuit and before the
+                            # workload identity gate and the verifier's
+                            # signature verification. A trust root with no
+                            # enrolled CRL keeps the existing behavior
+                            # exactly. A root with one or more snapshots
+                            # uses the single highest-CRLNumber snapshot;
+                            # when that snapshot's nextUpdate has already
+                            # passed verification fails closed (500, the
+                            # evidence stays received and can be retried
+                            # unchanged once a fresher CRL is enrolled),
+                            # since deciding without current revocation
+                            # data would be unsound. Otherwise a chain
+                            # certificate whose issuer DN and serial
+                            # number match an entry whose revocationDate
+                            # has arrived settles the evidence as
+                            # rejected; the hit is the union with the
+                            # single-certificate fingerprint registry.
+                            # The anchor row is held for the whole
+                            # transaction and registration takes the same
+                            # lock, so only snapshots committed before
+                            # this settlement are observed and a later
+                            # enrollment never rewrites a settled
+                            # conclusion.
+                            try:
+                                current_crl = session.scalar(
+                                    select(CRLSnapshot)
+                                    .where(
+                                        CRLSnapshot.tenant_id == body.tenant_id,
+                                        CRLSnapshot.workload_id
+                                        == body.workload_id,
+                                        CRLSnapshot.trust_root_id
+                                        == anchor.root_id,
+                                    )
+                                    .order_by(CRLSnapshot.crl_number.desc())
+                                    .limit(1)
+                                )
+                            except Exception:
+                                session.rollback()
+                                logger.error(
+                                    "CRL snapshot query failed for evidence %s",
+                                    evidence.evidence_id,
+                                )
+                                raise HTTPException(
+                                    status_code=500,
+                                    detail="crl registry unavailable",
+                                )
+                            if current_crl is not None:
+                                if current_crl.next_update <= now:
+                                    # The highest CRLNumber has expired and
+                                    # no fresher snapshot exists: fail
+                                    # closed before any settlement write,
+                                    # leaving the evidence received and
+                                    # retryable once an update is enrolled.
+                                    session.rollback()
+                                    raise HTTPException(
+                                        status_code=500,
+                                        detail="crl snapshot expired",
+                                    )
+                                # Match every chain certificate by its
+                                # issuer DN and serial number. The CRL is
+                                # issued by the trust root subject, so a
+                                # direct child of the root (or the root
+                                # itself) is what a root CRL can list; the
+                                # issuer comparison is nevertheless made
+                                # per certificate, never assumed.
+                                targets = {
+                                    (
+                                        certificate.issuer.rfc4514_string(),
+                                        str(certificate.serial_number),
+                                    )
+                                    for certificate in chain_certificates
+                                }
+                                try:
+                                    crl_rows = session.execute(
+                                        select(
+                                            CRLRevokedEntry.issuer_dn,
+                                            CRLRevokedEntry.serial_number,
+                                        ).where(
+                                            CRLRevokedEntry.crl_id
+                                            == current_crl.crl_id,
+                                            CRLRevokedEntry.serial_number.in_(
+                                                [serial for _issuer, serial in targets]
+                                            ),
+                                            CRLRevokedEntry.revocation_date <= now,
+                                        )
+                                    ).all()
+                                except Exception:
+                                    session.rollback()
+                                    logger.error(
+                                        "CRL entry query failed for evidence %s",
+                                        evidence.evidence_id,
+                                    )
+                                    raise HTTPException(
+                                        status_code=500,
+                                        detail="crl registry unavailable",
+                                    )
+                                if any(
+                                    (issuer_dn, serial_number) in targets
+                                    for issuer_dn, serial_number in crl_rows
+                                ):
+                                    revoked = True
+
                             # The chain parses and anchors to an active,
                             # configured trust root: its identity profiles
                             # gate the verifier's accept verdict. The leaf
@@ -6021,6 +6271,198 @@ def create_app(
                 "trust_root_id": body.trust_root_id,
                 "certificate_fingerprint": body.certificate_fingerprint,
                 "effective_at": _rfc3339(effective_at),
+            },
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return Response(
+            content=body_bytes, status_code=201, media_type="application/json"
+        )
+
+    @app.post("/v1/crls", status_code=201)
+    def register_crl(body: CreateCRLRequest) -> Response:
+        """Register a CRL revocation snapshot under a configured trust root.
+
+        Field and UUID validation is completed by the request model before
+        this handler runs (422 with no state written). The named trust root
+        must exist in exactly the request's tenant and workload; an unknown
+        or cross-scope root is an indistinguishable 404. The PEM must then
+        be a parseable X.509 v2 CRL carrying CRLNumber and nextUpdate whose
+        issuer DN equals the root subject, whose signature verifies under
+        the root public key, whose thisUpdate is not in the future and
+        whose nextUpdate is later than both thisUpdate and the reception
+        instant, and whose revoked serials are positive and unique; any
+        such failure is one indistinguishable 422 and writes nothing. Only
+        then are the snapshot conflicts judged: the same CRLNumber, the
+        same content, or a number at or below the current maximum is a 409;
+        only a strictly higher number replaces the current snapshot. The
+        snapshot header and every revoked entry are a single atomic write,
+        so a failure leaves no partial enrollment and the previous snapshot
+        in force. The response carries only identifiers, validated header
+        fields and the effective revoked count — never the CRL, certificate
+        material or exception detail.
+        """
+        now = _utcnow()
+        crl_id = str(uuid.uuid4())
+        with session_factory() as session:
+            try:
+                # Lock the trust-root row for the full registration.
+                # Verification takes the same lock while consulting the
+                # current CRL, so a registration either commits before the
+                # evidence settles (and the verification observes it) or
+                # waits until after it settles (and never retroactively
+                # changes the conclusion). SQLite ignores FOR UPDATE but
+                # already serializes all writers via BEGIN IMMEDIATE.
+                trust_root = session.scalar(
+                    select(TrustRoot)
+                    .where(
+                        TrustRoot.root_id == body.trust_root_id,
+                        TrustRoot.tenant_id == body.tenant_id,
+                        TrustRoot.workload_id == body.workload_id,
+                    )
+                    .with_for_update()
+                )
+                if trust_root is None:
+                    # Do not reveal whether an out-of-scope trust root exists.
+                    raise HTTPException(status_code=404, detail="trust root not found")
+                # The stored PEM is public material validated at trust-root
+                # creation; a failure to re-parse it is a service fault,
+                # never a client-content 422.
+                try:
+                    root_certificate = x509.load_pem_x509_certificate(
+                        trust_root.root_pem.encode("utf-8")
+                    )
+                except (ValueError, TypeError) as exc:
+                    session.rollback()
+                    logger.error("stored trust root certificate could not be parsed")
+                    raise HTTPException(
+                        status_code=500, detail="crl registration failed"
+                    ) from exc
+                try:
+                    (
+                        crl_number,
+                        content_sha256,
+                        this_update,
+                        next_update,
+                        entries,
+                        revoked_count,
+                    ) = _load_validated_crl(body.crl_pem, root_certificate, now)
+                except _CRLInvalid:
+                    # One indistinguishable 422 for every malformed or
+                    # non-conforming CRL; no material or reason is returned.
+                    raise HTTPException(status_code=422, detail="invalid CRL")
+
+                # Snapshot conflicts are judged only after full content
+                # validation, so a tampered same-number CRL reports the
+                # content error (422), never a stable-content conflict.
+                max_number = session.scalar(
+                    select(func.max(CRLSnapshot.crl_number)).where(
+                        CRLSnapshot.tenant_id == body.tenant_id,
+                        CRLSnapshot.workload_id == body.workload_id,
+                        CRLSnapshot.trust_root_id == body.trust_root_id,
+                    )
+                )
+                if max_number is not None and crl_number <= max_number:
+                    # Same number and lower/equal numbers never replace the
+                    # current snapshot.
+                    raise HTTPException(
+                        status_code=409,
+                        detail="CRL number is not higher than the current snapshot",
+                    )
+                same_content = session.scalar(
+                    select(CRLSnapshot.crl_id).where(
+                        CRLSnapshot.trust_root_id == body.trust_root_id,
+                        CRLSnapshot.content_sha256 == content_sha256,
+                    )
+                )
+                if same_content is not None:
+                    # The identical CRL content can never be enrolled twice
+                    # under one trust root, even carrying another number.
+                    raise HTTPException(
+                        status_code=409,
+                        detail="CRL content already registered for this trust root",
+                    )
+
+                issuer_dn = root_certificate.subject.rfc4514_string()
+                snapshot = CRLSnapshot(
+                    crl_id=crl_id,
+                    tenant_id=body.tenant_id,
+                    workload_id=body.workload_id,
+                    trust_root_id=body.trust_root_id,
+                    crl_number=crl_number,
+                    content_sha256=content_sha256,
+                    this_update=this_update,
+                    next_update=next_update,
+                    revoked_count=revoked_count,
+                    created_at=now,
+                )
+                session.add(snapshot)
+                # Insert the parent before any child row so the child's
+                # foreign key is satisfied on backends that enforce it
+                # immediately; a failure here rolls back before a single
+                # entry is written.
+                try:
+                    session.flush()
+                except IntegrityError:
+                    # A concurrent registration already holds the same
+                    # number/content; the loser reports a stable 409 and
+                    # nothing partial survives the rollback.
+                    session.rollback()
+                    raise HTTPException(
+                        status_code=409,
+                        detail="CRL number is not higher than the current snapshot",
+                    )
+                for serial_text, revocation_date in entries:
+                    session.add(
+                        CRLRevokedEntry(
+                            entry_id=str(uuid.uuid4()),
+                            crl_id=crl_id,
+                            tenant_id=body.tenant_id,
+                            workload_id=body.workload_id,
+                            trust_root_id=body.trust_root_id,
+                            issuer_dn=issuer_dn,
+                            serial_number=serial_text,
+                            revocation_date=revocation_date,
+                        )
+                    )
+                try:
+                    session.commit()
+                except IntegrityError:
+                    # A concurrent registration won the same-number or
+                    # same-content constraint; the loser reports a stable
+                    # 409 and its whole snapshot (header plus entries) is
+                    # rolled back.
+                    session.rollback()
+                    raise HTTPException(
+                        status_code=409,
+                        detail="CRL number is not higher than the current snapshot",
+                    )
+                except Exception:
+                    session.rollback()
+                    logger.error("CRL snapshot write failed")
+                    raise HTTPException(
+                        status_code=500, detail="crl registration failed"
+                    )
+            except HTTPException:
+                # 404/422/409 judgements and the controlled 500s above keep
+                # their status; a read-only judgement has written nothing.
+                raise
+            except Exception:
+                # A failure during the locked lookups is a full rollback and
+                # a sanitized 500: no snapshot can exist on this path.
+                session.rollback()
+                logger.error("CRL registration failed")
+                raise HTTPException(
+                    status_code=500, detail="crl registration failed"
+                )
+        body_bytes = json.dumps(
+            {
+                "crl_id": crl_id,
+                "trust_root_id": body.trust_root_id,
+                "crl_number": crl_number,
+                "this_update": _rfc3339(this_update),
+                "next_update": _rfc3339(next_update),
+                "revoked_count": revoked_count,
             },
             separators=(",", ":"),
             allow_nan=False,

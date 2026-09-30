@@ -479,6 +479,138 @@ class CertificateRevocation(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
+class CRLSnapshot(Base):
+    """One immutable, fully validated X.509 v2 CRL registered under a trust root.
+
+    A row is an atomic snapshot: its header columns and every
+    :class:`CRLRevokedEntry` row are inserted in one transaction, so a
+    failed registration can never leave a half-enrolled CRL. Snapshots are
+    never updated or deleted. Within one trust root only a CRL carrying a
+    strictly higher ``crl_number`` than every existing snapshot can be
+    registered (the same CRLNumber, the same content or a number at or
+    below the current maximum is rejected as 409); the highest-numbered
+    snapshot is the current one and replaces no rows.
+
+    Only identifiers, the scope, validated header fields, a content digest
+    and counters are stored here — never the CRL PEM/DER itself, any
+    certificate material, or free-form text.
+    """
+
+    __tablename__ = "crl_snapshots"
+    __table_args__ = (
+        # At most one snapshot per (trust root, CRLNumber); the constraint
+        # turns a concurrent same-number registration into one insert plus
+        # a stable 409 even if the explicit max check raced.
+        UniqueConstraint(
+            "trust_root_id",
+            "crl_number",
+            name="uq_crl_snapshot_root_crl_number",
+        ),
+        # The same CRL content can never be enrolled twice under one root,
+        # even carrying a different CRLNumber.
+        UniqueConstraint(
+            "trust_root_id",
+            "content_sha256",
+            name="uq_crl_snapshot_root_content",
+        ),
+        # Covers the per-root "current snapshot" lookup: the row with the
+        # maximum CRLNumber in exactly one tenant/workload scope.
+        Index(
+            "ix_crl_snapshots_root_number",
+            "tenant_id",
+            "workload_id",
+            "trust_root_id",
+            "crl_number",
+        ),
+    )
+
+    crl_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # The trust root whose subject signed the CRL and whose scope the
+    # revoked entries are matched within. CRLs never cross trust roots,
+    # tenants or workloads.
+    trust_root_id: Mapped[str] = mapped_column(String(36), index=True)
+    # Value of the CRL's CRLNumber extension; strictly increasing across
+    # the snapshots of one trust root.
+    crl_number: Mapped[int] = mapped_column(BigInteger)
+    # Hex SHA-256 of the CRL's DER encoding, used for exact same-content
+    # duplicate detection.
+    content_sha256: Mapped[str] = mapped_column(String(64))
+    # CRL thisUpdate (UTC), validated to be no later than the
+    # registration instant.
+    this_update: Mapped[datetime] = mapped_column(UTCDateTime())
+    # CRL nextUpdate (UTC), strictly after thisUpdate and after the
+    # registration instant; verification past it against the highest
+    # snapshot fails closed.
+    next_update: Mapped[datetime] = mapped_column(UTCDateTime())
+    # Number of revoked entries whose revocationDate had already arrived at
+    # registration time; future-dated entries are excluded. Stored as the
+    # value returned by the accepting response and never recomputed.
+    revoked_count: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class CRLRevokedEntry(Base):
+    """One revoked-certificate entry of an enrolled CRL snapshot.
+
+    Rows are written in the same transaction as their parent
+    :class:`CRLSnapshot`; snapshots are never deleted, so neither are
+    their entries. An entry matches a chain certificate at verification
+    time when the certificate's issuer DN, rendered as RFC4514 text,
+    equals ``issuer_dn``, its serial number equals ``serial_number`` (the
+    canonical decimal text, since X.509 serials may exceed 64 bits), and
+    ``revocation_date`` is at or before the verification instant. An
+    entry with a future revocationDate is stored but does not reject
+    until that instant arrives.
+
+    Only non-sensitive comparison strings, the serial text and a UTC
+    timestamp are stored — no CRL or certificate material.
+    """
+
+    __tablename__ = "crl_revoked_entries"
+    __table_args__ = (
+        # A serial may appear at most once within one CRL; the handler
+        # rejects duplicate serials as 422 before inserting, and this
+        # constraint guarantees the rule atomically.
+        UniqueConstraint(
+            "crl_id",
+            "serial_number",
+            name="uq_crl_revoked_entry_crl_serial",
+        ),
+        # Covers verification's effective-entry lookup against one
+        # snapshot: scope -> snapshot -> serial, bounded by revocationDate.
+        Index(
+            "ix_crl_revoked_entries_lookup",
+            "tenant_id",
+            "workload_id",
+            "trust_root_id",
+            "crl_id",
+            "serial_number",
+            "revocation_date",
+        ),
+    )
+
+    entry_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    crl_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("crl_snapshots.crl_id"),
+        index=True,
+    )
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    trust_root_id: Mapped[str] = mapped_column(String(36), index=True)
+    # RFC4514 text of the CRL (entry) issuer DN, denormalized from the
+    # snapshot so the verification match needs no second table.
+    issuer_dn: Mapped[str] = mapped_column(String(1024))
+    # Canonical decimal text of the revoked certificate serial number;
+    # text because X.509 serial integers may be wider than 64 bits.
+    serial_number: Mapped[str] = mapped_column(String(64))
+    # UTC instant at/after which the entry rejects the matching chain
+    # certificate (the CRL entry's revocationDate).
+    revocation_date: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class WorkloadIdentityProfile(Base):
     """A workload identity profile anchored to one configured trust root.
 
