@@ -479,6 +479,112 @@ class CertificateRevocation(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
+class CertificateRevocationList(Base):
+    """One registered, immutable X.509 v2 CRL snapshot for a trust root.
+
+    A snapshot is the whole CRL as published by its issuer: a strictly
+    increasing ``crl_number`` (the CRLNumber extension value) with its own
+    validity window (``this_update``/``next_update``) and an independently
+    stored set of revoked-certificate entries (see
+    :class:`CrlRevokedCertificate`). Snapshots are never updated or
+    deleted: a strictly higher CRLNumber for the same trust root inserts a
+    new snapshot and becomes the current one; an equal number, an equal
+    body or a lower/equal number is rejected. Verification for a trust
+    root uses only the highest-numbered snapshot whose ``next_update`` has
+    not passed at verification time; when the highest snapshot is already
+    expired and no newer snapshot exists, verification fails closed with
+    500 rather than trusting stale revocation data.
+
+    Only identifiers, the scope, the parsed metadata, a digest of the CRL
+    body and timestamps are stored: no CRL or certificate material and no
+    free-form text.
+    """
+
+    __tablename__ = "certificate_revocation_lists"
+    __table_args__ = (
+        # Within one trust root each CRLNumber is registered at most once;
+        # the constraint makes concurrent equal-number registrations settle
+        # as exactly one insert plus stable 409s. Its scoped prefix index
+        # also serves the "highest CRLNumber for this trust root" lookup.
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "trust_root_id",
+            "crl_number",
+            name="uq_crl_scope_root_number",
+        ),
+        # Two registrations of a byte-identical CRL body under one root can
+        # never both succeed, so a same-content replay is a stable 409.
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "trust_root_id",
+            "crl_sha256",
+            name="uq_crl_scope_root_content",
+        ),
+    )
+
+    crl_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # The trust root whose subject and public key certify this CRL. CRLs
+    # never cross trust roots, tenants or workloads.
+    trust_root_id: Mapped[str] = mapped_column(String(36), index=True)
+    # Value of the CRLNumber extension; strictly increases per root.
+    crl_number: Mapped[int] = mapped_column(BigInteger)
+    # SHA-256 hex of the CRL's DER encoding, used for same-content replay
+    # detection.
+    crl_sha256: Mapped[str] = mapped_column(String(64))
+    this_update: Mapped[datetime] = mapped_column(UTCDateTime())
+    next_update: Mapped[datetime] = mapped_column(UTCDateTime())
+    # Number of revoked entries whose revocationDate had arrived at
+    # registration time; recorded once, never recomputed.
+    revoked_count: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class CrlRevokedCertificate(Base):
+    """One revoked-certificate entry within a registered CRL snapshot.
+
+    Rows are inserted together with their parent snapshot in one atomic
+    transaction and never updated or deleted independently. A certificate
+    is identified within its issuer's scope by the issuer distinguished
+    name (RFC4514 text, matching the trust-root subject) plus the
+    certificate serial number; ``revocation_date`` gates when the entry
+    takes effect. Only these parsed values are persisted — no CRL or
+    certificate material.
+    """
+
+    __tablename__ = "crl_revoked_certificates"
+    __table_args__ = (
+        # A CRL may list a serial at most once; duplicate serials in the
+        # submitted body are rejected at registration, and the constraint
+        # guarantees the invariant on concurrent writers as well. It also
+        # serves the verification lookup (crl_id + serial_number IN (...)).
+        UniqueConstraint(
+            "crl_id", "serial_number", name="uq_crl_entry_crl_serial"
+        ),
+    )
+
+    entry_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    crl_id: Mapped[str] = mapped_column(String(36), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    trust_root_id: Mapped[str] = mapped_column(String(36), index=True)
+    # RFC4514 rendering of the CRL issuer distinguished name (the trust-
+    # root subject); identical for every entry of one snapshot, stored so
+    # each row remains self-describing without a join back to the root.
+    issuer_dn: Mapped[str] = mapped_column(Text)
+    # Revoked certificate serial number as a non-negative integer in
+    # canonical decimal text. DER INTEGERs are unbounded (a parsed client
+    # CRL is not bound to the 159-bit builder limit), so this is stored as
+    # unlimited text rather than a width-bounded varchar or a 64-bit
+    # integer; matching compares it against
+    # ``str(certificate.serial_number)``.
+    serial_number: Mapped[str] = mapped_column(Text)
+    revocation_date: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class WorkloadIdentityProfile(Base):
     """A workload identity profile anchored to one configured trust root.
 

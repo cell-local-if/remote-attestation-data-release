@@ -34,6 +34,12 @@ __all__ = [
     "VerifierRegistry",
     "AttestedNonceJSONVerifier",
     "X509AttestedNonceJSONVerifier",
+    "CrlValidationError",
+    "ParsedCrl",
+    "ValidatedCrl",
+    "load_crl",
+    "parse_crl",
+    "validate_crl_against_root",
     "default_registry",
     "register_verifier",
     "unregister_verifier",
@@ -329,6 +335,40 @@ def _verify_certificate_signature(
     return True
 
 
+def _verify_crl_signature(crl: x509.CertificateRevocationList, issuer_public_key) -> bool:
+    """Verify a CRL's signature against its issuer's key; never raises."""
+    try:
+        if isinstance(issuer_public_key, rsa.RSAPublicKey):
+            issuer_public_key.verify(
+                crl.signature,
+                crl.tbs_certlist_bytes,
+                padding.PKCS1v15(),
+                crl.signature_hash_algorithm,
+            )
+        elif isinstance(issuer_public_key, ec.EllipticCurvePublicKey):
+            issuer_public_key.verify(
+                crl.signature,
+                crl.tbs_certlist_bytes,
+                ec.ECDSA(crl.signature_hash_algorithm),
+            )
+        elif isinstance(issuer_public_key, ed25519.Ed25519PublicKey):
+            issuer_public_key.verify(crl.signature, crl.tbs_certlist_bytes)
+        else:
+            return False
+    except Exception:
+        # Malformed CRL signatures can raise ValueError and friends in
+        # addition to InvalidSignature; any failure is a plain failure.
+        return False
+    return True
+
+
+def _load_crl(pem: str) -> x509.CertificateRevocationList | None:
+    try:
+        return x509.load_pem_x509_crl(pem.encode("utf-8"))
+    except Exception:
+        return None
+
+
 def _load_certificate(pem: str) -> x509.Certificate | None:
     try:
         return x509.load_pem_x509_certificate(pem.encode("utf-8"))
@@ -481,3 +521,222 @@ def unregister_verifier(format_name: str) -> None:
 def get_verifier(format_name: str) -> Verifier | None:
     """Look up a verifier on the process-wide default registry."""
     return default_registry.get(format_name)
+
+
+# ---------------------------------------------------------------------------
+# X.509 v2 CRL registration support
+# ---------------------------------------------------------------------------
+
+
+class CrlValidationError(ValueError):
+    """A submitted CRL failed a structural or trust validation rule.
+
+    The message is a fixed, service-defined category string — never the CRL
+    body, certificate material, or an exception detail — so the API layer
+    can safely turn it into a sanitized 422.
+    """
+
+
+@dataclass(frozen=True)
+class CrlRevokedEntry:
+    """One validated revoked-certificate entry of a parsed CRL."""
+
+    serial_number: int
+    revocation_date: datetime
+
+
+@dataclass(frozen=True)
+class ValidatedCrl:
+    """The intrinsically valid content of a submitted CRL.
+
+    Produced by :func:`parse_crl` before the trust root is read: every
+    check that depends only on the CRL body (PEM/ASN.1, v2, CRLNumber,
+    nextUpdate, the time window and the revoked-entry serials) has already
+    passed. The trust-dependent checks (issuer DN, signature) run later in
+    :func:`validate_crl_against_root`, so the fixed error order
+    (intrinsic 422 -> unknown root 404 -> issuer/signature 422 -> 409)
+    holds.
+    """
+
+    crl: x509.CertificateRevocationList
+    crl_number: int
+    this_update: datetime
+    next_update: datetime
+    crl_sha256: str
+    entries: tuple[CrlRevokedEntry, ...]
+    revoked_count: int
+
+
+@dataclass(frozen=True)
+class ParsedCrl:
+    """A CRL that has also passed the trust-root issuer/signature checks."""
+
+    validated: ValidatedCrl
+    issuer_dn: str
+
+    @property
+    def crl(self) -> x509.CertificateRevocationList:
+        return self.validated.crl
+
+    @property
+    def crl_number(self) -> int:
+        return self.validated.crl_number
+
+    @property
+    def this_update(self) -> datetime:
+        return self.validated.this_update
+
+    @property
+    def next_update(self) -> datetime:
+        return self.validated.next_update
+
+    @property
+    def crl_sha256(self) -> str:
+        return self.validated.crl_sha256
+
+    @property
+    def entries(self) -> tuple[CrlRevokedEntry, ...]:
+        return self.validated.entries
+
+    @property
+    def revoked_count(self) -> int:
+        return self.validated.revoked_count
+
+
+def load_crl(pem_text: str) -> x509.CertificateRevocationList | None:
+    """Parse a PEM CRL, returning None on any PEM/ASN.1 failure."""
+    if not isinstance(pem_text, str):
+        return None
+    try:
+        return x509.load_pem_x509_crl(pem_text.encode("utf-8"))
+    except Exception:
+        return None
+
+
+def verify_crl_signature(
+    crl: x509.CertificateRevocationList, issuer_public_key
+) -> bool:
+    """Verify a CRL signature against its issuer's public key; never raises."""
+    return _verify_crl_signature(crl, issuer_public_key)
+
+
+def _as_utc(value: datetime) -> datetime:
+    # Prefer the timezone-aware accessors on newer cryptography; the
+    # legacy naive properties are fixed to UTC by RFC 5280, so a naive
+    # value is attached to UTC as a fallback for older libraries.
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _crl_this_update(crl: x509.CertificateRevocationList) -> datetime:
+    aware = getattr(crl, "last_update_utc", None)
+    return _as_utc(aware if aware is not None else crl.last_update)
+
+
+def _crl_next_update(crl: x509.CertificateRevocationList) -> datetime | None:
+    # Newer cryptography exposes timezone-aware accessors (the naive
+    # properties are deprecated); fall back to the naive, RFC-5280-UTC
+    # value on older libraries.
+    if hasattr(crl, "next_update_utc"):
+        aware = crl.next_update_utc
+        return None if aware is None else _as_utc(aware)
+    return None if crl.next_update is None else _as_utc(crl.next_update)
+
+
+def _revocation_date_utc(revoked) -> datetime:
+    aware = getattr(revoked, "revocation_date_utc", None)
+    return _as_utc(aware if aware is not None else revoked.revocation_date)
+
+
+def parse_crl(pem_text: str, *, now: datetime) -> ValidatedCrl:
+    """Parse and intrinsically validate a submitted CRL body.
+
+    Enforces, in fixed order: PEM/ASN.1 parse as an X.509 v2 CRL; presence
+    of CRLNumber and nextUpdate; thisUpdate not after ``now``; nextUpdate
+    strictly later than both thisUpdate and ``now``; and every revoked
+    entry carrying a non-negative, non-duplicate serial. Raises
+    :class:`CrlValidationError` (sanitized category only) on the first
+    failed rule. The trust root is never accessed here.
+    """
+    crl = load_crl(pem_text)
+    if crl is None:
+        raise CrlValidationError("crl_pem is not a valid PEM X.509 CRL")
+    # X.509 v2 is the only CRL version permitted to carry extensions, and
+    # the contract requires the v2-only CRLNumber extension; its presence
+    # is therefore the v2 marker (the library exposes no version field on
+    # a parsed CRL). A v1 CRL without it is rejected below.
+    try:
+        number_ext = crl.extensions.get_extension_for_class(x509.CRLNumber)
+    except x509.ExtensionNotFound:
+        raise CrlValidationError(
+            "crl_pem must be an X.509 v2 CRL with a CRLNumber extension"
+        )
+    crl_number = number_ext.value.crl_number
+    # RFC 5280 bounds CRLNumber to a non-negative integer.
+    if not isinstance(crl_number, int) or crl_number < 0:
+        raise CrlValidationError("invalid CRLNumber")
+
+    next_update = _crl_next_update(crl)
+    if next_update is None:
+        raise CrlValidationError("crl_pem must include nextUpdate")
+    this_update = _crl_this_update(crl)
+
+    if this_update > now:
+        raise CrlValidationError("thisUpdate must not be in the future")
+    if next_update <= this_update:
+        raise CrlValidationError("nextUpdate must be later than thisUpdate")
+    if next_update <= now:
+        raise CrlValidationError("nextUpdate must be later than the receipt time")
+
+    entries: list[CrlRevokedEntry] = []
+    seen_serials: set[int] = set()
+    for revoked in crl:
+        serial = revoked.serial_number
+        # RFC 5280 serials are non-negative integers; a negative value or
+        # another non-canonical encoding is a malformed CRL.
+        if not isinstance(serial, int) or serial < 0:
+            raise CrlValidationError("invalid revoked certificate serial number")
+        if serial in seen_serials:
+            raise CrlValidationError("duplicate revoked certificate serial number")
+        seen_serials.add(serial)
+        entries.append(
+            CrlRevokedEntry(
+                serial_number=serial,
+                revocation_date=_revocation_date_utc(revoked),
+            )
+        )
+
+    der = crl.public_bytes(Encoding.DER)
+    revoked_count = sum(1 for entry in entries if entry.revocation_date <= now)
+    return ValidatedCrl(
+        crl=crl,
+        crl_number=crl_number,
+        this_update=this_update,
+        next_update=next_update,
+        crl_sha256=hashlib.sha256(der).hexdigest(),
+        entries=tuple(entries),
+        revoked_count=revoked_count,
+    )
+
+
+def validate_crl_against_root(
+    validated: ValidatedCrl,
+    *,
+    issuer_certificate: x509.Certificate,
+) -> ParsedCrl:
+    """Validate the trust-dependent CRL rules against one trust root.
+
+    The CRL issuer DN must equal the trust root's subject and the CRL
+    signature must verify under the trust root's public key; either
+    mismatch is a sanitized :class:`CrlValidationError` (422). Runs only
+    after the trust root has been looked up in the request's exact scope.
+    """
+    if validated.crl.issuer != issuer_certificate.subject:
+        raise CrlValidationError("CRL issuer does not match the trust root subject")
+    if not _verify_crl_signature(validated.crl, issuer_certificate.public_key()):
+        raise CrlValidationError("CRL signature is not valid for the trust root")
+    return ParsedCrl(
+        validated=validated,
+        issuer_dn=issuer_certificate.subject.rfc4514_string(),
+    )
