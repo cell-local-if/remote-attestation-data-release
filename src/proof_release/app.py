@@ -48,9 +48,11 @@ from cryptography import x509
 from cryptography.hazmat.primitives.serialization import Encoding
 
 from proof_release.db import (
+    DECISION_EVALUATION_VERSION,
     DECISION_STATUS_ALLOWED,
     DECISION_STATUS_DENIED,
     DECISION_STATUS_CODES,
+    EVALUATION_NODE_TYPES,
     RELEASE_GRANT_STATUS_CODES,
     RELEASE_GRANT_STATUS_CONSUMED,
     RELEASE_GRANT_STATUS_PENDING,
@@ -115,6 +117,7 @@ from proof_release.db import (
     DataEnvelope,
     Decision,
     DecisionCommitCounter,
+    DecisionEvaluationNode,
     Evidence,
     Policy,
     PolicyCommitCounter,
@@ -145,7 +148,7 @@ from proof_release.envelopes import (
 from proof_release.policies import (
     InvalidRule,
     canonical_rule_json,
-    evaluate_rule,
+    evaluate_rule_explained,
     validate_rule,
 )
 from proof_release.verifiers import (
@@ -7738,7 +7741,11 @@ def create_app(
                 )
 
             rule = json.loads(policy.rule_json)
-            satisfied = evaluate_rule(rule, claims)
+            # Evaluate every node of the rule tree (no short-circuit) so
+            # the decision commits together with its complete explanation.
+            # The root outcome is identical to the short-circuiting
+            # evaluator's result, so the decision status is unchanged.
+            satisfied, explanation = evaluate_rule_explained(rule, claims)
             status = (
                 DECISION_STATUS_ALLOWED if satisfied else DECISION_STATUS_DENIED
             )
@@ -7777,6 +7784,27 @@ def create_app(
                 ),
             )
             session.add(decision)
+            # The full rule explanation commits in the same transaction as
+            # the decision it explains, so a persisted decision always has
+            # exactly one complete explanation and a rolled-back decision
+            # leaves none. Each row records only a node's position, kind
+            # and boolean outcome — never a claim name, comparison value,
+            # actual claim value, evidence, nonce, capability, payload or
+            # key. The rows are immutable: a retry or a concurrent loser
+            # returns the winner's decision and its committed explanation,
+            # and later policy/identity/key changes never rewrite them.
+            for explained_node in explanation:
+                session.add(
+                    DecisionEvaluationNode(
+                        decision_id=decision_id,
+                        node_index=explained_node["node_index"],
+                        rule_path=json.dumps(
+                            explained_node["rule_path"], separators=(",", ":")
+                        ),
+                        node_type=explained_node["node_type"],
+                        outcome=explained_node["outcome"],
+                    )
+                )
             if prior_decision is None:
                 # Commits in the same transaction as the first decision
                 # row, recording only the fixed allowed/denied code, the
@@ -9384,6 +9412,191 @@ def create_app(
         body = (
             json.dumps(
                 {"decision": decision_view, "policy_version": policy_view},
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
+
+    @app.get("/v1/decisions//evaluation")
+    def get_decision_evaluation_identifier_required() -> Response:
+        # An empty path segment is a missing decision identifier: a 422
+        # client error rather than a routing-level 404. It never reads a
+        # decision or its evaluation.
+        raise HTTPException(status_code=422, detail="invalid decision identifier")
+
+    @app.get("/v1/decisions/{decision_id}/evaluation")
+    def get_decision_evaluation(
+        request: Request,
+        decision_id: str,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return one decision's persisted rule-evaluation explanation.
+
+        The explanation is the complete rule tree the decision was taken
+        against, recorded node by node in the decision's own transaction
+        and never rewritten afterwards: policy retirement or update,
+        identity or revocation changes and key rotation all leave it
+        intact. Every node carries exactly its depth-first pre-order
+        ``node_index`` (0 is the root), its ``rule_path`` (child positions
+        from the root, ``[]`` for the root itself), its ``node_type``
+        (leaf/all/any/not) and its boolean ``outcome``; the root outcome
+        is the decision's status. No claim name, comparison value, actual
+        claim value, evidence, nonce, capability, payload or key is ever
+        stored or returned.
+
+        Every request-shape failure is a 422 returned before any state is
+        read: the body must be missing or zero-length, exactly one
+        non-blank ``tenant_id`` and ``workload_id`` may be supplied (an
+        unknown or repeated parameter is a 422) and the path id must be a
+        canonical lowercase UUID. An unknown or out-of-scope decision is
+        one indistinguishable 404. A decision settled before explanations
+        were recorded carries none and answers 409. A storage or
+        integrity failure (including a partial or inconsistent
+        explanation) is a 500 with the half-built result discarded
+        entirely. The handler issues only SELECTs of committed state.
+        """
+        # --- request shape (all 422, no storage touched) ----------------
+        allowed_params = {"tenant_id", "workload_id"}
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+        # Each parameter is a single scalar string; a repeated parameter
+        # (even of an allowed name) is rejected rather than silently
+        # treated as last-wins.
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(
+                status_code=422, detail="query parameter must appear once"
+            )
+
+        # The raw path value must be a canonical lowercase UUID: missing
+        # (handled by the dedicated empty-segment route above), blank,
+        # whitespace-padded, uppercase or otherwise non-canonical values
+        # are format errors rejected before any state is read.
+        if not decision_id or not _UUID_RE.fullmatch(decision_id):
+            raise HTTPException(
+                status_code=422, detail="invalid decision identifier"
+            )
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        # --- read-only decision + persisted explanation -----------------
+        try:
+            with session_factory() as session:
+                decision = session.get(Decision, decision_id)
+                if (
+                    decision is None
+                    or decision.tenant_id != tenant_id
+                    or decision.workload_id != workload_id
+                ):
+                    # Do not reveal whether an unknown or out-of-scope
+                    # decision exists under another scope: both share one
+                    # indistinguishable 404.
+                    raise HTTPException(
+                        status_code=404, detail="decision not found"
+                    )
+
+                rows = session.scalars(
+                    select(DecisionEvaluationNode)
+                    .where(DecisionEvaluationNode.decision_id == decision_id)
+                    .order_by(DecisionEvaluationNode.node_index)
+                ).all()
+                if not rows:
+                    # A decision settled before explanations were recorded
+                    # has none; its conclusion stays valid and
+                    # addressable, but no per-node outcomes exist to
+                    # return. This is a fixed conflict, never an error
+                    # page with partial data.
+                    raise HTTPException(
+                        status_code=409, detail="evaluation not recorded"
+                    )
+
+                # Integrity is verified before anything is returned: the
+                # stored nodes must be the complete, contiguous depth-first
+                # pre-order sequence 0..N-1 with a well-formed path and
+                # kind each, and the root must sit at the empty path with
+                # an outcome equal to the decision's status. Anything
+                # less is a storage/integrity failure — discard the
+                # half-built result and answer 500 rather than returning
+                # a truncated or inconsistent explanation.
+                nodes = []
+                for expected_index, row in enumerate(rows):
+                    try:
+                        rule_path = json.loads(row.rule_path)
+                    except (json.JSONDecodeError, TypeError):
+                        rule_path = None
+                    if (
+                        row.node_index != expected_index
+                        or not isinstance(rule_path, list)
+                        or any(
+                            not isinstance(position, int)
+                            or isinstance(position, bool)
+                            or position < 0
+                            for position in rule_path
+                        )
+                        or (expected_index == 0) != (rule_path == [])
+                        or row.node_type not in EVALUATION_NODE_TYPES
+                        or not isinstance(row.outcome, bool)
+                    ):
+                        raise HTTPException(
+                            status_code=500,
+                            detail="decision evaluation unavailable",
+                        )
+                    nodes.append(
+                        {
+                            "node_index": row.node_index,
+                            "rule_path": rule_path,
+                            "node_type": row.node_type,
+                            "outcome": row.outcome,
+                        }
+                    )
+                if nodes[0]["outcome"] != (
+                    decision.status == DECISION_STATUS_ALLOWED
+                ):
+                    raise HTTPException(
+                        status_code=500,
+                        detail="decision evaluation unavailable",
+                    )
+
+                evaluation_view = {
+                    "decision_id": decision.decision_id,
+                    # The integer policy version the decision (and this
+                    # explanation) was taken against.
+                    "policy_version": decision.policy_version,
+                    # The fixed allowed/denied conclusion code; it equals
+                    # the root node's outcome.
+                    "status": decision.status,
+                    # The original UTC decision time, never rewritten.
+                    "decided_at": _rfc3339(decision.decided_at),
+                    # The fixed explanation shape version.
+                    "evaluation_version": DECISION_EVALUATION_VERSION,
+                    "nodes": nodes,
+                }
+        except HTTPException:
+            raise
+        except Exception:
+            # Fixed message only: exception text might carry protected
+            # material and is never logged or returned.
+            logger.error("decision evaluation query failed")
+            raise HTTPException(
+                status_code=500, detail="decision evaluation unavailable"
+            )
+
+        # Compact JSON with a single terminating newline. Every value is
+        # a JSON string, integer, boolean or a list of integers — no
+        # floats or non-finite values are possible. No claim name, claim
+        # value, evidence text, nonce, capability, payload, key or
+        # exception text appears.
+        body = (
+            json.dumps(
+                evaluation_view,
                 separators=(",", ":"),
                 allow_nan=False,
                 ensure_ascii=False,

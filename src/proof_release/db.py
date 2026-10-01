@@ -944,6 +944,66 @@ class DecisionCommitCounter(Base):
     last_seq: Mapped[int] = mapped_column(BigInteger)
 
 
+#: Finite, service-defined set of rule-node kinds a persisted decision
+#: evaluation explanation records: a comparison leaf or one of the
+#: compound forms.
+EVALUATION_NODE_TYPE_LEAF = "leaf"
+EVALUATION_NODE_TYPE_ALL = "all"
+EVALUATION_NODE_TYPE_ANY = "any"
+EVALUATION_NODE_TYPE_NOT = "not"
+EVALUATION_NODE_TYPES = frozenset(
+    {
+        EVALUATION_NODE_TYPE_LEAF,
+        EVALUATION_NODE_TYPE_ALL,
+        EVALUATION_NODE_TYPE_ANY,
+        EVALUATION_NODE_TYPE_NOT,
+    }
+)
+
+#: Version of the persisted and returned evaluation explanation shape.
+#: Explanations are written once, in the decision's own transaction, and
+#: never rewritten, so one fixed version suffices; a future shape change
+#: would allocate a new version rather than mutate stored rows.
+DECISION_EVALUATION_VERSION = 1
+
+
+class DecisionEvaluationNode(Base):
+    """One node of a decision's immutable rule-evaluation explanation.
+
+    The rows of one ``decision_id`` reconstruct the full rule tree the
+    decision was taken against, in depth-first pre-order: ``node_index``
+    numbers the nodes consecutively from 0 (the root) and ``rule_path``
+    is the canonical JSON array of child positions from the root (``[]``
+    for the root, ``[0]`` for the first child of an ``all``/``any`` and
+    for a ``not`` node's only child). ``outcome`` is the node's boolean
+    result; the root's outcome is the decision's allowed/denied status.
+
+    Exactly one explanation exists per decision: the rows commit in the
+    same transaction as the decision itself, and the decision's
+    (evidence, policy version) uniqueness makes concurrent creators
+    converge on a single decision and therefore a single explanation.
+    The rows are never updated or deleted afterwards — policy retirement
+    or update, identity or revocation changes and key rotation leave a
+    recorded explanation untouched.
+
+    Only node positions, kinds and booleans are stored: never claim
+    names, comparison values, actual claim values, evidence, nonces,
+    capabilities, payloads or keys. The composite primary key doubles as
+    the lookup/ordering index for reading one decision's explanation.
+    """
+
+    __tablename__ = "decision_evaluation_nodes"
+
+    decision_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    # Depth-first pre-order position of this node; 0 is the root.
+    node_index: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Canonical JSON array of integer child positions from the root.
+    rule_path: Mapped[str] = mapped_column(Text)
+    # One of EVALUATION_NODE_TYPE_*.
+    node_type: Mapped[str] = mapped_column(String(8))
+    outcome: Mapped[bool] = mapped_column(Boolean)
+
+
 class DataEnvelope(Base):
     """An envelope-encrypted data item scoped to a tenant and workload.
 

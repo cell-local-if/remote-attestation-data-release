@@ -30,6 +30,7 @@ __all__ = [
     "InvalidRule",
     "validate_rule",
     "evaluate_rule",
+    "evaluate_rule_explained",
     "canonical_rule_json",
     "MAX_RULE_DEPTH",
     "MAX_RULE_NODES",
@@ -265,6 +266,31 @@ def _compare_order(actual: Any, key: str, bound: Any) -> bool:
     return actual >= bound
 
 
+def _evaluate_leaf(rule: dict[str, Any], claims: dict[str, Any]) -> bool:
+    """Evaluate one leaf node (locator plus exactly one comparison)."""
+    (comparison,) = set(rule.keys()) - _LOCATOR_KEYS
+    if "claim" in rule:
+        if isinstance(claims, dict) and rule["claim"] in claims:
+            actual = claims[rule["claim"]]
+        else:
+            actual = _MISSING
+    else:
+        actual = _read_path(claims, rule["path"])
+    if comparison == "exists":
+        return actual is not _MISSING
+    if actual is _MISSING:
+        return False
+    if comparison == "equals":
+        return _scalar_equals(actual, rule["equals"])
+    if comparison == "in":
+        return any(
+            _scalar_equals(actual, candidate) for candidate in rule["in"]
+        )
+    if comparison in _ORDER_KEYS:
+        return _compare_order(actual, comparison, rule[comparison])
+    raise InvalidRule(f"unknown comparison: {comparison}")
+
+
 def evaluate_rule(rule: dict[str, Any], claims: dict[str, Any]) -> bool:
     """Evaluate a validated rule against top-level verified claims.
 
@@ -280,27 +306,7 @@ def evaluate_rule(rule: dict[str, Any], claims: dict[str, Any]) -> bool:
     keys = set(rule.keys())
     locators = keys & _LOCATOR_KEYS
     if len(keys) == 2 and len(locators) == 1:
-        (comparison,) = keys - locators
-        if "claim" in locators:
-            if isinstance(claims, dict) and rule["claim"] in claims:
-                actual = claims[rule["claim"]]
-            else:
-                actual = _MISSING
-        else:
-            actual = _read_path(claims, rule["path"])
-        if comparison == "exists":
-            return actual is not _MISSING
-        if actual is _MISSING:
-            return False
-        if comparison == "equals":
-            return _scalar_equals(actual, rule["equals"])
-        if comparison == "in":
-            return any(
-                _scalar_equals(actual, candidate) for candidate in rule["in"]
-            )
-        if comparison in _ORDER_KEYS:
-            return _compare_order(actual, comparison, rule[comparison])
-        raise InvalidRule(f"unknown comparison: {comparison}")
+        return _evaluate_leaf(rule, claims)
     (key,) = keys
     if key == "all":
         return all(evaluate_rule(child, claims) for child in rule["all"])
@@ -309,3 +315,63 @@ def evaluate_rule(rule: dict[str, Any], claims: dict[str, Any]) -> bool:
     if key == "not":
         return not evaluate_rule(rule["not"], claims)
     raise InvalidRule(f"unknown rule form: {key}")
+
+
+def evaluate_rule_explained(
+    rule: dict[str, Any], claims: dict[str, Any]
+) -> tuple[bool, list[dict[str, Any]]]:
+    """Evaluate a validated rule and explain every node's outcome.
+
+    Returns ``(root_outcome, nodes)`` where ``nodes`` lists every node of
+    the rule tree in depth-first pre-order (parent before children,
+    children in declared order). Each entry carries exactly::
+
+        {"node_index": int, "rule_path": [int, ...],
+         "node_type": "leaf"|"all"|"any"|"not", "outcome": bool}
+
+    ``node_index`` numbers the nodes consecutively from 0 (the root);
+    ``rule_path`` is the list of child positions from the root — ``[]``
+    for the root, ``[0]`` for the first child of an ``all``/``any`` and
+    for a ``not`` child's only subnode. The root outcome is the rule's
+    boolean result, identical to :func:`evaluate_rule`.
+
+    Unlike :func:`evaluate_rule`, compound nodes do not short-circuit:
+    every child is evaluated so every node has a recorded outcome. The
+    result is the same — leaf comparisons are total functions with no
+    side effects, so skipped branches never change the root outcome.
+    The explanation records only node positions, kinds and booleans —
+    never claim names, comparison values or actual claim values.
+    """
+    nodes: list[dict[str, Any]] = []
+
+    def visit(node: dict[str, Any], path: list[int]) -> bool:
+        record: dict[str, Any] = {
+            "node_index": len(nodes),
+            "rule_path": list(path),
+            "node_type": "",
+            "outcome": False,
+        }
+        nodes.append(record)
+        keys = set(node.keys())
+        if len(keys) == 2 and keys & _LOCATOR_KEYS:
+            record["node_type"] = "leaf"
+            record["outcome"] = _evaluate_leaf(node, claims)
+            return record["outcome"]
+        (key,) = keys
+        record["node_type"] = key
+        if key in ("all", "any"):
+            child_outcomes = [
+                visit(child, path + [position])
+                for position, child in enumerate(node[key])
+            ]
+            record["outcome"] = (
+                all(child_outcomes) if key == "all" else any(child_outcomes)
+            )
+            return record["outcome"]
+        if key == "not":
+            record["outcome"] = not visit(node["not"], path + [0])
+            return record["outcome"]
+        raise InvalidRule(f"unknown rule form: {key}")
+
+    root_outcome = visit(rule, [])
+    return root_outcome, nodes
