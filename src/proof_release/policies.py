@@ -30,6 +30,8 @@ __all__ = [
     "InvalidRule",
     "validate_rule",
     "evaluate_rule",
+    "explain_rule",
+    "rule_structure",
     "canonical_rule_json",
     "MAX_RULE_DEPTH",
     "MAX_RULE_NODES",
@@ -309,3 +311,95 @@ def evaluate_rule(rule: dict[str, Any], claims: dict[str, Any]) -> bool:
     if key == "not":
         return not evaluate_rule(rule["not"], claims)
     raise InvalidRule(f"unknown rule form: {key}")
+
+
+def explain_rule(
+    rule: dict[str, Any], claims: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Explain a validated rule's evaluation as a depth-first node list.
+
+    Every node of the tree appears exactly once, parents before their
+    children (pre-order), with ``node_index`` running continuously from 0
+    in that traversal order. Each node carries::
+
+        {"node_index": int, "rule_path": [int, ...],
+         "node_type": "leaf"|"all"|"any"|"not", "outcome": bool}
+
+    ``rule_path`` is the integer child-index path from the root: the root
+    is ``[]``, the first child of an ``all``/``any`` node is ``[0]`` (the
+    second child ``[1]`` and so on), and the single child of ``not`` is
+    ``[0]``. Every node's ``outcome`` is produced by
+    :func:`evaluate_rule` against the same verified claims, so the root's
+    outcome always equals the decision's overall verdict and every
+    compound node's outcome agrees with its children's outcomes under the
+    documented all/any/not semantics. Unlike :func:`evaluate_rule`'s
+    short-circuit walk, every child is evaluated independently so the
+    explanation always covers the complete tree.
+
+    The explanation contains only node positions, structural types and
+    booleans: it never records claim names, object paths, comparison
+    operators, expected scalars, actual claim values or any evidence.
+    """
+    nodes: list[dict[str, Any]] = []
+
+    def visit(node: dict[str, Any], path: list[int]) -> None:
+        keys = set(node.keys())
+        locators = keys & _LOCATOR_KEYS
+        index = len(nodes)
+        if len(keys) == 2 and len(locators) == 1:
+            node_type = "leaf"
+            children: list[tuple[Any, list[int]]] = []
+        else:
+            (key,) = keys
+            node_type = key
+            if key in ("all", "any"):
+                children = [
+                    (child, [*path, position])
+                    for position, child in enumerate(node[key])
+                ]
+            else:
+                children = [(node[key], [*path, 0])]
+        nodes.append(
+            {
+                "node_index": index,
+                "rule_path": list(path),
+                "node_type": node_type,
+                "outcome": evaluate_rule(node, claims),
+            }
+        )
+        for child, child_path in children:
+            visit(child, child_path)
+
+    visit(rule, [])
+    return nodes
+
+
+def rule_structure(rule: dict[str, Any]) -> list[tuple[tuple[int, ...], str]]:
+    """Return a validated rule tree's pre-order ``(path, node_type)`` shape.
+
+    This is the explanation minus its outcomes: exactly one entry per node
+    in the same depth-first order :func:`explain_rule` emits, with the
+    same integer paths and ``leaf``/``all``/``any``/``not`` types. It
+    contains no comparison data — only positions and structural types — so
+    an explanation read back can be checked for completeness and shape
+    against a policy version's immutable rule without touching claim names,
+    paths-as-locators, expected scalars or actual values.
+    """
+    skeleton: list[tuple[tuple[int, ...], str]] = []
+
+    def visit(node: dict[str, Any], path: list[int]) -> None:
+        keys = set(node.keys())
+        locators = keys & _LOCATOR_KEYS
+        if len(keys) == 2 and len(locators) == 1:
+            skeleton.append((tuple(path), "leaf"))
+            return
+        (key,) = keys
+        skeleton.append((tuple(path), key))
+        if key in ("all", "any"):
+            for position, child in enumerate(node[key]):
+                visit(child, [*path, position])
+        else:
+            visit(node[key], [*path, 0])
+
+    visit(rule, [])
+    return skeleton

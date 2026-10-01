@@ -944,6 +944,52 @@ class DecisionCommitCounter(Base):
     last_seq: Mapped[int] = mapped_column(BigInteger)
 
 
+class DecisionEvaluationNode(Base):
+    """One node of a decision's depth-first policy-rule evaluation.
+
+    Rows are inserted in the same transaction as the :class:`Decision`
+    they explain, in pre-order traversal order, so exactly one immutable
+    explanation exists per decision and a committed decision never lacks
+    one. Decisions recorded by deployments older than the explanation have
+    no rows: reading the explanation for such a decision is a defined 409
+    (``evaluation not recorded``) rather than a fabricated reconstruction.
+
+    The table stores only node position, structural type and a boolean:
+
+    * ``node_index`` — zero-based pre-order position, unique and
+      gap-free within one decision (0 is the root);
+    * ``rule_path`` — canonical JSON array of integer child indexes from
+      the root (``[]`` for the root, ``[0]`` for the first child of an
+      ``all``/``any`` node or the single child of ``not``);
+    * ``node_type`` — one of ``leaf``/``all``/``any``/``not``;
+    * ``outcome`` — that node's boolean verdict; the root row's outcome
+      equals the decision status.
+
+    It never stores claim names, object paths, comparison operators,
+    expected scalars, actual claim values, evidence, nonces, capabilities,
+    payloads or keys. The explanation is historical: policy retirement,
+    policy updates, identity or revocation changes and key rotation never
+    rewrite these rows.
+    """
+
+    __tablename__ = "decision_evaluation_nodes"
+
+    # The composite primary key orders and identifies the rows: it is
+    # unique per (decision, pre-order position), gap-free inserts never
+    # collide within a decision, and an explanation read whole for one
+    # decision walks the key prefix in node_index order on every backend.
+    # It is also the concurrent-insert backstop: alongside the decision's
+    # own (evidence, policy) uniqueness it guarantees one decision with
+    # one explanation.
+    decision_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    node_index: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Canonical JSON text of the integer path array (e.g. ``[]`` or
+    # ``[0,1]``); integers and square brackets only — never claim names.
+    rule_path: Mapped[str] = mapped_column(String(256))
+    node_type: Mapped[str] = mapped_column(String(8))
+    outcome: Mapped[bool] = mapped_column(Boolean)
+
+
 class DataEnvelope(Base):
     """An envelope-encrypted data item scoped to a tenant and workload.
 
