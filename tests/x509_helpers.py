@@ -8,8 +8,9 @@ from datetime import datetime, timedelta, timezone
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+from cryptography.x509 import ocsp
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 def generate_key():
     return ec.generate_private_key(ec.SECP256R1())
@@ -108,15 +109,16 @@ def sign_payload(key, nonce: str, claims: dict) -> str:
     return base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")
 
 
-def evidence_document(nonce, claims, chain_pems, signature) -> str:
-    return json.dumps(
-        {
-            "nonce": nonce,
-            "claims": claims,
-            "certificate_chain": list(chain_pems),
-            "signature": signature,
-        }
-    )
+def evidence_document(nonce, claims, chain_pems, signature, *, ocsp_responses=None):
+    document = {
+        "nonce": nonce,
+        "claims": claims,
+        "certificate_chain": list(chain_pems),
+        "signature": signature,
+    }
+    if ocsp_responses is not None:
+        document["ocsp_responses"] = ocsp_responses
+    return json.dumps(document)
 
 
 def make_evidence(nonce, leaf_key, chain_certificates, claims=None) -> str:
@@ -269,3 +271,267 @@ def crl_without_next_update(issuer_cert, issuer_key, number=1, *, revoked=()):
         + _base64.encodebytes(new_outer).decode("ascii")
         + "-----END X509 CRL-----\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# OCSP response builders (embedded x509-attested-nonce-json evidence)
+# ---------------------------------------------------------------------------
+
+
+def make_delegated_responder(
+    issuer_cert,
+    issuer_key,
+    common_name="test-ocsp-responder",
+    *,
+    ocsp_signing=True,
+    ca=False,
+    not_before=None,
+    not_after=None,
+    extra_extensions=(),
+):
+    """Create an OCSP-responder certificate and key issued by ``issuer_cert``.
+
+    By default the certificate carries the OCSP Signing extended key usage
+    and a non-CA basic constraints extension, as RFC 6960 requires for a
+    delegated responder. The EKU extension may be omitted and other
+    extensions added to exercise rejection paths.
+    """
+    key = generate_key()
+    extensions = list(extra_extensions)
+    if ocsp_signing:
+        extensions.append(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.OCSP_SIGNING])
+        )
+    cert = build_certificate(
+        common_name,
+        key.public_key(),
+        issuer_cert.subject,
+        issuer_key,
+        ca=ca,
+        not_before=not_before,
+        not_after=not_after,
+        extra_extensions=extensions,
+    )
+    return key, cert
+
+
+def make_ocsp_response(
+    target_cert,
+    issuer_cert,
+    responder_cert,
+    responder_key,
+    *,
+    status=ocsp.OCSPCertStatus.GOOD,
+    algorithm=hashes.SHA1(),
+    this_update=None,
+    next_update=None,
+    revocation_time=None,
+    responder_encoding=ocsp.OCSPResponderEncoding.HASH,
+    embedded_certificates=(),
+    signature_algorithm=hashes.SHA256(),
+):
+    """Build and sign a one-SingleResponse DER ``OCSPResponse``.
+
+    ``this_update`` defaults to five minutes before now and
+    ``next_update`` to one day after now. A revoked response gets a
+    revocation time of now unless one is supplied. The responder is
+    identified by key hash by default (RFC 5019 style); responder
+    certificates may be embedded alongside the signature.
+    """
+    now = datetime.now(timezone.utc)
+    if this_update is None:
+        this_update = now - timedelta(minutes=5)
+    if next_update is None:
+        next_update = now + timedelta(days=1)
+    if (
+        status == ocsp.OCSPCertStatus.REVOKED
+        and revocation_time is None
+    ):
+        revocation_time = now
+    builder = (
+        ocsp.OCSPResponseBuilder()
+        .add_response(
+            cert=target_cert,
+            issuer=issuer_cert,
+            algorithm=algorithm,
+            cert_status=status,
+            this_update=this_update,
+            next_update=next_update,
+            revocation_time=revocation_time,
+            revocation_reason=None,
+        )
+        .responder_id(responder_encoding, responder_cert)
+    )
+    if embedded_certificates:
+        builder = builder.certificates(list(embedded_certificates))
+    response = builder.sign(responder_key, signature_algorithm)
+    return response.public_bytes(serialization.Encoding.DER)
+
+
+def make_ocsp_entry(
+    target_cert,
+    issuer_cert,
+    responder_cert,
+    responder_key,
+    **kwargs,
+):
+    """Build one ``ocsp_responses`` evidence entry (response + responder)."""
+    der = make_ocsp_response(
+        target_cert, issuer_cert, responder_cert, responder_key, **kwargs
+    )
+    return {
+        "response": base64.urlsafe_b64encode(der).rstrip(b"=").decode("ascii"),
+        "responder_certificate": pem(responder_cert),
+    }
+
+
+def ocsp_entries_for_chain(certificates, keys):
+    """Good, direct-CA-signed entries covering every non-root certificate."""
+    return [
+        make_ocsp_entry(
+            certificates[index],
+            certificates[index + 1],
+            certificates[index + 1],
+            keys[index + 1],
+        )
+        for index in range(len(certificates) - 1)
+    ]
+
+
+# Minimal DER walker/encoder used to mutate responses the high-level
+# builder cannot express (producedAt, multiple SingleResponses).
+def _der_tlv(data: bytes, index: int = 0):
+    tag = data[index]
+    index += 1
+    length = data[index]
+    index += 1
+    if length & 0x80:
+        count = length & 0x7F
+        length = int.from_bytes(data[index : index + count], "big")
+        index += count
+    return tag, data[index : index + length], index + length
+
+
+def _der_encode(tag: int, value: bytes) -> bytes:
+    if len(value) < 0x80:
+        length = bytes([len(value)])
+    else:
+        raw = len(value).to_bytes((len(value).bit_length() + 7) // 8, "big")
+        length = bytes([0x80 | len(raw)]) + raw
+    return bytes([tag]) + length + value
+
+
+def _ocsp_response_parts(der: bytes) -> dict:
+    """Split an OCSPResponse DER into the pieces surgery must preserve."""
+    _, outer, _ = _der_tlv(der)
+    index = 0
+    _, status_value, index = _der_tlv(outer, index)
+    response_bytes_tag, response_bytes_explicit, index = _der_tlv(
+        outer, index
+    )
+    _, response_bytes, _ = _der_tlv(response_bytes_explicit)
+    index = 0
+    oid_tag, oid_value, index = _der_tlv(response_bytes, index)
+    octet_tag, octet_value, index = _der_tlv(response_bytes, index)
+    _, basic, _ = _der_tlv(octet_value)
+    index = 0
+    _, tbs_value, index = _der_tlv(basic, index)
+    algorithm_tag, algorithm_value, index = _der_tlv(basic, index)
+    signature_tag, signature_value, index = _der_tlv(basic, index)
+    return {
+        "status_value": status_value,
+        "response_bytes_tag": response_bytes_tag,
+        "oid": (oid_tag, oid_value),
+        "octet_tag": octet_tag,
+        "tbs": tbs_value,
+        "algorithm": (algorithm_tag, algorithm_value),
+        "signature_tag": signature_tag,
+        "tail": basic[index:],
+    }
+
+
+def _ocsp_tbs_children(tbs_value: bytes) -> list[tuple[int, bytes]]:
+    children = []
+    index = 0
+    while index < len(tbs_value):
+        start = index
+        tag, _, index = _der_tlv(tbs_value, index)
+        children.append((tag, tbs_value[start:index]))
+    return children
+
+
+def _rebuild_ocsp_response(parts: dict, tbs_value: bytes, signer_key) -> bytes:
+    """Re-sign the replaced ResponseData and reassemble the OCSPResponse.
+
+    ``tbs_value`` is the complete ResponseData SEQUENCE TLV.
+    """
+    if isinstance(signer_key, ec.EllipticCurvePrivateKey):
+        signature = signer_key.sign(tbs_value, ec.ECDSA(hashes.SHA256()))
+    elif isinstance(signer_key, rsa.RSAPrivateKey):
+        signature = signer_key.sign(
+            tbs_value, padding.PKCS1v15(), hashes.SHA256()
+        )
+    else:
+        signature = signer_key.sign(tbs_value)
+    # BasicOCSPResponse ::= SEQUENCE { ResponseData, AlgorithmIdentifier,
+    # BIT STRING signature, [0] certs? }
+    basic = _der_encode(
+        0x30,
+        tbs_value
+        + _der_encode(parts["algorithm"][0], parts["algorithm"][1])
+        + _der_encode(parts["signature_tag"], b"\x00" + signature)
+        + parts["tail"],
+    )
+    # ResponseBytes ::= SEQUENCE { OID responseType, OCTET STRING response }
+    response_bytes = _der_encode(
+        0x30,
+        _der_encode(parts["oid"][0], parts["oid"][1])
+        + _der_encode(parts["octet_tag"], basic),
+    )
+    return _der_encode(
+        0x30,
+        _der_encode(0x0A, parts["status_value"])
+        + _der_encode(parts["response_bytes_tag"], response_bytes),
+    )
+
+
+def ocsp_response_with_produced_at(der: bytes, produced_at, signer_key) -> bytes:
+    """Replace a response's producedAt (GeneralizedTime) and re-sign it."""
+    parts = _ocsp_response_parts(der)
+    children = _ocsp_tbs_children(parts["tbs"])
+    index = next(i for i, (tag, _) in enumerate(children) if tag == 0x18)
+    text = produced_at.astimezone(timezone.utc).strftime("%Y%m%d%H%M%SZ").encode(
+        "ascii"
+    )
+    children[index] = (0x18, _der_encode(0x18, text))
+    tbs_value = _der_encode(0x30, b"".join(raw for _, raw in children))
+    return _rebuild_ocsp_response(parts, tbs_value, signer_key)
+
+
+def ocsp_response_resent(der: bytes, new_signer_key) -> bytes:
+    """Re-sign an otherwise unchanged response with a different key."""
+    parts = _ocsp_response_parts(der)
+    tbs_value = _der_encode(0x30, parts["tbs"])
+    return _rebuild_ocsp_response(parts, tbs_value, new_signer_key)
+
+
+def ocsp_response_with_extra_single_response(
+    der: bytes, signer_key
+) -> bytes:
+    """Duplicate the SingleResponse so the response carries two of them."""
+    parts = _ocsp_response_parts(der)
+    children = _ocsp_tbs_children(parts["tbs"])
+    index = next(i for i, (tag, _) in enumerate(children) if tag == 0x30)
+    _, responses_value, _ = _der_tlv(children[index][1])
+    _, first_single, _ = _der_tlv(responses_value)
+    new_responses = _der_encode(
+        0x30, responses_value + _der_encode(0x30, first_single)
+    )
+    children[index] = (0x30, new_responses)
+    tbs_value = _der_encode(0x30, b"".join(raw for _, raw in children))
+    return _rebuild_ocsp_response(parts, tbs_value, signer_key)
+
+
+def b64url(der: bytes) -> str:
+    """Unpadded base64url encoding for raw DER material."""
+    return base64.urlsafe_b64encode(der).rstrip(b"=").decode("ascii")

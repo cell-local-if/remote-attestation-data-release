@@ -17,7 +17,7 @@ import json
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict
 
 from cryptography import x509
@@ -25,6 +25,8 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa
 from cryptography.hazmat.primitives.serialization import Encoding
+from cryptography.x509 import ocsp
+from cryptography.x509.oid import ExtendedKeyUsageOID
 
 __all__ = [
     "ChallengeContext",
@@ -376,6 +378,260 @@ def _load_certificate(pem: str) -> x509.Certificate | None:
         return None
 
 
+#: Maximum accepted span between an OCSP SingleResponse's thisUpdate and
+#: its nextUpdate; a response claiming freshness for longer is rejected.
+MAX_OCSP_NEXT_UPDATE_WINDOW = timedelta(days=7)
+
+
+def _verify_ocsp_signature(response: ocsp.OCSPResponse, public_key) -> bool:
+    """Verify an OCSP response signature; never raises."""
+    try:
+        if isinstance(public_key, rsa.RSAPublicKey):
+            public_key.verify(
+                response.signature,
+                response.tbs_response_bytes,
+                padding.PKCS1v15(),
+                response.signature_hash_algorithm,
+            )
+        elif isinstance(public_key, ec.EllipticCurvePublicKey):
+            public_key.verify(
+                response.signature,
+                response.tbs_response_bytes,
+                ec.ECDSA(response.signature_hash_algorithm),
+            )
+        elif isinstance(public_key, ed25519.Ed25519PublicKey):
+            public_key.verify(response.signature, response.tbs_response_bytes)
+        else:
+            return False
+    except Exception:
+        # Malformed signatures or an unsupported signature algorithm raise
+        # ValueError and friends in addition to InvalidSignature; any
+        # failure is a plain rejection.
+        return False
+    return True
+
+
+def _ocsp_certid_matches(
+    single: ocsp.OCSPSingleResponse,
+    target: x509.Certificate,
+    issuer: x509.Certificate,
+) -> bool:
+    """Whether a SingleResponse's CertID names ``target``.
+
+    The issuer name hash, issuer key hash and serial must all equal the
+    values computed for ``target`` against its chain issuer, using the
+    CertID's own hash algorithm. Never raises.
+    """
+    try:
+        certid = (
+            ocsp.OCSPRequestBuilder()
+            .add_certificate(target, issuer, single.hash_algorithm)
+            .build()
+        )
+    except Exception:
+        return False
+    return (
+        certid.issuer_name_hash == single.issuer_name_hash
+        and certid.issuer_key_hash == single.issuer_key_hash
+        and certid.serial_number == single.serial_number
+    )
+
+
+def _ocsp_responder_matches_certificate(
+    response: ocsp.OCSPResponse, certificate: x509.Certificate
+) -> bool:
+    """Whether the response's ResponderID names ``certificate``.
+
+    Accepts either the by-name form (subject DN equality) or the by-key
+    form (SHA-1 of the subject public key BIT STRING, equal to the
+    certificate's subject key identifier value). Never raises.
+    """
+    try:
+        if response.responder_name is not None:
+            return response.responder_name == certificate.subject
+        key_hash = response.responder_key_hash
+        if key_hash is not None:
+            ski = x509.SubjectKeyIdentifier.from_public_key(
+                certificate.public_key()
+            )
+            return ski.digest == key_hash
+    except Exception:
+        return False
+    return False
+
+
+def _valid_delegated_ocsp_responder(
+    responder: x509.Certificate,
+    issuer_certificate: x509.Certificate,
+    now: datetime,
+) -> bool:
+    """Validate a non-CA delegated OCSP responder certificate.
+
+    The responder must be within its validity period, must not assert
+    ``cA`` in basic constraints (RFC 6960 forbids CA delegated responders
+    when the extension is present), must carry the OCSP Signing extended
+    key usage, and must be directly issued and signed by the target
+    certificate's CA. Never raises.
+    """
+    try:
+        if (
+            responder.not_valid_before_utc > now
+            or responder.not_valid_after_utc < now
+        ):
+            return False
+        try:
+            basic = responder.extensions.get_extension_for_class(
+                x509.BasicConstraints
+            )
+        except x509.ExtensionNotFound:
+            pass
+        else:
+            if basic.value.ca:
+                return False
+        try:
+            eku = responder.extensions.get_extension_for_class(
+                x509.ExtendedKeyUsage
+            ).value
+        except x509.ExtensionNotFound:
+            return False
+        if ExtendedKeyUsageOID.OCSP_SIGNING not in eku:
+            return False
+        if responder.issuer != issuer_certificate.subject:
+            return False
+        if not _verify_certificate_signature(
+            responder, issuer_certificate.public_key()
+        ):
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _validate_embedded_ocsp(
+    document: dict, certificates: list[x509.Certificate], *, now: datetime
+) -> bool:
+    """Validate the optional inline ``ocsp_responses`` array.
+
+    Returns ``True`` when the field is absent (existing rules apply) or
+    when every non-root chain certificate has exactly one good, fresh,
+    correctly signed OCSP response covering it; ``False`` on any
+    structural, coverage, parse, status, time, path or signature failure.
+    All inputs stay on the stack and no exception text is propagated.
+    """
+    if "ocsp_responses" not in document:
+        return True
+    entries = document["ocsp_responses"]
+    if not isinstance(entries, list) or not entries:
+        return False
+    # One response per non-root certificate, no more, no fewer.
+    targets = certificates[:-1]
+    if len(entries) != len(targets):
+        return False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return False
+        response_b64 = entry.get("response")
+        responder_pem = entry.get("responder_certificate")
+        if not isinstance(response_b64, str) or not response_b64:
+            return False
+        if not isinstance(responder_pem, str) or not responder_pem:
+            return False
+        if not _is_unpadded_base64url(response_b64):
+            return False
+
+    matched_indexes: set[int] = set()
+    for entry in entries:
+        try:
+            response_der = _decode_unpadded_base64url(entry["response"])
+            response = ocsp.load_der_ocsp_response(response_der)
+            responder = _load_certificate(entry["responder_certificate"])
+            if responder is None:
+                return False
+            if response.response_status != ocsp.OCSPResponseStatus.SUCCESSFUL:
+                return False
+            try:
+                singles = list(response.responses)
+            except Exception:
+                return False
+            if len(singles) != 1:
+                return False
+            single = singles[0]
+
+            # The CertID must name exactly one of the non-root certificates
+            # in this chain; duplicates and references elsewhere are
+            # rejected, which together with the count check enforces the
+            # one-to-one coverage of every non-root certificate.
+            matches = [
+                index
+                for index, target in enumerate(targets)
+                if _ocsp_certid_matches(
+                    single, target, certificates[index + 1]
+                )
+            ]
+            if len(matches) != 1:
+                return False
+            target_index = matches[0]
+            if target_index in matched_indexes:
+                return False
+            issuer_ca = certificates[target_index + 1]
+
+            # Only good continues; revoked and unknown settle the proof as
+            # rejected.
+            if single.certificate_status != ocsp.OCSPCertStatus.GOOD:
+                return False
+
+            this_update = single.this_update_utc
+            next_update = single.next_update_utc
+            produced_at = response.produced_at_utc
+            if next_update is None:
+                return False
+            if this_update > now:
+                return False
+            if produced_at < this_update or produced_at > now:
+                return False
+            if next_update <= now:
+                return False
+            if next_update > this_update + MAX_OCSP_NEXT_UPDATE_WINDOW:
+                return False
+
+            # The signer is either the target's direct CA (the presented
+            # responder certificate is byte-identical to the chain issuer)
+            # or a delegated responder certificate issued by that CA. The
+            # delegate must be a distinct certificate: allowing the target
+            # itself to answer would let the certificate holder vouch for
+            # its own revocation status.
+            responder_der = responder.public_bytes(Encoding.DER)
+            if responder_der == issuer_ca.public_bytes(Encoding.DER):
+                if not _ocsp_responder_matches_certificate(
+                    response, issuer_ca
+                ):
+                    return False
+            else:
+                if responder_der == targets[target_index].public_bytes(
+                    Encoding.DER
+                ):
+                    return False
+                if not _valid_delegated_ocsp_responder(
+                    responder, issuer_ca, now
+                ):
+                    return False
+                if not _ocsp_responder_matches_certificate(
+                    response, responder
+                ):
+                    return False
+            if not _verify_ocsp_signature(
+                response, responder.public_key()
+            ):
+                return False
+        except Exception:
+            # Every malformed-OCSP failure mode is a plain rejection;
+            # nothing is raised, logged or propagated.
+            return False
+        matched_indexes.add(target_index)
+
+    return matched_indexes == set(range(len(targets)))
+
+
 class X509AttestedNonceJSONVerifier(Verifier):
     """Built-in verifier for the ``x509-attested-nonce-json`` format.
 
@@ -400,10 +656,28 @@ class X509AttestedNonceJSONVerifier(Verifier):
     parseable chain, the chain root byte-identical to a trust root
     configured for exactly this tenant and workload, every certificate
     within its validity period, every issuer a CA certificate, each
-    certificate signed by the next in the chain, and finally the leaf
-    signature over the canonical payload. Any failure yields a plain
-    rejected result; certificate material, evidence content and exception
-    details are never persisted, logged, or returned.
+    certificate signed by the next in the chain, the optional inline
+    ``ocsp_responses`` array (see below), and finally the leaf signature
+    over the canonical payload. Any failure yields a plain rejected
+    result; certificate material, evidence content and exception details
+    are never persisted, logged, or returned.
+
+    The document may additionally carry an ``ocsp_responses`` array with
+    one entry per non-root chain certificate; each entry holds an
+    unpadded base64url DER ``OCSPResponse`` (``response``) and the PEM
+    ``responder_certificate`` that signed it. When present the array must
+    cover every non-root certificate exactly once (no missing, duplicate
+    or foreign-cert entries); each response must be ``successful`` with a
+    single ``good`` SingleResponse whose CertID (issuer name hash, issuer
+    key hash, serial) names its target, must be fresh at verification
+    time (thisUpdate not after now; producedAt between thisUpdate and
+    now; nextUpdate after now and within seven days of thisUpdate), and
+    must be signed either by the target's direct issuing CA or by a
+    delegated responder certificate issued by that CA that carries the
+    OCSP Signing extended key usage and passes the basic-constraints,
+    path and validity checks. A ``revoked``/``unknown`` status or any
+    other failure rejects the proof. When the field is absent all other
+    rules behave exactly as before.
     """
 
     format_name = X509_ATTESTED_NONCE_JSON
@@ -488,6 +762,13 @@ class X509AttestedNonceJSONVerifier(Verifier):
                 return _reject()
             if not _verify_certificate_signature(subject, issuer.public_key()):
                 return _reject()
+
+        # Optional inline OCSP revocation evidence. Absent field: existing
+        # rules apply unchanged. Present: every non-root certificate must
+        # have one good, fresh, correctly signed response or the proof is
+        # rejected before the leaf signature is examined.
+        if not _validate_embedded_ocsp(document, certificates, now=now):
+            return _reject()
 
         signed_payload = json.dumps(
             {"claims": claims, "nonce": nonce},
