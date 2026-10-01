@@ -146,10 +146,13 @@ def test_create_grant_on_allowed_decision_returns_201(client):
         "pending",
         "issued_at",
         "expires_at",
+        "classification",
     }
     assert data["decision_id"] == decision["decision_id"]
     assert data["data_id"] == "data-1"
     assert data["pending"] is True
+    # Omitting classification preserves the unconstrained legacy flow.
+    assert data["classification"] is None
     # 32 random bytes -> 43 chars of unpadded base64url.
     capability = data["capability"]
     assert len(capability) == 43
