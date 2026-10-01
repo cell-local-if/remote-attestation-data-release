@@ -116,6 +116,26 @@ def test_verify_valid_evidence_returns_verified(submitted, client):
     assert verified_at.utcoffset() == timedelta(0)
 
 
+def test_ocsp_responses_field_is_ignored_by_hmac_format(client):
+    # The new x509-only field must not change HMAC-format verification:
+    # the MAC covers only {claims, nonce}, so an extra (even malformed)
+    # ocsp_responses array is irrelevant to the attested-nonce verifier.
+    created = _create(client).json()
+    evidence = _attested_evidence(
+        created["nonce"],
+        {"measurement": "abc"},
+        ocsp_responses=[{"response": "not-base64", "responder_certificate": ""}],
+    )
+    submitted = _submit(client, created, evidence)
+    assert submitted.status_code == 201
+    evidence_id = submitted.json()["evidence_id"]
+
+    response = _verify(client, evidence_id, created, evidence)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "verified"
+
+
 def test_verify_rejected_evidence_still_200_with_timestamp(client):
     created = _create(client).json()
     # Structurally valid document with a wrong MAC: the evidence is accepted
