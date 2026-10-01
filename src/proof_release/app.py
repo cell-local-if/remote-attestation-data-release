@@ -16,7 +16,9 @@ from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -3819,6 +3821,26 @@ async def _require_empty_query_body(request: Request) -> None:
         raise HTTPException(status_code=422, detail="query body must be empty")
 
 
+def _json_safe(value):
+    """Replace non-finite floats so a 422 detail can always be rendered.
+
+    The JSON body parser accepts ``NaN``/``Infinity`` literals, so a
+    rejected request (for example a rule with a non-finite ordinal bound)
+    can carry such a value inside the echoed error input. The strict JSON
+    renderer (``allow_nan=False``) cannot serialize it, which would turn a
+    client error into a server error; non-finite floats are therefore
+    replaced by their literal spelling. Finite values, and every error
+    that never contained one, render exactly as before.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 def create_app(
     database_url: str | None = None,
     verifier_registry: VerifierRegistry | None = None,
@@ -4844,6 +4866,18 @@ def create_app(
     app.state.session_factory = session_factory
     app.state.verifier_registry = registry
     app.state.rewrap_job_runner = runner
+
+    @app.exception_handler(RequestValidationError)
+    async def _request_validation_exception_handler(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        # Identical to the default handler, except the echoed error input
+        # is first made renderable when the rejected body carried a
+        # non-finite float literal.
+        return JSONResponse(
+            status_code=422,
+            content={"detail": jsonable_encoder(_json_safe(exc.errors()))},
+        )
 
     @app.get("/health")
     def health() -> dict[str, str]:
