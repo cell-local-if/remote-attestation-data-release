@@ -1022,6 +1022,47 @@ class DataEnvelope(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
+class DataClassification(Base):
+    """The immutable classification bound to one data envelope.
+
+    A row exists for exactly one ``(tenant_id, workload_id, data_id)``
+    envelope and can only be created when that envelope already exists.
+    The classification is assigned exactly once: a repeated submission of
+    the same code is an idempotent no-op that keeps the original
+    ``assigned_at``, while submitting any other code is rejected. The row
+    is never updated or deleted by the service, so the classification
+    cannot be reclassified, removed or back-dated.
+
+    Only identifiers, the fixed classification code and the assignment
+    timestamp are stored — never envelope material, a payload, a
+    capability or any other secret.
+    """
+
+    __tablename__ = "data_classifications"
+    __table_args__ = (
+        # One assignment per envelope; the composite primary key is also
+        # the lookup key for the PUT/GET endpoints. A concurrent first
+        # assignment can never create two rows, so all contenders observe
+        # one committed code and one assigned_at.
+        Index(
+            "ix_data_classifications_scope",
+            "tenant_id",
+            "workload_id",
+        ),
+    )
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    data_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # Fixed, caller-supplied classification code (1..64 lowercase ASCII
+    # letters, digits or hyphens, never beginning or ending with a
+    # hyphen). Immutable once assigned.
+    classification: Mapped[str] = mapped_column(String(64))
+    # The single immutable assignment instant; a same-code replay returns
+    # this value verbatim and never rewrites it.
+    assigned_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class ReleaseGrant(Base):
     """A one-time, TTL-bounded capability that releases one data item.
 
@@ -1049,6 +1090,12 @@ class ReleaseGrant(Base):
     # Caller-supplied identifier of the protected data item this grant
     # authorizes release of. The service never sees the data itself.
     data_id: Mapped[str] = mapped_column(String(256))
+    # Classification permanently bound to the grant at issuance. NULL for
+    # a grant minted without a classification (the legacy, unconstrained
+    # path); an explicit value is the envelope's immutable classification
+    # code and is never rewritten. The release path checks it against the
+    # envelope's current bound classification before any key is loaded.
+    classification: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Only the SHA-256 digest of the capability is persisted.
     capability_digest: Mapped[str] = mapped_column(String(64))
     # pending -> consumed | revoked, settled atomically on the first valid

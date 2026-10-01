@@ -112,6 +112,7 @@ from proof_release.db import (
     CertificateRevocationList,
     CrlRevokedCertificate,
     Challenge,
+    DataClassification,
     DataEnvelope,
     Decision,
     DecisionCommitCounter,
@@ -224,6 +225,15 @@ CURSOR_SECRET_ENV = "PROOF_RELEASE_CURSOR_SECRET"
 _DEMO_CURSOR_SECRET = "dev-only-rewrap-cursor-secret"
 
 _NONCE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+#: Immutable data classification code: 1..64 lowercase ASCII letters,
+#: digits or hyphens, never beginning or ending with a hyphen.
+CLASSIFICATION_MIN_LENGTH = 1
+CLASSIFICATION_MAX_LENGTH = 64
+_CLASSIFICATION_RE = re.compile(
+    r"^(?=.{"
+    rf"{CLASSIFICATION_MIN_LENGTH},{CLASSIFICATION_MAX_LENGTH}"
+    r"}$)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+)
 #: Cursors are strict unpadded base64url tokens; empty string is reserved
 #: for the beginning-of-scope cursor and never travels through this pattern.
 _CURSOR_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -490,6 +500,13 @@ def _optional_non_blank(value: str | None) -> str | None:
     return _require_non_blank(value)
 
 
+def _optional_classification_format(value: str | None) -> str | None:
+    """Validate an optional classification field (None stays unbound)."""
+    if value is None:
+        return None
+    return _classification_format(value)
+
+
 def _cursor_secret() -> bytes:
     return os.environ.get(CURSOR_SECRET_ENV, _DEMO_CURSOR_SECRET).encode("utf-8")
 
@@ -661,6 +678,21 @@ def _canonical_uuid(value: str) -> str:
     """Validate a canonical lowercase UUID string."""
     if not _UUID_RE.fullmatch(value):
         raise ValueError("must be a canonical UUID")
+    return value
+
+
+def _classification_format(value: str) -> str:
+    """Validate an immutable data classification code.
+
+    1..64 lowercase ASCII letters, digits or hyphens, with neither the
+    first nor the last character a hyphen (which also excludes empty and
+    hyphen-only spellings).
+    """
+    if not _CLASSIFICATION_RE.fullmatch(value):
+        raise ValueError(
+            "classification must be 1 to 64 lowercase ASCII letters, "
+            "digits or hyphens and must not begin or end with a hyphen"
+        )
     return value
 
 
@@ -2677,10 +2709,17 @@ class CreateReleaseGrantRequest(BaseModel):
     ttl_seconds: StrictInt = Field(
         default=DEFAULT_TTL_SECONDS, ge=MIN_TTL_SECONDS, le=MAX_TTL_SECONDS
     )
+    #: Optional immutable classification binding. Omitted/None preserves
+    #: the legacy unconstrained issuance; an explicit value must match the
+    #: envelope's bound classification before any grant is minted.
+    classification: StrictStr | None = Field(default=None, min_length=1)
 
     _non_blank = field_validator(
         "tenant_id", "workload_id", "decision_id", "data_id"
     )(_require_non_blank)
+    _classification_shape = field_validator("classification")(
+        _optional_classification_format
+    )
 
 
 class ReleaseGrantCreatedResponse(BaseModel):
@@ -2693,6 +2732,9 @@ class ReleaseGrantCreatedResponse(BaseModel):
     pending: bool
     issued_at: str
     expires_at: str
+    #: The classification permanently bound to the grant; null for a grant
+    #: minted without one.
+    classification: str | None
 
 
 class ConsumeReleaseGrantRequest(BaseModel):
@@ -2786,6 +2828,35 @@ class DataEnvelopeResponse(BaseModel):
     iv: str
     tag: str
     wrapped_key: str
+
+
+class AssignDataClassificationRequest(BaseModel):
+    """Assignment of an immutable classification to one data envelope.
+
+    The body carries exactly the two non-blank scope strings and one
+    well-formed classification code; any missing, blank, wrong-typed,
+    malformed or unknown field is rejected as a client error before
+    storage is touched.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    classification: StrictStr = Field(min_length=1)
+
+    _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
+    _classification_shape = field_validator("classification")(
+        _classification_format
+    )
+
+
+class DataClassificationResponse(BaseModel):
+    data_id: str
+    tenant_id: str
+    workload_id: str
+    classification: str
+    assigned_at: str
 
 
 class RewrapDataEnvelopeRequest(BaseModel):
@@ -2924,6 +2995,10 @@ def _migrate_additive(engine) -> None:
         ),
         "release_grants": (
             ("revoked_at", "DATETIME"),
+            # Optional immutable classification binding added after
+            # grants first shipped; legacy grants stay unconstrained
+            # (NULL), preserving their original behavior.
+            ("classification", "VARCHAR(64)"),
         ),
         "trust_roots": (
             ("status", "VARCHAR(16)"),
@@ -7895,13 +7970,6 @@ def create_app(
     def create_release_grant(
         body: CreateReleaseGrantRequest,
     ) -> ReleaseGrantCreatedResponse:
-        # Capabilities are 32 bytes from the CSPRNG, rendered unpadded
-        # base64url. The plaintext lives only on this stack frame and the
-        # create response; only its SHA-256 digest is persisted.
-        capability_bytes = secrets.token_bytes(CAPABILITY_BYTES)
-        capability = base64.urlsafe_b64encode(capability_bytes).rstrip(
-            b"="
-        ).decode("ascii")
         now = _utcnow()
         expires_at = now + timedelta(seconds=body.ttl_seconds)
         grant_id = str(uuid.uuid4())
@@ -7928,12 +7996,51 @@ def create_app(
                 raise HTTPException(
                     status_code=409, detail="decision is not allowed"
                 )
+            bound_classification = None
+            if body.classification is not None:
+                # An explicitly classified grant can only be minted against
+                # an existing envelope whose immutable classification is
+                # exactly the requested one. A missing or cross-scope
+                # envelope is the same indistinguishable 404 used on the
+                # release path; an envelope with no classification or a
+                # different one is a 409. None of these lookups mint a
+                # capability, grant or audit row.
+                envelope = session.get(
+                    DataEnvelope,
+                    (body.tenant_id, body.workload_id, body.data_id),
+                )
+                if envelope is None:
+                    raise HTTPException(
+                        status_code=404, detail="data envelope not found"
+                    )
+                assigned = session.get(
+                    DataClassification,
+                    (body.tenant_id, body.workload_id, body.data_id),
+                )
+                if (
+                    assigned is None
+                    or assigned.classification != body.classification
+                ):
+                    raise HTTPException(
+                        status_code=409, detail="classification mismatch"
+                    )
+                bound_classification = assigned.classification
+            # Capabilities are 32 bytes from the CSPRNG, rendered unpadded
+            # base64url. Minted only after every business precondition has
+            # passed, so a rejected classification request never produces
+            # one. The plaintext lives only on this stack frame and the
+            # create response; only its SHA-256 digest is persisted.
+            capability_bytes = secrets.token_bytes(CAPABILITY_BYTES)
+            capability = base64.urlsafe_b64encode(capability_bytes).rstrip(
+                b"="
+            ).decode("ascii")
             grant = ReleaseGrant(
                 grant_id=grant_id,
                 tenant_id=body.tenant_id,
                 workload_id=body.workload_id,
                 decision_id=body.decision_id,
                 data_id=body.data_id,
+                classification=bound_classification,
                 capability_digest=_nonce_digest(capability),
                 status="pending",
                 issued_at=now,
@@ -7982,6 +8089,7 @@ def create_app(
             pending=True,
             issued_at=_rfc3339(now),
             expires_at=_rfc3339(expires_at),
+            classification=bound_classification,
         )
 
     @app.get("/v1/release-grants")
@@ -10749,6 +10857,29 @@ def create_app(
                 # decryption or release happens past this point.
                 raise HTTPException(status_code=409, detail="grant already revoked")
 
+            # Classification release constraint. A grant minted without a
+            # classification is unconstrained and keeps the legacy release
+            # behavior exactly (even if the envelope is classified later).
+            # A grant permanently bound at issuance must find the envelope's
+            # immutable classification still equal to the bound code; the
+            # check runs atomically in this transaction after every grant
+            # judgement and before any key material is loaded. A mismatch
+            # spends the rate-limit slot like the other business
+            # judgements above but leaves the grant pending, writes no
+            # consumption audit and returns no payload.
+            if grant.classification is not None:
+                assigned = session.get(
+                    DataClassification,
+                    (grant.tenant_id, grant.workload_id, grant.data_id),
+                )
+                if (
+                    assigned is None
+                    or assigned.classification != grant.classification
+                ):
+                    raise HTTPException(
+                        status_code=409, detail="classification mismatch"
+                    )
+
             # Keyring problems are server failures that must not consume
             # the grant. Only the failure kind is logged — never key
             # material, the capability, or any payload.
@@ -10971,6 +11102,156 @@ def create_app(
                 iv=b64url_encode(envelope.iv),
                 tag=b64url_encode(envelope.tag),
                 wrapped_key=b64url_encode(envelope.wrapped_key),
+            )
+
+    @app.put("/v1/data-classes/")
+    def assign_data_classification_identifier_required() -> Response:
+        # An empty path segment is a missing data identifier: a 422 client
+        # error rather than a routing-level 404, and it never reads state.
+        raise HTTPException(status_code=422, detail="invalid data identifier")
+
+    @app.put(
+        "/v1/data-classes/{data_id}",
+        status_code=200,
+        response_model=DataClassificationResponse,
+    )
+    def assign_data_classification(
+        data_id: str, body: AssignDataClassificationRequest
+    ) -> DataClassificationResponse:
+        """Assign the one immutable classification of a data envelope.
+
+        The target envelope must already exist in exactly the body's
+        scope (a missing or cross-scope envelope is an indistinguishable
+        404). The first legal request binds the classification with one
+        assigned_at; a repeated submission of the same code is idempotent
+        and keeps that timestamp, while any other code is a 409 that
+        changes nothing. Concurrent first assignments settle as one
+        committed row, so every contender observes the same assigned_at.
+        """
+        if not data_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+        with session_factory() as session:
+            # Lock the envelope row for the whole judgement so concurrent
+            # first assignments serialize here on locking backends (on
+            # SQLite every writer already begins as BEGIN IMMEDIATE): the
+            # loser observes the winner's row and can only return its
+            # result or a stable 409, never a second assigned_at. The
+            # envelope must exist in exactly this scope; unknown and
+            # cross-scope identifiers are indistinguishable 404s.
+            envelope = session.get(
+                DataEnvelope,
+                (body.tenant_id, body.workload_id, data_id),
+                with_for_update=True,
+            )
+            if envelope is None:
+                raise HTTPException(
+                    status_code=404, detail="data envelope not found"
+                )
+            existing = session.get(
+                DataClassification,
+                (body.tenant_id, body.workload_id, data_id),
+            )
+            if existing is not None:
+                if existing.classification != body.classification:
+                    # The classification is immutable: never rewrite the
+                    # code, the assigned_at or any other state.
+                    raise HTTPException(
+                        status_code=409, detail="classification immutable"
+                    )
+                # Same code: an idempotent replay returning the original
+                # assignment timestamp; no write occurs.
+                return DataClassificationResponse(
+                    data_id=data_id,
+                    tenant_id=body.tenant_id,
+                    workload_id=body.workload_id,
+                    classification=existing.classification,
+                    assigned_at=_rfc3339(existing.assigned_at),
+                )
+            assigned_at = _utcnow()
+            classification = DataClassification(
+                tenant_id=body.tenant_id,
+                workload_id=body.workload_id,
+                data_id=data_id,
+                classification=body.classification,
+                assigned_at=assigned_at,
+            )
+            session.add(classification)
+            try:
+                session.commit()
+            except IntegrityError:
+                # A concurrent first assignment won the primary key. Read
+                # the winner and apply the same idempotent/immutable
+                # judgement instead of creating a second row.
+                session.rollback()
+                winner = session.get(
+                    DataClassification,
+                    (body.tenant_id, body.workload_id, data_id),
+                )
+                if winner is None:
+                    # pragma: no cover - defensive: the unique conflict
+                    # guarantees the winning row is committed and readable.
+                    raise HTTPException(
+                        status_code=500, detail="classification unavailable"
+                    )
+                if winner.classification != body.classification:
+                    raise HTTPException(
+                        status_code=409, detail="classification immutable"
+                    )
+                return DataClassificationResponse(
+                    data_id=data_id,
+                    tenant_id=body.tenant_id,
+                    workload_id=body.workload_id,
+                    classification=winner.classification,
+                    assigned_at=_rfc3339(winner.assigned_at),
+                )
+            except Exception:
+                session.rollback()
+                logger.error("data classification write failed")
+                raise HTTPException(
+                    status_code=500, detail="classification unavailable"
+                )
+        return DataClassificationResponse(
+            data_id=data_id,
+            tenant_id=body.tenant_id,
+            workload_id=body.workload_id,
+            classification=body.classification,
+            assigned_at=_rfc3339(assigned_at),
+        )
+
+    @app.get("/v1/data-classes/")
+    def get_data_classification_identifier_required() -> Response:
+        # As the PUT empty-segment route: a missing data identifier is a
+        # 422 field error, never a state-reading lookup.
+        raise HTTPException(status_code=422, detail="invalid data identifier")
+
+    @app.get(
+        "/v1/data-classes/{data_id}",
+        response_model=DataClassificationResponse,
+    )
+    def get_data_classification(
+        data_id: str,
+        tenant_id: str = Query(..., min_length=1),
+        workload_id: str = Query(..., min_length=1),
+    ) -> DataClassificationResponse:
+        if not data_id.strip() or not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+        with session_factory() as session:
+            # Read-only: return only the five classification fields, never
+            # any envelope material. An unclassified, unknown or
+            # cross-scope data_id is one indistinguishable 404.
+            classification = session.get(
+                DataClassification, (tenant_id, workload_id, data_id)
+            )
+            if classification is None:
+                raise HTTPException(
+                    status_code=404, detail="classification not found"
+                )
+            return DataClassificationResponse(
+                data_id=classification.data_id,
+                tenant_id=classification.tenant_id,
+                workload_id=classification.workload_id,
+                classification=classification.classification,
+                assigned_at=_rfc3339(classification.assigned_at),
             )
 
     @app.post(
