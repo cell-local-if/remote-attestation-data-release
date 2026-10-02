@@ -112,6 +112,7 @@ from proof_release.db import (
     CertificateRevocationList,
     CrlRevokedCertificate,
     Challenge,
+    ChallengeRateLimitCounter,
     DataEnvelope,
     Decision,
     DecisionCommitCounter,
@@ -203,6 +204,19 @@ _IDEMPOTENCY_KEY_RE = re.compile(
 #: the contract is fixed; tests that exercise settlement atomicity with
 #: larger bursts raise it in-process.
 GRANT_BUDGET_PER_MINUTE = 5
+
+#: Per-(tenant, workload) budget for random-challenge issuance. At most
+#: this many fully validated ``POST /v1/challenges`` requests may create a
+#: challenge during one UTC natural minute. The counter is persistent and
+#: independent of the shared grant budget above: it is attributed solely
+#: by the request's two scope fields (never by the minted challenge id or
+#: nonce), and it is consumed only after every field has validated, in the
+#: same transaction as the challenge row it admits — so a 429, a 422 or a
+#: counter failure never leaves a challenge, a nonce or half a count
+#: behind. A module-level constant rather than configuration so the
+#: contract is fixed; tests that exercise issuance in larger bursts raise
+#: it in-process.
+CHALLENGE_ISSUE_BUDGET_PER_MINUTE = 5
 
 #: Fixed page size for the read-only release-grant audit listing. The
 #: listing is cursor-driven; the page size is an internal constant and is
@@ -4893,28 +4907,101 @@ def create_app(
         return {"status": "ready"}
 
     @app.post("/v1/challenges", status_code=201, response_model=ChallengeCreatedResponse)
-    def create_challenge(body: CreateChallengeRequest) -> ChallengeCreatedResponse:
-        nonce_bytes = secrets.token_bytes(NONCE_BYTES)
-        nonce = base64.urlsafe_b64encode(nonce_bytes).rstrip(b"=").decode("ascii")
+    def create_challenge(body: CreateChallengeRequest):
+        # Every field has validated (a 422 never reaches here and never
+        # touches the budget). Reserve one slot of the per-scope,
+        # per-UTC-minute issuance budget and mint the challenge in the
+        # same transaction, so a committed counter always matches an
+        # issued challenge and a rejected or failed request leaves no
+        # challenge, no nonce and no partial count behind.
         now = _utcnow()
-        expires_at = now + timedelta(seconds=body.ttl_seconds)
-        challenge = Challenge(
-            challenge_id=str(uuid.uuid4()),
-            tenant_id=body.tenant_id,
-            workload_id=body.workload_id,
-            nonce_digest=_nonce_digest(nonce),
-            status="pending",
-            issued_at=now,
-            expires_at=expires_at,
-            consumed_at=None,
-        )
+        window_start = _utc_minute_window(now)
         with session_factory() as session:
-            session.add(challenge)
-            session.commit()
+            try:
+                admitted = False
+                for _ in range(2):
+                    # Lock the scope's minute row when one exists. SQLite
+                    # ignores FOR UPDATE but every write transaction already
+                    # begins as BEGIN IMMEDIATE, serializing concurrent
+                    # issuances process-wide; on locking backends the row
+                    # lock orders them.
+                    row = session.scalar(
+                        select(ChallengeRateLimitCounter)
+                        .where(
+                            ChallengeRateLimitCounter.tenant_id == body.tenant_id,
+                            ChallengeRateLimitCounter.workload_id == body.workload_id,
+                            ChallengeRateLimitCounter.window_start == window_start,
+                        )
+                        .with_for_update()
+                    )
+                    if row is None:
+                        # The first valid request of the minute initializes
+                        # the counter at one. A concurrent initializer on a
+                        # locking backend may win the unique constraint; that
+                        # race is retried as an increment below.
+                        session.add(
+                            ChallengeRateLimitCounter(
+                                tenant_id=body.tenant_id,
+                                workload_id=body.workload_id,
+                                window_start=window_start,
+                                count=1,
+                            )
+                        )
+                        try:
+                            session.flush()
+                        except IntegrityError:
+                            session.rollback()
+                            continue
+                        admitted = True
+                        break
+                    if row.count >= CHALLENGE_ISSUE_BUDGET_PER_MINUTE:
+                        # Budget exhausted: no challenge, no nonce, no
+                        # counter write; recompute the retry hint at
+                        # response time.
+                        session.rollback()
+                        return _too_many_requests_response(_utcnow())
+                    row.count = row.count + 1
+                    admitted = True
+                    break
+                if not admitted:
+                    # Defensive: the unique-insert retry loop failed to
+                    # settle, which the single retry above makes unreachable.
+                    session.rollback()
+                    logger.error("challenge rate-limit reservation could not settle")
+                    raise HTTPException(
+                        status_code=500, detail="rate limit unavailable"
+                    )
+                # Admitted: mint the challenge inside the same transaction
+                # as the counter increment. The nonce is generated only now
+                # — a rejected request never creates, persists or leaks one.
+                nonce_bytes = secrets.token_bytes(NONCE_BYTES)
+                nonce = base64.urlsafe_b64encode(nonce_bytes).rstrip(b"=").decode(
+                    "ascii"
+                )
+                issued_at = _utcnow()
+                expires_at = issued_at + timedelta(seconds=body.ttl_seconds)
+                challenge = Challenge(
+                    challenge_id=str(uuid.uuid4()),
+                    tenant_id=body.tenant_id,
+                    workload_id=body.workload_id,
+                    nonce_digest=_nonce_digest(nonce),
+                    status="pending",
+                    issued_at=issued_at,
+                    expires_at=expires_at,
+                    consumed_at=None,
+                )
+                session.add(challenge)
+                session.commit()
+            except HTTPException:
+                raise
+            except Exception:
+                session.rollback()
+                logger.error("challenge rate-limit counter unavailable")
+                raise HTTPException(status_code=500, detail="rate limit unavailable")
         return ChallengeCreatedResponse(
             challenge_id=challenge.challenge_id,
             nonce=nonce,
-            issued_at=_rfc3339(now),
+            issued_at=_rfc3339(issued_at),
             expires_at=_rfc3339(expires_at),
             status="pending",
         )

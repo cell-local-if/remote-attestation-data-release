@@ -1562,3 +1562,39 @@ class RateLimitCounter(Base):
     window_start: Mapped[datetime] = mapped_column(UTCDateTime(), primary_key=True)
     # Number of admitted (budget-consuming) requests during this window.
     count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class ChallengeRateLimitCounter(Base):
+    """Persistent per-scope issuance counter for one UTC natural minute.
+
+    One row exists per ``(tenant_id, workload_id, window_start)`` triple,
+    where ``window_start`` is the UTC minute (a datetime with seconds and
+    sub-seconds truncated to zero) during which the counted challenge
+    creations arrived. Only ``POST /v1/challenges`` draws from this
+    budget: it is fully independent of the shared grant consume/revoke/
+    release budget (:class:`RateLimitCounter`), and the challenge id and
+    nonce never participate in the window — the two scope fields alone
+    determine attribution. The row is written in the same transaction as
+    the challenge it admits, so a committed counter always matches the
+    issued challenges and a rejected or failed request leaves neither.
+    A new minute starts a new row, which both restores the quota
+    automatically and isolates scopes strictly — quotas are never
+    borrowed across scopes or minutes.
+    """
+
+    __tablename__ = "challenge_rate_limit_counters"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "window_start",
+            name="uq_challenge_rate_limit_counter_scope_window",
+        ),
+    )
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # UTC minute boundary at which the window starts, truncated to seconds.
+    window_start: Mapped[datetime] = mapped_column(UTCDateTime(), primary_key=True)
+    # Number of challenges issued during this window.
+    count: Mapped[int] = mapped_column(Integer, default=0)
