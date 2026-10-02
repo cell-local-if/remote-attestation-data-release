@@ -6427,6 +6427,109 @@ def create_app(
             content=body_bytes, status_code=201, media_type="application/json"
         )
 
+    @app.get("/v1/crls/")
+    def crl_identifier_required() -> Response:
+        # An empty path segment is a missing CRL identifier: a 422 client
+        # error rather than a routing-level 404.
+        raise HTTPException(status_code=422, detail="invalid CRL identifier")
+
+    @app.get("/v1/crls/{crl_id}")
+    def get_crl(
+        request: Request,
+        crl_id: str,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        trust_root_id: str = Query(...),
+    ) -> Response:
+        """Return one registered CRL snapshot with all of its entries.
+
+        The path identifier and the mandatory ``trust_root_id`` query
+        parameter must be canonical lowercase UUIDs and the scope
+        parameters non-blank; any other query parameter, a repeated
+        parameter or a shape defect is a 422 before storage is touched.
+        An unknown identifier and one belonging to another tenant,
+        workload or trust root are the same indistinguishable 404. The
+        handler issues only SELECTs: it writes no audit record, updates
+        no snapshot and never parses or returns the CRL body, certificate
+        material or key material. ``revoked_count`` is the count recorded
+        at registration (entries whose revocationDate had arrived then),
+        never recomputed against the current time, while ``entries``
+        lists every revoked certificate of the snapshot — including
+        entries not yet in effect — ordered by ``(revocation_date,
+        entry_id)`` ascending. A storage failure is a sanitized 500.
+        """
+        # --- request shape (all 422, no storage touched) ----------------
+        allowed_params = {"tenant_id", "workload_id", "trust_root_id"}
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+        # Each parameter is a single scalar string; a repeated parameter
+        # (even of an allowed name) is rejected rather than silently
+        # treated as last-wins.
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(
+                status_code=422, detail="query parameter must appear once"
+            )
+        if not _UUID_RE.fullmatch(crl_id):
+            raise HTTPException(status_code=422, detail="invalid CRL identifier")
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+        if not trust_root_id.strip() or not _UUID_RE.fullmatch(trust_root_id):
+            raise HTTPException(
+                status_code=422, detail="invalid trust root identifier"
+            )
+
+        try:
+            with session_factory() as session:
+                crl = session.get(CertificateRevocationList, crl_id)
+                if (
+                    crl is None
+                    or crl.tenant_id != tenant_id
+                    or crl.workload_id != workload_id
+                    or crl.trust_root_id != trust_root_id
+                ):
+                    # Unknown and cross-scope snapshots are indistinguishable.
+                    raise HTTPException(status_code=404, detail="crl not found")
+                entries = session.scalars(
+                    select(CrlRevokedCertificate)
+                    .where(CrlRevokedCertificate.crl_id == crl.crl_id)
+                    .order_by(
+                        CrlRevokedCertificate.revocation_date.asc(),
+                        CrlRevokedCertificate.entry_id.asc(),
+                    )
+                ).all()
+                payload = {
+                    "crl_id": crl.crl_id,
+                    "tenant_id": crl.tenant_id,
+                    "workload_id": crl.workload_id,
+                    "trust_root_id": crl.trust_root_id,
+                    "crl_number": crl.crl_number,
+                    "crl_sha256": crl.crl_sha256,
+                    "this_update": _rfc3339(crl.this_update),
+                    "next_update": _rfc3339(crl.next_update),
+                    "revoked_count": crl.revoked_count,
+                    "created_at": _rfc3339(crl.created_at),
+                    "entries": [
+                        {
+                            "entry_id": entry.entry_id,
+                            "issuer_dn": entry.issuer_dn,
+                            "serial_number": entry.serial_number,
+                            "revocation_date": _rfc3339(entry.revocation_date),
+                        }
+                        for entry in entries
+                    ],
+                }
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("CRL lookup failed")
+            raise HTTPException(status_code=500, detail="CRL registry unavailable")
+
+        return _compact_json(payload)
+
     @app.post("/v1/workload-identities", status_code=201)
     def register_workload_identity(body: RegisterWorkloadIdentityRequest) -> Response:
         """Register a workload identity profile under a configured trust root.
