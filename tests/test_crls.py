@@ -1088,3 +1088,259 @@ def test_failed_registration_read_returns_500_and_keeps_previous_snapshot(
         ),
     )
     assert recovered.status_code == 201
+
+
+# --- read-only snapshot query (GET /v1/crls/{crl_id}) ------------------------
+
+
+def _get_crl(client, crl_id, **scope):
+    params = {
+        "tenant_id": scope.get("tenant_id", TENANT),
+        "workload_id": scope.get("workload_id", WORKLOAD),
+        "trust_root_id": scope.get("trust_root_id", scope.get("root_id", "")),
+    }
+    params.update(scope.get("extra_params", {}))
+    return client.get(f"/v1/crls/{crl_id}", params=params)
+
+
+def test_get_crl_returns_snapshot_and_all_entries(client, root_id, chain):
+    now = datetime.now(timezone.utc)
+    serials = [1001, 1002, 1003]
+    crl_pem = make_crl(
+        chain["root_cert"],
+        chain["root_key"],
+        [
+            (serials[1], now - timedelta(seconds=1)),
+            # Not yet effective at registration: still listed, never counted.
+            (serials[2], now + timedelta(days=3)),
+            (serials[0], now - timedelta(hours=2)),
+        ],
+        number=7,
+    )
+    created = _register_crl(client, root_id, crl_pem)
+    assert created.status_code == 201
+    crl_id = created.json()["crl_id"]
+
+    response = _get_crl(client, crl_id, root_id=root_id)
+    assert response.status_code == 200
+    body = response.json()
+    assert list(body.keys()) == [
+        "crl_id",
+        "tenant_id",
+        "workload_id",
+        "trust_root_id",
+        "crl_number",
+        "crl_sha256",
+        "this_update",
+        "next_update",
+        "revoked_count",
+        "created_at",
+        "entries",
+    ]
+    assert body["crl_id"] == crl_id
+    assert body["tenant_id"] == TENANT
+    assert body["workload_id"] == WORKLOAD
+    assert body["trust_root_id"] == root_id
+    assert body["crl_number"] == 7
+    assert isinstance(body["crl_number"], int)
+    assert isinstance(body["revoked_count"], int)
+    # The registration-time count is kept verbatim, never recomputed.
+    assert body["revoked_count"] == 2
+    sha256 = body["crl_sha256"]
+    assert len(sha256) == 64 and sha256 == sha256.lower()
+    int(sha256, 16)
+    for field in ("this_update", "next_update", "created_at"):
+        assert body[field].endswith("+00:00")
+
+    entries = body["entries"]
+    assert len(entries) == 3
+    for entry in entries:
+        assert list(entry.keys()) == [
+            "entry_id",
+            "issuer_dn",
+            "serial_number",
+            "revocation_date",
+        ]
+        assert entry["revocation_date"].endswith("+00:00")
+    # Sorted by revocation_date ascending; the future-dated entry is last.
+    assert [e["serial_number"] for e in entries] == ["1001", "1002", "1003"]
+    dates = [e["revocation_date"] for e in entries]
+    assert dates == sorted(dates)
+    # No CRL or certificate material is ever returned.
+    assert "BEGIN X509 CRL" not in response.text
+    assert "BEGIN CERTIFICATE" not in response.text
+
+
+def test_get_crl_empty_snapshot_has_no_entries(client, root_id, chain):
+    crl_pem = make_crl(chain["root_cert"], chain["root_key"], [], number=1)
+    crl_id = _register_crl(client, root_id, crl_pem).json()["crl_id"]
+    response = _get_crl(client, crl_id, root_id=root_id)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["entries"] == []
+    assert body["revoked_count"] == 0
+
+
+def test_get_crl_repeated_queries_are_identical(client, root_id, chain):
+    now = datetime.now(timezone.utc)
+    crl_pem = make_crl(
+        chain["root_cert"],
+        chain["root_key"],
+        [(1001, now - timedelta(hours=1))],
+        number=1,
+    )
+    crl_id = _register_crl(client, root_id, crl_pem).json()["crl_id"]
+    first = _get_crl(client, crl_id, root_id=root_id)
+    second = _get_crl(client, crl_id, root_id=root_id)
+    assert first.status_code == 200
+    assert first.content == second.content
+
+
+def test_get_crl_is_read_only(client, app, root_id, chain):
+    now = datetime.now(timezone.utc)
+    crl_pem = make_crl(
+        chain["root_cert"],
+        chain["root_key"],
+        [(1001, now - timedelta(hours=1))],
+        number=1,
+    )
+    crl_id = _register_crl(client, root_id, crl_pem).json()["crl_id"]
+    response = _get_crl(client, crl_id, root_id=root_id)
+    assert response.status_code == 200
+    with app.state.session_factory() as session:
+        snapshots = session.scalars(select(CertificateRevocationList)).all()
+        entries = session.scalars(select(CrlRevokedCertificate)).all()
+    assert len(snapshots) == 1
+    assert snapshots[0].crl_id == crl_id
+    assert len(entries) == 1
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    [
+        "not-a-uuid",
+        "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaZ",
+        " aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "",
+    ],
+)
+def test_get_crl_non_canonical_id_is_422(client, root_id, chain, bad_id):
+    crl_pem = make_crl(chain["root_cert"], chain["root_key"], [], number=1)
+    crl_id = _register_crl(client, root_id, crl_pem).json()["crl_id"]
+    target = bad_id if bad_id else "%20"
+    response = _get_crl(client, target, root_id=root_id)
+    assert response.status_code == 422
+    # A non-canonical spelling of the real id is also rejected.
+    assert _get_crl(client, crl_id.upper(), root_id=root_id).status_code == 422
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("tenant_id", ""),
+        ("tenant_id", "   "),
+        ("workload_id", ""),
+        ("workload_id", "\t"),
+        ("trust_root_id", ""),
+        ("trust_root_id", "not-a-uuid"),
+        ("trust_root_id", "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"),
+    ],
+)
+def test_get_crl_invalid_scope_params_are_422(client, root_id, chain, field, value):
+    crl_pem = make_crl(chain["root_cert"], chain["root_key"], [], number=1)
+    crl_id = _register_crl(client, root_id, crl_pem).json()["crl_id"]
+    response = _get_crl(client, crl_id, root_id=root_id, **{field: value})
+    assert response.status_code == 422
+
+
+def test_get_crl_missing_scope_params_are_422(client, root_id, chain):
+    crl_pem = make_crl(chain["root_cert"], chain["root_key"], [], number=1)
+    crl_id = _register_crl(client, root_id, crl_pem).json()["crl_id"]
+    assert client.get(f"/v1/crls/{crl_id}").status_code == 422
+    assert (
+        client.get(f"/v1/crls/{crl_id}", params={"tenant_id": TENANT}).status_code
+        == 422
+    )
+
+
+def test_get_crl_extra_query_param_is_422(client, root_id, chain):
+    crl_pem = make_crl(chain["root_cert"], chain["root_key"], [], number=1)
+    crl_id = _register_crl(client, root_id, crl_pem).json()["crl_id"]
+    response = _get_crl(
+        client, crl_id, root_id=root_id, extra_params={"cursor": "abc"}
+    )
+    assert response.status_code == 422
+
+
+def test_get_crl_empty_path_segment_is_422(client):
+    assert client.get("/v1/crls/").status_code == 422
+
+
+def test_get_crl_unknown_id_is_404(client, root_id, chain):
+    crl_pem = make_crl(chain["root_cert"], chain["root_key"], [], number=1)
+    assert _register_crl(client, root_id, crl_pem).status_code == 201
+    response = _get_crl(
+        client, "11111111-1111-1111-1111-111111111111", root_id=root_id
+    )
+    assert response.status_code == 404
+    assert response.json()["detail"] == "crl not found"
+
+
+@pytest.mark.parametrize(
+    "scope_override",
+    [
+        {"tenant_id": OTHER_TENANT},
+        {"workload_id": OTHER_WORKLOAD},
+    ],
+)
+def test_get_crl_cross_scope_is_indistinguishable_404(
+    client, root_id, chain, scope_override
+):
+    crl_pem = make_crl(chain["root_cert"], chain["root_key"], [], number=1)
+    crl_id = _register_crl(client, root_id, crl_pem).json()["crl_id"]
+    response = _get_crl(client, crl_id, root_id=root_id, **scope_override)
+    assert response.status_code == 404
+    assert response.json()["detail"] == "crl not found"
+
+
+def test_get_crl_cross_trust_root_is_indistinguishable_404(client, chain):
+    roots = {}
+    for tenant in (TENANT, OTHER_TENANT):
+        response = client.post(
+            "/v1/trust-roots",
+            json={
+                "tenant_id": tenant,
+                "workload_id": WORKLOAD,
+                "root_pem": pem(chain["root_cert"]),
+            },
+        )
+        assert response.status_code == 201
+        roots[tenant] = response.json()["root_id"]
+    crl_pem = make_crl(chain["root_cert"], chain["root_key"], [], number=1)
+    crl_id = _register_crl(client, roots[TENANT], crl_pem).json()["crl_id"]
+    # The other tenant's root id is a canonical UUID but not the CRL's root.
+    response = _get_crl(client, crl_id, root_id=roots[OTHER_TENANT])
+    assert response.status_code == 404
+    assert response.json()["detail"] == "crl not found"
+
+
+def test_get_crl_storage_failure_is_500(app, client, root_id, chain):
+    crl_pem = make_crl(chain["root_cert"], chain["root_key"], [], number=1)
+    crl_id = _register_crl(client, root_id, crl_pem).json()["crl_id"]
+    engine = app.state.engine
+
+    def fail_select(conn, cursor, statement, parameters, context, executemany):
+        if "FROM certificate_revocation_lists" in statement:
+            raise RuntimeError("simulated storage failure")
+
+    event.listen(engine, "before_cursor_execute", fail_select)
+    try:
+        response = _get_crl(client, crl_id, root_id=root_id)
+        assert response.status_code == 500
+        assert response.json()["detail"] == "CRL registry unavailable"
+    finally:
+        event.remove(engine, "before_cursor_execute", fail_select)
+
+    # The failure left nothing behind: the same query succeeds afterwards.
+    assert _get_crl(client, crl_id, root_id=root_id).status_code == 200
