@@ -1401,6 +1401,88 @@ class AuditEvent(Base):
     occurred_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
 
 
+class AuditEventChainLink(Base):
+    """Tamper-evident chain receipt for one compliance audit event.
+
+    A row is inserted in the *same* committed transaction as the
+    :class:`AuditEvent` it receipts, so an event exists if and only if its
+    chain link does; a rolled-back transition leaves neither. The table is
+    never updated or deleted by the service.
+
+    The per-scope ``sequence`` is a gap-free, strictly increasing number
+    allocated from :class:`AuditEventChainCounter` inside the event's own
+    transaction: 1 for the scope's first event, increasing by exactly one
+    per later committed event, so concurrent writers can never mint the
+    same sequence and a retry or crash never leaves a gap. ``event_sha256``
+    is the SHA-256 over the event's public fields (the same identifiers,
+    fixed codes, timestamp and capability *digest* the audit listing
+    already exposes) chained to ``previous_sha256``, the preceding link's
+    digest — 64 zero hex characters for the scope's first event. Events
+    written before the chain existed are backfilled on open in their
+    stable ``(occurred_at, event_id)`` listing order.
+
+    Only the scope, the event identifier, the sequence and the two digest
+    strings are stored: no capability (plaintext or digest), payload,
+    evidence, key or certificate material has a column here.
+    """
+
+    __tablename__ = "audit_event_chain_links"
+    __table_args__ = (
+        # The gap-free per-scope sequence: unique so two concurrent
+        # allocations can never mint the same number, and covering the
+        # chain walk ordered by sequence within one scope.
+        Index(
+            "ix_audit_event_chain_links_scope_seq",
+            "tenant_id",
+            "workload_id",
+            "sequence",
+            unique=True,
+        ),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # Gap-free, immutable, per-scope chain position: 1 for the scope's
+    # first event, increasing by exactly one per later committed event.
+    sequence: Mapped[int] = mapped_column(BigInteger)
+    # Hex SHA-256 of the preceding link in this scope's chain; 64 zero
+    # characters for the first event.
+    previous_sha256: Mapped[str] = mapped_column(String(64))
+    # Hex SHA-256 over the event's public fields and previous_sha256.
+    event_sha256: Mapped[str] = mapped_column(String(64))
+
+
+class AuditEventChainCounter(Base):
+    """Per-scope monotonic allocator for the audit-event chain sequence.
+
+    Exactly one row exists per ``(tenant_id, workload_id)``. It is an
+    internal ordering device — never exposed on any response and holding
+    no business state, material or secret — whose sole purpose is to give
+    concurrent audit-event writers in one scope unique, consecutive chain
+    sequences on every backend:
+
+    * the next value is read ``FOR UPDATE`` (locking backends) so
+      concurrent writers in one scope serialize on the counter row itself;
+    * on SQLite every write transaction already begins as BEGIN
+      IMMEDIATE, serializing all writers process-wide;
+    * the scope's first allocation inserts the anchor inside a savepoint,
+      so the unique-anchor race never rolls the surrounding write back.
+
+    The counter advances in the same transaction as the event and chain
+    link it sequences, so a committed link's sequence is final and
+    strictly greater than every link that committed before it.
+    """
+
+    __tablename__ = "audit_event_chain_counters"
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # Last per-scope chain sequence handed out; 1 for the scope's first
+    # event, strictly increasing for every later committed event.
+    last_seq: Mapped[int] = mapped_column(BigInteger)
+
+
 class ProofLifecycleEvent(Base):
     """Append-only, tenant-scoped proof-lifecycle audit event.
 

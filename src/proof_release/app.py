@@ -107,6 +107,8 @@ from proof_release.db import (
     PROOF_EVENT_STATUS_ALLOWED,
     PROOF_EVENT_STATUS_DENIED,
     AuditEvent,
+    AuditEventChainCounter,
+    AuditEventChainLink,
     Base,
     CertificateRevocation,
     CertificateRevocationList,
@@ -427,10 +429,258 @@ def _next_policy_commit_seq(session, tenant_id: str, workload_id: str) -> int:
     )
 
 
+#: Genesis link of every audit-event chain: the ``previous_sha256`` of a
+#: scope's first event is 64 zero hex characters.
+_AUDIT_CHAIN_GENESIS = "0" * 64
+
+#: Finite, service-defined set of audit-chain failure classifications.
+#: ``event-mismatch`` — a link's stored digest does not match the digest
+#: recomputed from the event's current public fields (or the event the
+#: link receipts is gone or out of scope); ``chain-mismatch`` — a link's
+#: ``previous_sha256`` does not equal its predecessor's digest while the
+#: referenced digest exists somewhere (a wrong or cross-scope link);
+#: ``sequence-mismatch`` — the per-scope sequence skips, repeats or is
+#: out of order; ``missing-predecessor`` — a link references a digest no
+#: chain row carries. Verification failures are reported with these codes
+#: only; they never contain event content.
+AUDIT_CHAIN_FAILURE_EVENT_MISMATCH = "event-mismatch"
+AUDIT_CHAIN_FAILURE_CHAIN_MISMATCH = "chain-mismatch"
+AUDIT_CHAIN_FAILURE_SEQUENCE_MISMATCH = "sequence-mismatch"
+AUDIT_CHAIN_FAILURE_MISSING_PREDECESSOR = "missing-predecessor"
+
+
+def _audit_event_digest(
+    *,
+    previous_sha256: str,
+    event_id: str,
+    tenant_id: str,
+    workload_id: str,
+    event_type: str,
+    grant_id: str | None,
+    decision_id: str | None,
+    data_id: str | None,
+    status: str,
+    capability_sha256: str | None,
+    occurred_at: datetime,
+) -> str:
+    """Compute one audit-event chain digest over public fields only.
+
+    The hashed payload is the canonical JSON (sorted keys, compact
+    separators) of exactly the fields the read-only audit listing already
+    exposes — identifiers, the fixed type/status codes, the UTC timestamp
+    and the capability *digest* — plus the preceding link's digest. No
+    plaintext capability, payload, evidence or key material is ever an
+    input, and the same inputs always reproduce the same digest, so a
+    receipt stays stable across restarts.
+    """
+    payload = json.dumps(
+        {
+            "event_id": event_id,
+            "tenant_id": tenant_id,
+            "workload_id": workload_id,
+            "event_type": event_type,
+            "grant_id": grant_id,
+            "decision_id": decision_id,
+            "data_id": data_id,
+            "status": status,
+            "capability_sha256": capability_sha256,
+            "occurred_at": _rfc3339(occurred_at),
+            "previous_sha256": previous_sha256,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _record_audit_event(
+    session,
+    *,
+    tenant_id: str,
+    workload_id: str,
+    event_type: str,
+    grant_id: str | None,
+    decision_id: str | None,
+    data_id: str | None,
+    status: str,
+    capability_sha256: str | None,
+    occurred_at: datetime,
+) -> None:
+    """Append one audit event and its chain link in the caller's transaction.
+
+    The per-scope chain sequence is allocated from the shared counter in
+    this same transaction (``FOR UPDATE`` on locking backends, BEGIN
+    IMMEDIATE on SQLite), so concurrent writers in one scope serialize and
+    each committed event takes a unique, consecutive sequence. The link's
+    ``previous_sha256`` is the digest of the link sequenced immediately
+    before — the chain head — or the 64-zero genesis for the scope's first
+    event. The caller commits (or rolls back) the unit of work: the event
+    and its receipt always commit or roll back together, so a retry,
+    crash or restart can never add an event without its link or break the
+    chain.
+    """
+    event_id = str(uuid.uuid4())
+    sequence = _next_scoped_commit_seq(
+        session, tenant_id, workload_id, AuditEventChainCounter
+    )
+    if sequence == 1:
+        previous_sha256 = _AUDIT_CHAIN_GENESIS
+    else:
+        previous_sha256 = session.scalar(
+            select(AuditEventChainLink.event_sha256).where(
+                AuditEventChainLink.tenant_id == tenant_id,
+                AuditEventChainLink.workload_id == workload_id,
+                AuditEventChainLink.sequence == sequence - 1,
+            )
+        )
+        if previous_sha256 is None:
+            # The counter advanced but the preceding link is absent: the
+            # chain store is inconsistent, so the write must fail rather
+            # than mint a receipt on a broken chain.
+            logger.error("audit event chain head missing")
+            raise HTTPException(status_code=500, detail="audit chain unavailable")
+    event_sha256 = _audit_event_digest(
+        previous_sha256=previous_sha256,
+        event_id=event_id,
+        tenant_id=tenant_id,
+        workload_id=workload_id,
+        event_type=event_type,
+        grant_id=grant_id,
+        decision_id=decision_id,
+        data_id=data_id,
+        status=status,
+        capability_sha256=capability_sha256,
+        occurred_at=occurred_at,
+    )
+    session.add(
+        AuditEvent(
+            event_id=event_id,
+            tenant_id=tenant_id,
+            workload_id=workload_id,
+            event_type=event_type,
+            grant_id=grant_id,
+            decision_id=decision_id,
+            data_id=data_id,
+            status=status,
+            capability_sha256=capability_sha256,
+            occurred_at=occurred_at,
+        )
+    )
+    session.add(
+        AuditEventChainLink(
+            event_id=event_id,
+            tenant_id=tenant_id,
+            workload_id=workload_id,
+            sequence=sequence,
+            previous_sha256=previous_sha256,
+            event_sha256=event_sha256,
+        )
+    )
+
+
+def _verify_audit_chain(
+    session, tenant_id: str, workload_id: str, *, upto_sequence: int | None = None
+) -> tuple[str | None, str | None, int, int, str | None]:
+    """Walk one scope's audit chain and classify the first defect.
+
+    Returns ``(failure_event_id, failure_reason, checked_count,
+    last_sequence, head_event_sha256)``. On a fully verified chain (or
+    prefix, when ``upto_sequence`` bounds the walk) the first two values
+    are ``None``; ``checked_count`` is the number of links examined
+    (including a failing link), ``last_sequence`` the sequence of the last
+    *verified* link (0 when none verified) and ``head_event_sha256`` that
+    link's digest (``None`` when none verified). The walk examines links
+    in ascending sequence order and stops at the first defect:
+
+    * a sequence that is not exactly the expected next number (a skip, a
+      duplicate or a disorder) is ``sequence-mismatch``;
+    * a ``previous_sha256`` that does not equal the verified predecessor's
+      digest is ``chain-mismatch`` when the referenced digest exists on
+      some link (a wrong or cross-scope link) and ``missing-predecessor``
+      when no link anywhere carries it;
+    * a stored digest that does not match the digest recomputed from the
+      event's current public fields — or a link whose event is gone or
+      out of scope — is ``event-mismatch``.
+    """
+    stmt = select(AuditEventChainLink).where(
+        AuditEventChainLink.tenant_id == tenant_id,
+        AuditEventChainLink.workload_id == workload_id,
+    )
+    if upto_sequence is not None:
+        stmt = stmt.where(AuditEventChainLink.sequence <= upto_sequence)
+    rows = list(session.scalars(stmt.order_by(AuditEventChainLink.sequence.asc())))
+
+    expected = 1
+    previous_sha256 = _AUDIT_CHAIN_GENESIS
+    checked_count = 0
+    last_sequence = 0
+    head_event_sha256: str | None = None
+    for row in rows:
+        checked_count += 1
+        if row.sequence != expected:
+            return (
+                row.event_id,
+                AUDIT_CHAIN_FAILURE_SEQUENCE_MISMATCH,
+                checked_count,
+                last_sequence,
+                head_event_sha256,
+            )
+        if row.previous_sha256 != previous_sha256:
+            referenced = session.scalar(
+                select(func.count())
+                .select_from(AuditEventChainLink)
+                .where(AuditEventChainLink.event_sha256 == row.previous_sha256)
+            )
+            reason = (
+                AUDIT_CHAIN_FAILURE_CHAIN_MISMATCH
+                if referenced
+                else AUDIT_CHAIN_FAILURE_MISSING_PREDECESSOR
+            )
+            return (
+                row.event_id,
+                reason,
+                checked_count,
+                last_sequence,
+                head_event_sha256,
+            )
+        event = session.get(AuditEvent, row.event_id)
+        if (
+            event is None
+            or event.tenant_id != tenant_id
+            or event.workload_id != workload_id
+            or _audit_event_digest(
+                previous_sha256=row.previous_sha256,
+                event_id=event.event_id,
+                tenant_id=event.tenant_id,
+                workload_id=event.workload_id,
+                event_type=event.event_type,
+                grant_id=event.grant_id,
+                decision_id=event.decision_id,
+                data_id=event.data_id,
+                status=event.status,
+                capability_sha256=event.capability_sha256,
+                occurred_at=event.occurred_at,
+            )
+            != row.event_sha256
+        ):
+            return (
+                row.event_id,
+                AUDIT_CHAIN_FAILURE_EVENT_MISMATCH,
+                checked_count,
+                last_sequence,
+                head_event_sha256,
+            )
+        last_sequence = row.sequence
+        head_event_sha256 = row.event_sha256
+        previous_sha256 = row.event_sha256
+        expected += 1
+    return None, None, checked_count, last_sequence, head_event_sha256
+
+
 def _rfc3339(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat()
-
-
 def _utc_minute_window(now: datetime) -> datetime:
     """Return the UTC natural-minute boundary containing ``now``.
 
@@ -3817,6 +4067,138 @@ def _rebuild_release_grant_events(engine) -> None:
             conn.execute(events_tbl.insert(), rows)
 
 
+def _migrate_audit_event_chain(engine) -> None:
+    """Backfill chain receipts for events written before the chain existed.
+
+    The tamper-evident chain shipped after the compliance audit events
+    themselves, so a database written by an older deployment holds
+    ``audit_events`` rows but no ``audit_event_chain_links`` rows.
+    ``create_all`` has just created the empty chain tables, so on open
+    every event that lacks a link is chained, per scope, in the audit
+    listing's stable ``(occurred_at, event_id)`` order — the same order a
+    reader already observes — numbered from the scope's current head (1
+    when the scope has no links yet) and linked to the head's digest (the
+    64-zero genesis for a new chain). Each touched scope's
+    :class:`AuditEventChainCounter` is seeded at the backfilled maximum
+    (inserted when absent, raised when lower) so the first event written
+    after the upgrade continues the chain at N+1 instead of colliding.
+
+    The upgrade is one transaction, runs identically on every backend
+    (numbering is done client-side from the stable listing key, never
+    from a dialect-specific rowid), and is a no-op once every event has a
+    link, so a fresh database and an already-upgraded one are both
+    untouched. No event field, response shape or secret-handling rule
+    changes; the link rows carry only the scope, the event identifier,
+    the sequence and the two digests.
+    """
+    events_tbl = AuditEvent.__table__
+    links_tbl = AuditEventChainLink.__table__
+    counters_tbl = AuditEventChainCounter.__table__
+    with engine.begin() as conn:
+        linkless = conn.execute(
+            select(
+                events_tbl.c.event_id,
+                events_tbl.c.tenant_id,
+                events_tbl.c.workload_id,
+                events_tbl.c.event_type,
+                events_tbl.c.grant_id,
+                events_tbl.c.decision_id,
+                events_tbl.c.data_id,
+                events_tbl.c.status,
+                events_tbl.c.capability_sha256,
+                events_tbl.c.occurred_at,
+            )
+            .select_from(
+                events_tbl.outerjoin(
+                    links_tbl, links_tbl.c.event_id == events_tbl.c.event_id
+                )
+            )
+            .where(links_tbl.c.event_id.is_(None))
+            .order_by(
+                events_tbl.c.tenant_id,
+                events_tbl.c.workload_id,
+                events_tbl.c.occurred_at,
+                events_tbl.c.event_id,
+            )
+        ).all()
+        if not linkless:
+            return
+        # Current chain head (highest sequence and its digest) per scope.
+        heads: dict[tuple[str, str], list] = {}
+        for tenant_id, workload_id, sequence, event_sha256 in conn.execute(
+            select(
+                links_tbl.c.tenant_id,
+                links_tbl.c.workload_id,
+                links_tbl.c.sequence,
+                links_tbl.c.event_sha256,
+            )
+        ).all():
+            head = heads.setdefault((tenant_id, workload_id), [0, _AUDIT_CHAIN_GENESIS])
+            if sequence > head[0]:
+                head[0] = sequence
+                head[1] = event_sha256
+        touched: set[tuple[str, str]] = set()
+        inserts: list[dict] = []
+        for event in linkless:
+            key = (event.tenant_id, event.workload_id)
+            head = heads.setdefault(key, [0, _AUDIT_CHAIN_GENESIS])
+            sequence = head[0] + 1
+            event_sha256 = _audit_event_digest(
+                previous_sha256=head[1],
+                event_id=event.event_id,
+                tenant_id=event.tenant_id,
+                workload_id=event.workload_id,
+                event_type=event.event_type,
+                grant_id=event.grant_id,
+                decision_id=event.decision_id,
+                data_id=event.data_id,
+                status=event.status,
+                capability_sha256=event.capability_sha256,
+                occurred_at=event.occurred_at,
+            )
+            inserts.append(
+                {
+                    "event_id": event.event_id,
+                    "tenant_id": event.tenant_id,
+                    "workload_id": event.workload_id,
+                    "sequence": sequence,
+                    "previous_sha256": head[1],
+                    "event_sha256": event_sha256,
+                }
+            )
+            head[0] = sequence
+            head[1] = event_sha256
+            touched.add(key)
+        conn.execute(links_tbl.insert(), inserts)
+        # Seed (never lower) the per-scope counter at the backfilled
+        # maximum so the next write allocates head+1.
+        for tenant_id, workload_id in touched:
+            last_seq = heads[(tenant_id, workload_id)][0]
+            existing = conn.execute(
+                select(counters_tbl.c.last_seq).where(
+                    counters_tbl.c.tenant_id == tenant_id,
+                    counters_tbl.c.workload_id == workload_id,
+                )
+            ).scalar()
+            if existing is None:
+                conn.execute(
+                    insert(counters_tbl).values(
+                        tenant_id=tenant_id,
+                        workload_id=workload_id,
+                        last_seq=last_seq,
+                    )
+                )
+            elif existing < last_seq:
+                conn.execute(
+                    update(counters_tbl)
+                    .where(
+                        counters_tbl.c.tenant_id == tenant_id,
+                        counters_tbl.c.workload_id == workload_id,
+                    )
+                    .values(last_seq=last_seq)
+                )
+
+
 async def _require_empty_query_body(request: Request) -> None:
     """Reject a read-only query carrying any request body (422).
 
@@ -3877,6 +4259,9 @@ def create_app(
     # Reconstruct the per-grant event timeline for grants written before
     # the timeline existed; a no-op on a fresh or already-upgraded database.
     _rebuild_release_grant_events(engine)
+    # Chain every audit event written before the tamper-evident receipts
+    # existed; a no-op on a fresh or already-upgraded database.
+    _migrate_audit_event_chain(engine)
     session_factory = sessionmaker(bind=engine, expire_on_commit=False)
     registry = verifier_registry or default_registry
 
@@ -4714,19 +5099,17 @@ def create_app(
                         if result == REWRAP_RESULT_REWRAPPED
                         else AUDIT_EVENT_STATUS_SKIPPED
                     )
-                    session.add(
-                        AuditEvent(
-                            event_id=str(uuid.uuid4()),
-                            tenant_id=tenant_id,
-                            workload_id=workload_id,
-                            event_type=AUDIT_EVENT_TYPE_REWRAP,
-                            grant_id=None,
-                            decision_id=None,
-                            data_id=data_id,
-                            status=event_status,
-                            capability_sha256=None,
-                            occurred_at=item_occurred_at,
-                        )
+                    _record_audit_event(
+                        session,
+                        tenant_id=tenant_id,
+                        workload_id=workload_id,
+                        event_type=AUDIT_EVENT_TYPE_REWRAP,
+                        grant_id=None,
+                        decision_id=None,
+                        data_id=data_id,
+                        status=event_status,
+                        capability_sha256=None,
+                        occurred_at=item_occurred_at,
                     )
                     next_boundary = (
                         _encode_cursor(tenant_id, workload_id, data_id)
@@ -7959,19 +8342,17 @@ def create_app(
             # grant row, so a pending event exists if and only if the grant
             # did. Only identifiers, the fixed status, the timestamp and
             # the capability digest are recorded — never the capability.
-            session.add(
-                AuditEvent(
-                    event_id=str(uuid.uuid4()),
-                    tenant_id=body.tenant_id,
-                    workload_id=body.workload_id,
-                    event_type=AUDIT_EVENT_TYPE_GRANT,
-                    grant_id=grant_id,
-                    decision_id=body.decision_id,
-                    data_id=body.data_id,
-                    status=AUDIT_EVENT_STATUS_PENDING,
-                    capability_sha256=grant.capability_digest,
-                    occurred_at=now,
-                )
+            _record_audit_event(
+                session,
+                tenant_id=body.tenant_id,
+                workload_id=body.workload_id,
+                event_type=AUDIT_EVENT_TYPE_GRANT,
+                grant_id=grant_id,
+                decision_id=body.decision_id,
+                data_id=body.data_id,
+                status=AUDIT_EVENT_STATUS_PENDING,
+                capability_sha256=grant.capability_digest,
+                occurred_at=now,
             )
             session.commit()
         return ReleaseGrantCreatedResponse(
@@ -8633,6 +9014,173 @@ def create_app(
                     "next_cursor": next_cursor,
                     "complete": complete,
                 },
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
+
+    def _scoped_chain_read_params(
+        request: Request, tenant_id: str, workload_id: str
+    ) -> None:
+        """Validate the exact two scope parameters of a chain read (422s).
+
+        Both read-only chain endpoints are ranged entirely by
+        ``tenant_id`` and ``workload_id``: a missing parameter is FastAPI's
+        422, and an unsupported, repeated or blank one is the same client
+        error class here, before any state is read.
+        """
+        keys = [key for key, _ in request.query_params.multi_items()]
+        if set(keys) - {"tenant_id", "workload_id"}:
+            raise HTTPException(status_code=422, detail="unsupported query parameter")
+        if len(keys) != len(set(keys)):
+            raise HTTPException(status_code=422, detail="duplicate query parameter")
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+    @app.get("/v1/compliance/audit-events//receipt")
+    def audit_event_receipt_identifier_required() -> Response:
+        # An empty path segment is a missing event identifier: a 422
+        # client error rather than a routing-level 404.
+        raise HTTPException(status_code=422, detail="invalid event identifier")
+
+    @app.get("/v1/compliance/audit-events/{event_id}/receipt")
+    def get_audit_event_receipt(
+        event_id: str,
+        request: Request,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return the tamper-evident chain receipt of one audit event.
+
+        The receipt exposes only the chain fields — the event identifier,
+        its per-scope sequence, the preceding link's digest and the event
+        digest — plus ``verified``, which recomputes the chain prefix up
+        to and including this event from the events' current public
+        fields. A broken prefix (a mismatched field or digest, a wrong or
+        cross-scope link, a skipped, repeated or disordered sequence, or
+        a missing predecessor) still returns 200 with ``verified`` false;
+        only an unknown or cross-scope identifier is a 404, a malformed
+        request a 422, and unavailable digest storage a 500. The handler
+        issues only SELECTs — links are written by the same transactions
+        as the events they receipt, never here.
+        """
+        _scoped_chain_read_params(request, tenant_id, workload_id)
+        # The path identifier must be a canonical lowercase UUID;
+        # surrounding whitespace and uppercase letters are format errors.
+        if not event_id.strip() or not _UUID_RE.fullmatch(event_id.lower()):
+            raise HTTPException(status_code=422, detail="invalid event identifier")
+        event_id = event_id.strip().lower()
+
+        try:
+            with session_factory() as session:
+                event = session.get(AuditEvent, event_id)
+                if (
+                    event is None
+                    or event.tenant_id != tenant_id
+                    or event.workload_id != workload_id
+                ):
+                    # Unknown and cross-scope events are indistinguishable.
+                    raise HTTPException(
+                        status_code=404, detail="audit event not found"
+                    )
+                link = session.get(AuditEventChainLink, event_id)
+                if link is None:
+                    # Every committed event carries a chain link; its
+                    # absence means the digest store is inconsistent.
+                    raise HTTPException(
+                        status_code=500, detail="audit receipt unavailable"
+                    )
+                if link.tenant_id != tenant_id or link.workload_id != workload_id:
+                    # A link whose stored scope was altered can never
+                    # verify against this scope's chain.
+                    verified = False
+                else:
+                    failure_event_id, _, _, _, _ = _verify_audit_chain(
+                        session,
+                        tenant_id,
+                        workload_id,
+                        upto_sequence=link.sequence,
+                    )
+                    verified = failure_event_id is None
+                payload = {
+                    "event_id": link.event_id,
+                    "sequence": link.sequence,
+                    "previous_sha256": link.previous_sha256,
+                    "event_sha256": link.event_sha256,
+                    "verified": verified,
+                }
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("audit event receipt query failed")
+            raise HTTPException(status_code=500, detail="audit receipt unavailable")
+
+        body = (
+            json.dumps(
+                payload,
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
+
+    @app.get("/v1/compliance/audit-events/integrity")
+    def audit_events_integrity(
+        request: Request,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Verify one scope's whole audit-event chain.
+
+        Walks every chain link of the scope in sequence order, checking
+        the gap-free numbering, the digest linkage back to the 64-zero
+        genesis and each event's recomputed digest. A fully intact chain
+        returns ``verified`` true with a null ``failure_event_id`` and
+        ``failure_reason``; the first defect stops the walk and is
+        reported with its event identifier and a fixed reason code
+        (``event-mismatch``, ``chain-mismatch``, ``sequence-mismatch`` or
+        ``missing-predecessor``), still with a 200. ``checked_count``
+        counts the links examined (including a failing one);
+        ``last_sequence`` and ``head_event_sha256`` describe the last
+        *verified* link (0 and null when none verified, e.g. an empty
+        scope). The handler issues only SELECTs; a storage or digest
+        failure is a 500 with no partial result.
+        """
+        _scoped_chain_read_params(request, tenant_id, workload_id)
+
+        try:
+            with session_factory() as session:
+                (
+                    failure_event_id,
+                    failure_reason,
+                    checked_count,
+                    last_sequence,
+                    head_event_sha256,
+                ) = _verify_audit_chain(session, tenant_id, workload_id)
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("audit chain integrity query failed")
+            raise HTTPException(status_code=500, detail="audit integrity unavailable")
+
+        payload = {
+            "verified": failure_event_id is None,
+            "checked_count": checked_count,
+            "last_sequence": last_sequence,
+            "head_event_sha256": head_event_sha256,
+            "failure_event_id": failure_event_id,
+            "failure_reason": failure_reason,
+        }
+        body = (
+            json.dumps(
+                payload,
                 separators=(",", ":"),
                 allow_nan=False,
                 ensure_ascii=False,
@@ -10524,19 +11072,17 @@ def create_app(
                 reason=RELEASE_GRANT_EVENT_REASON_CONSUME,
                 now=now,
             )
-            session.add(
-                AuditEvent(
-                    event_id=str(uuid.uuid4()),
-                    tenant_id=grant.tenant_id,
-                    workload_id=grant.workload_id,
-                    event_type=AUDIT_EVENT_TYPE_GRANT,
-                    grant_id=grant_id,
-                    decision_id=grant.decision_id,
-                    data_id=grant.data_id,
-                    status=AUDIT_EVENT_STATUS_CONSUMED,
-                    capability_sha256=grant.capability_digest,
-                    occurred_at=now,
-                )
+            _record_audit_event(
+                session,
+                tenant_id=grant.tenant_id,
+                workload_id=grant.workload_id,
+                event_type=AUDIT_EVENT_TYPE_GRANT,
+                grant_id=grant_id,
+                decision_id=grant.decision_id,
+                data_id=grant.data_id,
+                status=AUDIT_EVENT_STATUS_CONSUMED,
+                capability_sha256=grant.capability_digest,
+                occurred_at=now,
             )
             session.commit()
             decision_id = grant.decision_id
@@ -10653,19 +11199,17 @@ def create_app(
                 reason=RELEASE_GRANT_EVENT_REASON_REVOKED,
                 now=now,
             )
-            session.add(
-                AuditEvent(
-                    event_id=str(uuid.uuid4()),
-                    tenant_id=grant.tenant_id,
-                    workload_id=grant.workload_id,
-                    event_type=AUDIT_EVENT_TYPE_GRANT,
-                    grant_id=grant_id,
-                    decision_id=grant.decision_id,
-                    data_id=grant.data_id,
-                    status=AUDIT_EVENT_STATUS_REVOKED,
-                    capability_sha256=grant.capability_digest,
-                    occurred_at=now,
-                )
+            _record_audit_event(
+                session,
+                tenant_id=grant.tenant_id,
+                workload_id=grant.workload_id,
+                event_type=AUDIT_EVENT_TYPE_GRANT,
+                grant_id=grant_id,
+                decision_id=grant.decision_id,
+                data_id=grant.data_id,
+                status=AUDIT_EVENT_STATUS_REVOKED,
+                capability_sha256=grant.capability_digest,
+                occurred_at=now,
             )
             session.commit()
             decision_id = grant.decision_id
@@ -10830,19 +11374,17 @@ def create_app(
                 reason=RELEASE_GRANT_EVENT_REASON_RELEASE,
                 now=now,
             )
-            session.add(
-                AuditEvent(
-                    event_id=str(uuid.uuid4()),
-                    tenant_id=grant.tenant_id,
-                    workload_id=grant.workload_id,
-                    event_type=AUDIT_EVENT_TYPE_GRANT,
-                    grant_id=grant_id,
-                    decision_id=grant.decision_id,
-                    data_id=grant.data_id,
-                    status=AUDIT_EVENT_STATUS_CONSUMED,
-                    capability_sha256=grant.capability_digest,
-                    occurred_at=now,
-                )
+            _record_audit_event(
+                session,
+                tenant_id=grant.tenant_id,
+                workload_id=grant.workload_id,
+                event_type=AUDIT_EVENT_TYPE_GRANT,
+                grant_id=grant_id,
+                decision_id=grant.decision_id,
+                data_id=grant.data_id,
+                status=AUDIT_EVENT_STATUS_CONSUMED,
+                capability_sha256=grant.capability_digest,
+                occurred_at=now,
             )
             session.commit()
 
@@ -11068,19 +11610,17 @@ def create_app(
                 # The compliance event commits in the same transaction as
                 # the material rotation; an already-current no-op retry
                 # (above) writes no event because it changes no material.
-                session.add(
-                    AuditEvent(
-                        event_id=str(uuid.uuid4()),
-                        tenant_id=body.tenant_id,
-                        workload_id=body.workload_id,
-                        event_type=AUDIT_EVENT_TYPE_REWRAP,
-                        grant_id=None,
-                        decision_id=None,
-                        data_id=data_id,
-                        status=AUDIT_EVENT_STATUS_REWRAPPED,
-                        capability_sha256=None,
-                        occurred_at=rotated_at,
-                    )
+                _record_audit_event(
+                    session,
+                    tenant_id=body.tenant_id,
+                    workload_id=body.workload_id,
+                    event_type=AUDIT_EVENT_TYPE_REWRAP,
+                    grant_id=None,
+                    decision_id=None,
+                    data_id=data_id,
+                    status=AUDIT_EVENT_STATUS_REWRAPPED,
+                    capability_sha256=None,
+                    occurred_at=rotated_at,
                 )
                 try:
                     session.commit()
@@ -11365,19 +11905,17 @@ def create_app(
                 # events carry the envelope data identifier and the fixed
                 # rewrapped/skipped status; grant/decision identifiers and
                 # the capability digest are empty (NULL).
-                session.add(
-                    AuditEvent(
-                        event_id=str(uuid.uuid4()),
-                        tenant_id=body.tenant_id,
-                        workload_id=body.workload_id,
-                        event_type=AUDIT_EVENT_TYPE_REWRAP,
-                        grant_id=None,
-                        decision_id=None,
-                        data_id=data_id,
-                        status=event_status,
-                        capability_sha256=None,
-                        occurred_at=item_occurred_at,
-                    )
+                _record_audit_event(
+                    session,
+                    tenant_id=body.tenant_id,
+                    workload_id=body.workload_id,
+                    event_type=AUDIT_EVENT_TYPE_REWRAP,
+                    grant_id=None,
+                    decision_id=None,
+                    data_id=data_id,
+                    status=event_status,
+                    capability_sha256=None,
+                    occurred_at=item_occurred_at,
                 )
                 counts["processed"] += 1
                 if result == REWRAP_RESULT_REWRAPPED:
