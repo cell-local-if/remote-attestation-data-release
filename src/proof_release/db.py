@@ -1300,6 +1300,58 @@ class RewrapJobEvent(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
+class RewrapJobItem(Base):
+    """One immutable per-envelope processing attempt of a rewrap job.
+
+    A row is inserted in the *same* committed transaction as the outcome
+    it records: a successful or skipped envelope commits together with
+    the envelope's material change, the existing rewrap audit event and
+    the job's counters/cursor, and a failed attempt commits together with
+    the running -> failed settlement, the ``failed`` increment and the
+    resume cursor parked before the failing envelope. An attempt whose
+    transaction rolled back (a cancel, a lost claim or any pre-commit
+    failure) leaves no row, and a committed row is never updated or
+    deleted — a resume re-attempting the same envelope appends a new row
+    with a later ``attempt_seq``. The per-job ``attempt_seq`` is a
+    gap-free, stable ordering key allocated in the attempt's own
+    transaction (MAX+1 under the serialized writer), so the recorded
+    order is the order in which attempts committed.
+
+    Only identifiers, the sequence number, the envelope identifier, the
+    old/new master key versions (identical for skips and failures), the
+    fixed result code and a UTC timestamp are stored — never the wrapped
+    key, the data key, any payload, cursor tokens or exception text.
+    """
+
+    __tablename__ = "rewrap_job_items"
+    __table_args__ = (
+        # The gap-free per-job attempt sequence, both for allocation and
+        # for the item listing ordered by attempt_seq.
+        Index("ix_rewrap_job_items_job_seq", "job_id", "attempt_seq", unique=True),
+    )
+
+    item_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    job_id: Mapped[str] = mapped_column(String(36), index=True)
+    # Gap-free, immutable, per-job sequence number in committed-attempt
+    # order: 1 for the job's first committed attempt, increasing by
+    # exactly one per later committed attempt (a resume's re-attempt of
+    # the same envelope included). It is the stable listing key.
+    attempt_seq: Mapped[int] = mapped_column(Integer)
+    data_id: Mapped[str] = mapped_column(String(256))
+    # Master key version recorded on the envelope before this attempt;
+    # identical to new_key_version for skips and failures.
+    old_key_version: Mapped[int] = mapped_column(Integer)
+    # Master key version after the attempt: the then-current version for
+    # a successful rewrap, equal to old_key_version otherwise.
+    new_key_version: Mapped[int] = mapped_column(Integer)
+    # One of REWRAP_RESULT_*; a fixed, service-defined code only.
+    result: Mapped[str] = mapped_column(String(16))
+    # Commit time of the recorded attempt.
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class RewrapJobIdempotencyRecord(Base):
     """The first accepted submission of an idempotency-keyed rewrap job.
 
