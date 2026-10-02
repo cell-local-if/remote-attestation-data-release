@@ -288,7 +288,11 @@ def test_429_repeats_do_not_decrement_or_extend(app, client):
 # ---------------------------------------------------------------------------
 
 
-def test_consume_revoke_release_share_one_budget(client):
+def test_consume_revoke_release_share_one_budget(client, monkeypatch):
+    # The six setups below issue six challenges in the same minute; raise
+    # the (independent) challenge-issuance budget so this test stays
+    # focused on the shared one-time-grant budget.
+    monkeypatch.setattr(app_module, "CHALLENGE_ISSUANCE_BUDGET_PER_MINUTE", 64)
     first = _setup(client, data_id="d-1")
     second = _setup(client, data_id="d-2")
     third = _setup(client, data_id="d-3")

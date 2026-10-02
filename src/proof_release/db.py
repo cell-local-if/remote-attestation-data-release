@@ -1562,3 +1562,46 @@ class RateLimitCounter(Base):
     window_start: Mapped[datetime] = mapped_column(UTCDateTime(), primary_key=True)
     # Number of admitted (budget-consuming) requests during this window.
     count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class ChallengeIssuanceCounter(Base):
+    """Persistent per-scope admission counter for challenge issuance.
+
+    One row exists per ``(tenant_id, workload_id, window_start)`` triple,
+    where ``window_start`` is the UTC natural minute (seconds and
+    sub-seconds truncated) in which a *fully validated* ``POST
+    /v1/challenges`` request was admitted. The budget is attributed solely
+    to the two request scope fields: the challenge id and nonce are minted
+    only after admission and never participate in the window. This counter
+    is deliberately separate from :class:`RateLimitCounter`: challenge
+    issuance is independent of one-time-grant consumption, revocation and
+    payload release, so the two never share rows, quota or lock traffic,
+    and different tenants or workloads never share a row.
+
+    A slot is reserved in the same transaction that inserts the challenge,
+    so the count is durable (it survives process restarts), an admitted
+    request can never leave a counter without its challenge or a challenge
+    without its counter, and a rejected (over-budget) request writes
+    nothing — no counter, no challenge, and the freshly minted nonce is
+    neither returned nor persisted. A new UTC minute starts a new row,
+    which restores the quota automatically; quotas are never borrowed
+    across scopes or minutes.
+    """
+
+    __tablename__ = "challenge_issuance_counters"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "window_start",
+            name="uq_challenge_issuance_counter_scope_window",
+        ),
+    )
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # UTC minute boundary at which the window starts, truncated to seconds.
+    window_start: Mapped[datetime] = mapped_column(UTCDateTime(), primary_key=True)
+    # Number of challenges issued during this window; capped at the
+    # per-minute issuance budget by the atomic admission transaction.
+    count: Mapped[int] = mapped_column(Integer, default=0)
