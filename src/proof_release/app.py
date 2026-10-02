@@ -2669,6 +2669,50 @@ class DecisionResponse(BaseModel):
     decided_at: str
 
 
+#: Bounds for the read-only policy preview: one request names 1..16
+#: distinct policy versions to evaluate the presented evidence against.
+POLICY_PREVIEW_MAX_POLICY_IDS = 16
+
+
+class PolicyPreviewRequest(BaseModel):
+    """Body of the read-only policy preview.
+
+    Carries the same scope, challenge nonce and evidence bytes as a formal
+    decision request, plus the ordered list of policy version ids to
+    evaluate. Any missing, blank, wrong-typed or unknown field, an empty
+    or oversized ``policy_ids`` array, a repeated id or a non-canonical
+    (non-lowercase) UUID is rejected as a client error before any state
+    is read.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    nonce: StrictStr = Field(min_length=1)
+    evidence: StrictStr = Field(min_length=1)
+    policy_ids: list[StrictStr] = Field(
+        min_length=1, max_length=POLICY_PREVIEW_MAX_POLICY_IDS
+    )
+
+    _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
+    _nonce_valid = field_validator("nonce")(_nonce_format)
+
+    @field_validator("policy_ids")
+    @classmethod
+    def _validate_policy_ids(cls, value: list[str]) -> list[str]:
+        seen: set[str] = set()
+        for item in value:
+            if not _UUID_RE.fullmatch(item):
+                raise ValueError(
+                    "policy_ids must be canonical lowercase UUIDs"
+                )
+            if item in seen:
+                raise ValueError("policy_ids must not repeat")
+            seen.add(item)
+        return value
+
+
 class CreateReleaseGrantRequest(BaseModel):
     tenant_id: StrictStr = Field(min_length=1)
     workload_id: StrictStr = Field(min_length=1)
@@ -7886,6 +7930,200 @@ def create_app(
             status=status,
             decided_at=_rfc3339(decided_at),
         )
+
+    @app.post("/v1/evidence/{evidence_id}/policy-preview")
+    def preview_evidence_against_policies(
+        evidence_id: str, body: PolicyPreviewRequest
+    ) -> Response:
+        """Evaluate verified evidence against policy versions, read-only.
+
+        This is a pre-flight view of the formal decision: it applies the
+        same scope, challenge-binding, nonce and evidence-digest checks as
+        POST /v1/evidence/{evidence_id}/decisions and evaluates the same
+        immutable rule snapshots against the same parsed claims, but it
+        never invokes a verifier, never writes anything and never returns
+        a decision_id — no decision, proof event, evaluation node, grant,
+        audit row or cursor is created or advanced, so a repeated or
+        concurrent identical request deterministically returns the same
+        body. Evidence that already has formal decisions previews exactly
+        like evidence that has none.
+
+        Each ``policy_id`` names one immutable policy version in the
+        request's tenant/workload scope; results come back in request
+        order. An unknown or out-of-scope evidence or policy id is one
+        indistinguishable 404, a nonce mismatch is a 422, a digest
+        mismatch, unparseable JSON/claims, an unsupported evidence format
+        or an illegal ``policy_ids`` array is a 422, unverified evidence
+        or a retired policy version is a 409, and a storage failure is a
+        500 with no partial state left behind. The response carries only
+        identifiers, the fixed allowed/denied codes and node
+        positions/types/booleans — never evidence text, nonces, claim
+        names or values, comparison targets or keys.
+        """
+        evidence_digest = hashlib.sha256(body.evidence.encode("utf-8")).hexdigest()
+        nonce_digest = _nonce_digest(body.nonce)
+        try:
+            with session_factory() as session:
+                # Read-only twin of the formal decision's gating: same
+                # lookups, same order, but no row locks and no writes.
+                evidence = session.get(Evidence, evidence_id)
+                if (
+                    evidence is None
+                    or evidence.tenant_id != body.tenant_id
+                    or evidence.workload_id != body.workload_id
+                ):
+                    raise HTTPException(status_code=404, detail="evidence not found")
+
+                challenge = session.get(Challenge, evidence.challenge_id)
+                if (
+                    challenge is None
+                    or challenge.tenant_id != body.tenant_id
+                    or challenge.workload_id != body.workload_id
+                ):
+                    raise HTTPException(status_code=404, detail="evidence not found")
+
+                # The presented nonce must match the evidence's bound
+                # challenge. Only its digest is stored; the plaintext
+                # nonce is never kept.
+                if not hmac.compare_digest(challenge.nonce_digest, nonce_digest):
+                    raise HTTPException(status_code=422, detail="invalid nonce")
+
+                # Resolve every named policy version in request order
+                # before judging the evidence, mirroring the formal
+                # decision's check order (policy 404/409 before the
+                # evidence-content checks).
+                policies = []
+                for policy_id in body.policy_ids:
+                    policy = session.get(Policy, policy_id)
+                    if (
+                        policy is None
+                        or policy.tenant_id != body.tenant_id
+                        or policy.workload_id != body.workload_id
+                    ):
+                        raise HTTPException(status_code=404, detail="policy not found")
+                    # A retired version is terminal: it produces no new
+                    # judgement, formal or preview.
+                    if policy.status == POLICY_STATUS_RETIRED:
+                        raise HTTPException(
+                            status_code=409, detail="policy is retired"
+                        )
+                    policies.append(policy)
+
+                # Only settled, verified evidence may be evaluated;
+                # received (unverified) and rejected evidence cannot.
+                if evidence.status != "verified":
+                    raise HTTPException(
+                        status_code=409, detail="evidence is not verified"
+                    )
+
+                # The presented evidence must be byte-identical to what
+                # was received; compare digests only — never persist the
+                # bytes.
+                if not hmac.compare_digest(evidence.evidence_sha256, evidence_digest):
+                    raise HTTPException(
+                        status_code=422, detail="evidence digest mismatch"
+                    )
+
+                # Claims are readable only for the built-in JSON evidence
+                # formats; other formats carry no parseable claims.
+                if evidence.evidence_format not in (
+                    ATTESTED_NONCE_JSON,
+                    X509_ATTESTED_NONCE_JSON,
+                ):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="unsupported evidence format for policy preview",
+                    )
+
+                # Parse the presented (digest-matched) evidence just far
+                # enough to read its claims. The evidence is verified
+                # already; the verifier is not invoked again and neither
+                # the document nor the claims are persisted anywhere.
+                try:
+                    document = json.loads(body.evidence)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    raise HTTPException(
+                        status_code=422, detail="evidence is not valid JSON"
+                    )
+                if not isinstance(document, dict):
+                    raise HTTPException(
+                        status_code=422, detail="evidence is not valid JSON"
+                    )
+                claims = document.get("claims", {})
+                if not isinstance(claims, dict):
+                    raise HTTPException(
+                        status_code=422, detail="evidence is not valid JSON"
+                    )
+
+                results = []
+                for policy in policies:
+                    # The version row is immutable, so its stored rule is
+                    # exactly the snapshot a formal decision against this
+                    # version would evaluate.
+                    rule = json.loads(policy.rule_json)
+                    satisfied = evaluate_rule(rule, claims)
+                    status = (
+                        DECISION_STATUS_ALLOWED
+                        if satisfied
+                        else DECISION_STATUS_DENIED
+                    )
+                    evaluation_nodes = explain_rule(rule, claims)
+                    if (
+                        not evaluation_nodes
+                        or evaluation_nodes[0]["outcome"] != satisfied
+                    ):
+                        # Defensive: a validated rule always has a root
+                        # whose outcome is the overall verdict.
+                        logger.error(
+                            "policy preview evaluation explanation mismatch"
+                        )
+                        raise HTTPException(
+                            status_code=500, detail="policy preview unavailable"
+                        )
+                    results.append(
+                        {
+                            "policy_id": policy.policy_id,
+                            "policy_version": policy.version,
+                            "status": status,
+                            "evaluation": {
+                                "evaluation_version": EVALUATION_VERSION,
+                                "nodes": [
+                                    {
+                                        "node_index": node["node_index"],
+                                        "rule_path": node["rule_path"],
+                                        "node_type": node["node_type"],
+                                        "outcome": bool(node["outcome"]),
+                                    }
+                                    for node in evaluation_nodes
+                                ],
+                            },
+                        }
+                    )
+                payload = {"evidence_id": evidence_id, "results": results}
+        except HTTPException:
+            raise
+        except Exception:
+            # Fixed message only: exception text might carry protected
+            # material and is never logged or returned. Nothing was
+            # written, so no partial state can survive.
+            logger.error("policy preview failed")
+            raise HTTPException(status_code=500, detail="policy preview unavailable")
+
+        # Compact JSON with a single terminating newline. Every value is a
+        # string, integer, boolean or a (possibly empty) list of integers
+        # — no floats, nulls or non-finite values — and no evidence text,
+        # nonce, claim name or actual claim value, comparison target,
+        # capability, payload or key appears.
+        response_body = (
+            json.dumps(
+                payload,
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=response_body, media_type="application/json")
 
     @app.post(
         "/v1/release-grants",
