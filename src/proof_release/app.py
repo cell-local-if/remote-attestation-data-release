@@ -6433,6 +6433,144 @@ def create_app(
         # error rather than a routing-level 404.
         raise HTTPException(status_code=422, detail="invalid CRL identifier")
 
+    @app.get("/v1/crls/status")
+    def get_crl_status(
+        request: Request,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        trust_root_id: str = Query(...),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return the read-only CRL freshness state of one trust root.
+
+        The query is fixed entirely by the three mandatory, single-valued
+        query parameters: the two scope strings must be present with no
+        surrounding whitespace, and ``trust_root_id`` must be a canonical
+        lowercase UUID. Every shape failure (a missing, blank or
+        whitespace-padded scope value, a non-canonical UUID, a repeated or
+        unknown parameter, or any non-empty body) is a 422 produced before
+        storage is touched. An unknown trust root and one belonging to
+        another tenant or workload are the same indistinguishable 404;
+        retired roots still exist and therefore still answer 200.
+
+        The handler issues only SELECTs inside one read-only transaction
+        and never writes: it registers, updates or deletes no snapshot,
+        appends no audit row and changes no later verification, and the
+        response carries only identifiers, timestamps and the state — never
+        the CRL body, entries, digests or certificate material. The root
+        and its highest-CRLNumber snapshot are observed as one committed
+        point: a snapshot registration committing concurrently is seen
+        wholly before or wholly after. With no snapshot the state is
+        ``missing`` and the four CRL fields are null; otherwise they come
+        from the highest-numbered snapshot, which is ``fresh`` before its
+        nextUpdate and ``stale`` at or past it. A storage or consistency
+        fault is a sanitized 500 with no partial result.
+        """
+        # --- request shape (all 422, no state is read) ------------------
+        allowed_params = {"tenant_id", "workload_id", "trust_root_id"}
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+        # Each parameter is a single scalar string; a repeated parameter
+        # (even of an allowed name) is rejected rather than silently
+        # treated as last-wins.
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(
+                status_code=422, detail="query parameter must appear once"
+            )
+        # Non-empty and free of leading/trailing whitespace (a padded value
+        # is a shape defect, not a silently trimmed scope).
+        if not tenant_id or tenant_id != tenant_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+        if not workload_id or workload_id != workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+        # Canonical lowercase UUID only; surrounding whitespace or any
+        # non-hex/uppercase digit fails the pattern rather than being
+        # normalized.
+        if not _UUID_RE.fullmatch(trust_root_id):
+            raise HTTPException(
+                status_code=422, detail="invalid trust root identifier"
+            )
+
+        # One read-only transaction for both lookups. The trust-root row is
+        # never modified by CRL registration, and a snapshot plus its
+        # entries commit as one atomic write while this path reads only the
+        # immutable parent row, so the pair can only reflect a complete
+        # pre-commit state (previous snapshot or none) or a complete
+        # post-commit state (new highest snapshot) — never a partial one.
+        observed_at = _utcnow()
+        try:
+            with session_factory() as session:
+                root_exists = session.scalar(
+                    select(TrustRoot.root_id)
+                    .where(
+                        TrustRoot.root_id == trust_root_id,
+                        TrustRoot.tenant_id == tenant_id,
+                        TrustRoot.workload_id == workload_id,
+                    )
+                )
+                if root_exists is None:
+                    # Unknown and cross-scope trust roots are indistinguishable.
+                    raise HTTPException(
+                        status_code=404, detail="trust root not found"
+                    )
+                # Highest CRLNumber snapshot wins, matching the selection
+                # used at verification time.
+                current_crl = session.scalar(
+                    select(CertificateRevocationList)
+                    .where(
+                        CertificateRevocationList.tenant_id == tenant_id,
+                        CertificateRevocationList.workload_id == workload_id,
+                        CertificateRevocationList.trust_root_id
+                        == trust_root_id,
+                    )
+                    .order_by(CertificateRevocationList.crl_number.desc())
+                    .limit(1)
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("CRL status query failed")
+            raise HTTPException(
+                status_code=500, detail="CRL status unavailable"
+            )
+
+        if current_crl is None:
+            state = "missing"
+            current_crl_id = None
+            crl_number = None
+            this_update = None
+            next_update = None
+        else:
+            # At or past nextUpdate is stale; strictly before it is fresh.
+            # This mirrors verification's fail-closed boundary
+            # (next_update <= now), only reported rather than enforced.
+            state = "stale" if current_crl.next_update <= observed_at else "fresh"
+            current_crl_id = current_crl.crl_id
+            crl_number = current_crl.crl_number
+            this_update = _rfc3339(current_crl.this_update)
+            next_update = _rfc3339(current_crl.next_update)
+
+        # Exactly nine fields in a fixed order; compact JSON terminated by
+        # a single newline. crl_number is a Python int, so allow_nan=False
+        # only makes the no-finite-float invariant explicit.
+        return _compact_json_line(
+            {
+                "tenant_id": tenant_id,
+                "workload_id": workload_id,
+                "trust_root_id": trust_root_id,
+                "observed_at": _rfc3339(observed_at),
+                "state": state,
+                "current_crl_id": current_crl_id,
+                "crl_number": crl_number,
+                "this_update": this_update,
+                "next_update": next_update,
+            }
+        )
+
     @app.get("/v1/crls/{crl_id}")
     def get_crl(
         request: Request,
