@@ -11124,6 +11124,129 @@ def create_app(
             content=body, status_code=status_code, media_type="application/json"
         )
 
+    @app.get("/v1/key-rotation/status")
+    def get_key_rotation_status(
+        request: Request,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return a read-only key-rotation inventory for one scope.
+
+        The range is fixed entirely by the two mandatory, non-blank query
+        parameters; the request body is always empty. Every shape failure
+        (a missing or blank parameter, a repeated or unknown parameter, or
+        any non-empty body) is rejected as a 422 before any state is read.
+        The handler never writes: it rotates nothing, appends no audit row,
+        and returns no data_id, payload, key or envelope material — only
+        aggregate counts and version numbers.
+
+        The report counts the envelopes in the scope by the master key
+        version they are currently wrapped under, names the keyring's
+        current version, and lists any in-use versions the keyring no
+        longer holds a key for. ``scope_ready_for_key_drop`` is true only
+        when the scope holds no envelopes at all, or every envelope is
+        already at the current version and no in-use version is missing
+        from the keyring; it is a pure observation and changes nothing.
+        A storage failure or an unusable master keyring is a 500 with no
+        partial report.
+        """
+        # --- request shape (all 422, no state is read) ------------------
+        allowed_params = {"tenant_id", "workload_id"}
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+        # Each scope parameter is a single scalar string; a repeated
+        # parameter (a multi-valued/list value) is the wrong shape, not a
+        # silently last-wins scalar.
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(
+                status_code=422, detail="query parameter must appear once"
+            )
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        # The keyring classifies the envelope rows: its current version is
+        # the migration target and its configured versions decide which
+        # in-use versions are still decryptable. Only integer versions are
+        # reported — never key material. A missing or malformed keyring is
+        # a server failure: fail closed with a 500 rather than reporting an
+        # unclassified envelope set.
+        try:
+            keyring = load_keyring()
+        except MasterKeyError as exc:
+            logger.error("master key configuration unavailable: %s", exc)
+            raise HTTPException(
+                status_code=500, detail="key rotation status unavailable"
+            )
+        current_key_version = keyring.current_version
+
+        # One GROUP BY statement over the scoped rows. A single statement
+        # evaluates against one consistent committed snapshot on every
+        # backend (and the write lock taken by BEGIN IMMEDIATE on sqlite
+        # additionally orders it against concurrent committers), so an
+        # envelope created or re-wrapped concurrently is counted exactly
+        # once, under exactly one version — never split across two versions
+        # and never half-counted. The handler issues no writes.
+        counts_stmt = (
+            select(DataEnvelope.key_version, func.count())
+            .where(
+                DataEnvelope.tenant_id == tenant_id,
+                DataEnvelope.workload_id == workload_id,
+            )
+            .group_by(DataEnvelope.key_version)
+        )
+        try:
+            with session_factory() as session:
+                rows = session.execute(counts_stmt).all()
+        except Exception:
+            logger.error("key rotation status query failed")
+            raise HTTPException(
+                status_code=500, detail="key rotation status unavailable"
+            )
+
+        counts = {int(version): int(count) for version, count in rows}
+        total = sum(counts.values())
+        at_current = counts.get(current_key_version, 0)
+        behind = total - at_current
+        # Versions are reported as JSON object keys (strings) ordered by
+        # their numeric value, and only versions actually present in the
+        # scope appear.
+        by_key_version = {str(version): counts[version] for version in sorted(counts)}
+        # In-use versions the keyring can no longer unwrap: rotation to the
+        # current version is impossible for these envelopes until the key
+        # is restored, so they block any key drop.
+        unavailable = sorted(
+            version for version in counts if version not in keyring.keys
+        )
+        # Ready only when no historical version remains in the scope: an
+        # empty scope, or every envelope at the current version with no
+        # in-use version missing from the keyring. Purely observational.
+        ready_for_drop = total == 0 or (not unavailable and behind == 0)
+
+        # Exactly ten fields in a fixed order. Every count is a Python int
+        # produced by SQL count aggregation (never a float), so no -0.0 or
+        # non-finite value is possible; allow_nan=False (inside
+        # _compact_json_line) makes that explicit. Compact JSON terminated
+        # by a single newline.
+        return _compact_json_line(
+            {
+                "tenant_id": tenant_id,
+                "workload_id": workload_id,
+                "current_key_version": current_key_version,
+                "total": total,
+                "at_current": at_current,
+                "behind": behind,
+                "by_key_version": by_key_version,
+                "unavailable_key_versions": [str(v) for v in unavailable],
+                "scope_ready_for_key_drop": ready_for_drop,
+                "generated_at": _rfc3339(_utcnow()),
+            }
+        )
+
     @app.post("/v1/rewrap-batches")
     def create_rewrap_batch(body: CreateRewrapBatchRequest) -> Response:
         # Authenticate the cursor against this exact scope before touching
