@@ -6433,6 +6433,139 @@ def create_app(
         # error rather than a routing-level 404.
         raise HTTPException(status_code=422, detail="invalid CRL identifier")
 
+    # Registered before /v1/crls/{crl_id} so the literal "status" segment
+    # binds here rather than to the snapshot lookup (where it would be a
+    # 422 as a non-UUID identifier).
+    @app.get("/v1/crls/status")
+    def get_crl_status(
+        request: Request,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        trust_root_id: str = Query(...),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return the current revocation-list freshness of one trust root.
+
+        The range is fixed entirely by the three mandatory query
+        parameters, each appearing exactly once; the request body is
+        always empty. Every shape failure (a missing, blank or
+        whitespace-padded scope parameter, a non-canonical trust root
+        UUID, a repeated or unknown parameter, or any non-empty body) is
+        a 422 before any state is read. An unknown trust root and one
+        belonging to another tenant or workload are the same
+        indistinguishable 404. On success the response reports the
+        highest-CRLNumber snapshot of the root as of one consistent
+        committed read stamped ``observed_at``: ``missing`` when the root
+        has no snapshot at all (all four CRL fields null), otherwise
+        ``fresh`` while ``observed_at`` is before the snapshot's
+        ``next_update`` and ``stale`` once it has been reached. The
+        handler issues only SELECTs: it writes no audit record, updates
+        or deletes nothing, never parses or returns the CRL body, its
+        entries, digests or certificate material, and never changes later
+        verification. A concurrent registration is observed either
+        completely before or completely after its commit, never as a
+        partial snapshot. A storage failure or inconsistent read is a
+        sanitized 500 with no partial result.
+        """
+        # --- request shape (all 422, no state is read) ------------------
+        allowed_params = {"tenant_id", "workload_id", "trust_root_id"}
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+        # Each parameter is a single scalar string; a repeated parameter
+        # (even of an allowed name) is rejected rather than silently
+        # treated as last-wins.
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(
+                status_code=422, detail="query parameter must appear once"
+            )
+        # Scope identifiers are non-empty and carry no leading or
+        # trailing whitespace; the trust root identifier is a canonical
+        # lowercase UUID.
+        if (
+            not tenant_id
+            or tenant_id != tenant_id.strip()
+            or not workload_id
+            or workload_id != workload_id.strip()
+        ):
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+        if not _UUID_RE.fullmatch(trust_root_id):
+            raise HTTPException(
+                status_code=422, detail="invalid trust root identifier"
+            )
+
+        # One timestamp for the whole read: it stamps the response and
+        # decides freshness, so the reported state always agrees with the
+        # reported observation time.
+        observed_at = _utcnow()
+        try:
+            with session_factory() as session:
+                trust_root = session.scalar(
+                    select(TrustRoot.root_id).where(
+                        TrustRoot.root_id == trust_root_id,
+                        TrustRoot.tenant_id == tenant_id,
+                        TrustRoot.workload_id == workload_id,
+                    )
+                )
+                if trust_root is None:
+                    # Do not reveal whether an out-of-scope trust root exists.
+                    raise HTTPException(
+                        status_code=404, detail="trust root not found"
+                    )
+                # The same highest-CRLNumber selection verification uses.
+                # A snapshot commits atomically with its entries, so this
+                # single SELECT observes one fully committed snapshot (or
+                # none), never a half-registered one.
+                current_crl = session.scalar(
+                    select(CertificateRevocationList)
+                    .where(
+                        CertificateRevocationList.tenant_id == tenant_id,
+                        CertificateRevocationList.workload_id == workload_id,
+                        CertificateRevocationList.trust_root_id == trust_root_id,
+                    )
+                    .order_by(CertificateRevocationList.crl_number.desc())
+                    .limit(1)
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("CRL status query failed")
+            raise HTTPException(status_code=500, detail="CRL registry unavailable")
+
+        if current_crl is None:
+            state = "missing"
+            current_crl_id = None
+            crl_number = None
+            this_update = None
+            next_update = None
+        else:
+            # next_update reached means stale: the boundary itself is no
+            # longer fresh.
+            state = "fresh" if observed_at < current_crl.next_update else "stale"
+            current_crl_id = current_crl.crl_id
+            crl_number = current_crl.crl_number
+            this_update = _rfc3339(current_crl.this_update)
+            next_update = _rfc3339(current_crl.next_update)
+
+        # Exactly nine fields in a fixed order; compact JSON terminated
+        # by a single newline.
+        return _compact_json_line(
+            {
+                "tenant_id": tenant_id,
+                "workload_id": workload_id,
+                "trust_root_id": trust_root_id,
+                "observed_at": _rfc3339(observed_at),
+                "state": state,
+                "current_crl_id": current_crl_id,
+                "crl_number": crl_number,
+                "this_update": this_update,
+                "next_update": next_update,
+            }
+        )
+
     @app.get("/v1/crls/{crl_id}")
     def get_crl(
         request: Request,
