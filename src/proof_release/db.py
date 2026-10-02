@@ -1401,6 +1401,81 @@ class AuditEvent(Base):
     occurred_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
 
 
+class AuditEventChainLink(Base):
+    """Tamper-evident receipt chaining one compliance audit event.
+
+    Exactly one row exists per :class:`AuditEvent`, inserted in the same
+    committed transaction as the event itself, so a receipt exists if and
+    only if its event committed and a rollback removes both together. The
+    chain is partitioned per ``(tenant_id, workload_id)`` scope:
+    ``sequence`` starts at 1 and increases by exactly one per event in
+    commit order (allocated through :class:`AuditEventChainCounter`), and
+    ``previous_sha256`` is the ``event_sha256`` of the scope's preceding
+    link — 64 zero characters for the scope's first event.
+
+    Only the chain fields are stored: the event identifier, the scope, the
+    sequence and the two digests. Capabilities, payloads, evidence, data
+    keys, master keys and certificate material never have a column here;
+    ``event_sha256`` is a SHA-256 over the event's already-public fields
+    (the same identifiers, fixed codes, timestamp and capability *digest*
+    the audit listing exposes) plus the sequence and the previous digest.
+    The table is never updated or deleted by the service.
+    """
+
+    __tablename__ = "audit_event_chain_links"
+    __table_args__ = (
+        # Per-scope chain position: unique so two concurrent writers can
+        # never mint the same sequence, and covering the scoped walk the
+        # integrity query performs in sequence order.
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "sequence",
+            name="uq_audit_event_chain_scope_sequence",
+        ),
+    )
+
+    # Same identifier space as the audit event this receipt chains.
+    event_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256), index=True)
+    # Per-scope chain position: 1 for the scope's first event, strictly
+    # increasing by one per committed event thereafter.
+    sequence: Mapped[int] = mapped_column(BigInteger)
+    # Hex SHA-256 of the preceding link in this scope; 64 "0" characters
+    # for the scope's first event.
+    previous_sha256: Mapped[str] = mapped_column(String(64))
+    # Hex SHA-256 over the event's public fields, the sequence and the
+    # previous digest.
+    event_sha256: Mapped[str] = mapped_column(String(64))
+
+
+class AuditEventChainCounter(Base):
+    """Per-scope monotonic allocator for audit-chain ``sequence``.
+
+    Exactly one row exists per ``(tenant_id, workload_id)``. It is an
+    internal ordering device — never exposed on any response and holding
+    no business state, material or secret — whose sole purpose is to give
+    concurrent writers in one scope unique, consecutive chain positions:
+    allocating the next sequence reads this row ``FOR UPDATE`` (locking
+    backends) so writers serialize on the counter row itself, and on
+    SQLite every write transaction already begins as BEGIN IMMEDIATE. The
+    scope's first allocation inserts the anchor inside a savepoint, so a
+    first-write race costs only that savepoint and never rolls the
+    surrounding event transaction back. The counter advances in the same
+    transaction as the event and link it sequences, so a committed
+    link's sequence is final and a rollback leaves no gap.
+    """
+
+    __tablename__ = "audit_event_chain_counters"
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # Last per-scope chain sequence handed out; 1 for the scope's first
+    # event, strictly increasing thereafter.
+    last_seq: Mapped[int] = mapped_column(BigInteger)
+
+
 class ProofLifecycleEvent(Base):
     """Append-only, tenant-scoped proof-lifecycle audit event.
 
