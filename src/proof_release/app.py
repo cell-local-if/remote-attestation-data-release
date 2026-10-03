@@ -4187,6 +4187,43 @@ def _json_safe(value):
     return value
 
 
+class _BodyShapeError(ValueError):
+    """Internal marker: a request body is not exactly the allowed shape."""
+
+
+def _unique_object_pairs(pairs: list) -> dict:
+    """``object_pairs_hook`` rejecting a repeated key at any object depth.
+
+    Strict JSON object construction for endpoints whose contract forbids
+    duplicate fields: the standard ``dict`` collapse would silently keep
+    the last value, so a repeated key is detected here instead.
+    """
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _BodyShapeError("object field must appear once")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    """``parse_constant`` hook: NaN/Infinity literals are not valid JSON."""
+    raise _BodyShapeError("non-finite numbers are not valid JSON")
+
+
+def _finite_json_float(value: str) -> float:
+    """``parse_float`` hook rejecting overflow to a non-finite float.
+
+    Python's JSON parser maps an out-of-range literal such as ``1e999`` to
+    ``inf`` without ever calling ``parse_constant``; the finite check here
+    closes that hole so no non-finite value can enter through a body.
+    """
+    number = float(value)
+    if not math.isfinite(number):
+        raise _BodyShapeError("non-finite numbers are not valid JSON")
+    return number
+
+
 def create_app(
     database_url: str | None = None,
     verifier_registry: VerifierRegistry | None = None,
@@ -8330,6 +8367,185 @@ def create_app(
                     "policies": policies,
                     "next_cursor": next_cursor,
                     "complete": complete,
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
+
+    @app.post("/v1/policies//simulate")
+    def simulate_policy_identifier_required() -> Response:
+        # An empty path segment is a missing policy identifier: a 422
+        # client error rather than a routing-level 404 or 405. It never
+        # reads or evaluates a policy version.
+        raise HTTPException(status_code=422, detail="invalid policy identifier")
+
+    @app.post("/v1/policies/{policy_id}/simulate")
+    async def simulate_policy(policy_id: str, request: Request) -> Response:
+        """Dry-run one immutable policy version against caller claims.
+
+        A read-only simulation entry point: it confirms the conclusion a
+        fixed policy version reaches for a supplied claim set without
+        recording anything. The path ``policy_id`` must be a canonical
+        lowercase UUID (a missing segment, blank, whitespace-padded or
+        non-canonical value is a 422 before anything is read). The body
+        must be a JSON object carrying exactly ``tenant_id`` and
+        ``workload_id`` (both non-blank strings) and ``claims`` (a JSON
+        object): a missing, unknown or repeated field, an empty or blank
+        scope string, a non-object ``claims``, a non-JSON or empty body,
+        and any NaN/Infinity literal (including overflow spellings such as
+        ``1e999``) are all 422s produced before any state is read or
+        written. An unknown policy, or one belonging to another tenant or
+        workload, is one indistinguishable 404.
+
+        The version's immutable rule is evaluated with the existing
+        decision semantics: top-level ``claim`` and object-field ``path``
+        locators, ``equals``/``in``/``exists``/``lt``/``lte``/``gt``/``gte``
+        comparisons and ``all``/``any``/``not`` composition; a ``path``
+        descends object fields only (arrays never expand, indices are
+        never read) and a missing field is simply not satisfied. Active
+        and retired versions both simulate, and repeating a request
+        against an unchanged rule returns the identical result.
+
+        Success is 200 with compact JSON terminated by a single newline,
+        top-level keys in exactly the order ``tenant_id``,
+        ``workload_id``, ``policy_id``, ``policy_name``,
+        ``policy_version``, ``policy_status`` (the version's current
+        ``active``/``retired``), ``allowed`` (the root boolean) and
+        ``evaluation`` — the depth-first full-tree explanation of
+        ``node_index``/``rule_path``/``node_type``/``outcome`` nodes whose
+        root outcome equals ``allowed``. The response carries no claims,
+        matched or compared values, protected material, floats or
+        non-finite values. The handler issues only SELECTs: it creates no
+        decision, release grant, proof event or audit event, never
+        persists the claims, consumes none of the shared business
+        rate-limit budget and changes no state. A storage failure, or an
+        explanation that is incomplete or inconsistent with the immutable
+        rule, is a 500 with the half-built result discarded entirely.
+        """
+        # Path shape first: blank, whitespace-padded, uppercase or
+        # otherwise non-canonical identifiers are format errors rejected
+        # before the body is read or any state is touched.
+        if not _UUID_RE.fullmatch(policy_id):
+            raise HTTPException(status_code=422, detail="invalid policy identifier")
+
+        # --- strict body parse (all 422, no storage touched) ------------
+        # The body is parsed directly (rather than through a pydantic
+        # model) so that duplicate object keys — which the standard model
+        # pipeline would silently collapse to last-wins — and non-finite
+        # numbers are rejected at any nesting depth.
+        raw = await request.body()
+        try:
+            document = json.loads(
+                raw,
+                object_pairs_hook=_unique_object_pairs,
+                parse_constant=_reject_json_constant,
+                parse_float=_finite_json_float,
+            )
+        except Exception:
+            raise HTTPException(status_code=422, detail="invalid request body")
+        if not isinstance(document, dict):
+            raise HTTPException(status_code=422, detail="invalid request body")
+        # Exactly the three allowed fields: a missing or unknown field is
+        # the same client error, and a repeated field never reaches here
+        # (rejected by the pairs hook above).
+        if set(document.keys()) != {"tenant_id", "workload_id", "claims"}:
+            raise HTTPException(status_code=422, detail="invalid request fields")
+        tenant_id = document["tenant_id"]
+        workload_id = document["workload_id"]
+        claims = document["claims"]
+        if (
+            not isinstance(tenant_id, str)
+            or not tenant_id.strip()
+            or not isinstance(workload_id, str)
+            or not workload_id.strip()
+        ):
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+        if not isinstance(claims, dict):
+            raise HTTPException(
+                status_code=422, detail="claims must be a JSON object"
+            )
+
+        # --- read-only load of the immutable version --------------------
+        try:
+            with session_factory() as session:
+                policy = session.get(Policy, policy_id)
+                if (
+                    policy is None
+                    or policy.tenant_id != tenant_id
+                    or policy.workload_id != workload_id
+                ):
+                    # Unknown id and out-of-scope id share one
+                    # indistinguishable 404: existence under another
+                    # tenant or workload is never revealed.
+                    raise HTTPException(status_code=404, detail="policy not found")
+                policy_name = policy.name
+                policy_version = policy.version
+                policy_status = policy.status
+                rule_json = policy.rule_json
+        except HTTPException:
+            raise
+        except Exception:
+            # Fixed message only: exception text might carry protected
+            # material and is never logged or returned.
+            logger.error("policy simulation query failed")
+            raise HTTPException(
+                status_code=500, detail="policy simulation unavailable"
+            )
+
+        # --- pure evaluation against the immutable rule -----------------
+        try:
+            # The persisted rule was validated at creation; re-validating
+            # the immutable text here turns store damage into a 500 rather
+            # than evaluating a malformed tree.
+            rule = validate_rule(json.loads(rule_json))
+            allowed = evaluate_rule(rule, claims)
+            evaluation = explain_rule(rule, claims)
+            # Integrity guards: the explanation must cover the complete
+            # tree in pre-order and its root must reproduce the verdict.
+            # Any disagreement is answered 500 with no partial result,
+            # never an incomplete or inconsistent explanation.
+            if (
+                not evaluation
+                or evaluation[0]["rule_path"] != []
+                or evaluation[0]["outcome"] != allowed
+                or [
+                    (tuple(node["rule_path"]), node["node_type"])
+                    for node in evaluation
+                ]
+                != rule_structure(rule)
+            ):
+                raise HTTPException(
+                    status_code=500, detail="policy simulation unavailable"
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("policy simulation failed")
+            raise HTTPException(
+                status_code=500, detail="policy simulation unavailable"
+            )
+
+        # Compact JSON with a single terminating newline, keys in the
+        # fixed order tenant_id, workload_id, policy_id, policy_name,
+        # policy_version, policy_status, allowed, evaluation. Every value
+        # is a string, integer, boolean or a list of integers — no claims,
+        # matched or compared values, protected material, floats or
+        # non-finite values ever appear.
+        body = (
+            json.dumps(
+                {
+                    "tenant_id": tenant_id,
+                    "workload_id": workload_id,
+                    "policy_id": policy_id,
+                    "policy_name": policy_name,
+                    "policy_version": policy_version,
+                    "policy_status": policy_status,
+                    "allowed": allowed,
+                    "evaluation": evaluation,
                 },
                 separators=(",", ":"),
                 allow_nan=False,
