@@ -5,6 +5,7 @@ claim name or an object path and carry exactly one comparison key::
 
     {"claim": "<top-level claim name>", "equals": <scalar>}
     {"path": ["<segment>", ...], "equals": <scalar>}
+    {"path": ["items", {"wildcard": True}, "id"], "equals": <scalar>}
     {"claim": "...", "in": [<scalar>, ...]}        # 1..32 unique scalars
     {"claim": "...", "contains": <scalar>}          # array has an equal element
     {"claim": "...", "lt"|"lte"|"gt"|"gte": <finite JSON number>}
@@ -13,6 +14,13 @@ claim name or an object path and carry exactly one comparison key::
     {"all": [rule, ...]}
     {"any": [rule, ...]}
     {"not": rule}
+
+A path segment is either a string naming one object field or the exact
+object ``{"wildcard": True}`` (no other keys, and the value must be the
+JSON boolean ``true``). A wildcard segment expands every element of the
+JSON array at that position; several wildcards expand left to right into
+the full set of candidate paths. A leaf is true when any complete
+candidate satisfies its comparison.
 
 Scalars are JSON scalars (string, number, boolean or null). Rules mention
 only claim *names* (or object paths) and expected scalar values — they
@@ -93,22 +101,44 @@ def _is_number(value: Any) -> bool:
     return False
 
 
+def _is_wildcard_segment(segment: Any) -> bool:
+    """True only for the exact wildcard object ``{"wildcard": True}``.
+
+    The object must carry the single key ``wildcard`` whose value is the
+    JSON boolean ``true``: any other key, any other value type (including
+    ``1``) or an empty object is a malformed segment, not a wildcard.
+    """
+    return (
+        isinstance(segment, dict)
+        and len(segment) == 1
+        and segment.get("wildcard") is True
+    )
+
+
 def _validate_path(path: Any) -> None:
     """Validate the ``path`` sibling of a path leaf.
 
     It must be a non-empty list of at most :data:`MAX_PATH_SEGMENTS`
-    segments; each segment is a non-blank string no longer than
-    :data:`MAX_PATH_SEGMENT_LENGTH` characters. A segment names exactly
-    one object field — dots embedded in a segment are literal characters
-    of that single name and never split it.
+    segments; each segment is either a non-blank string no longer than
+    :data:`MAX_PATH_SEGMENT_LENGTH` characters, or the exact wildcard
+    object ``{"wildcard": True}``. A string segment names exactly one
+    object field — dots embedded in a segment are literal characters of
+    that single name and never split it, and the literal string ``"*"``
+    is an ordinary field name. A wildcard segment expands the elements of
+    the JSON array found at that position.
     """
     if not isinstance(path, list) or not path:
         raise InvalidRule("path must be a non-empty list of segments")
     if len(path) > MAX_PATH_SEGMENTS:
         raise InvalidRule(f"path may name at most {MAX_PATH_SEGMENTS} segments")
     for segment in path:
+        if _is_wildcard_segment(segment):
+            continue
         if not isinstance(segment, str) or not segment or not segment.strip():
-            raise InvalidRule("path segments must be non-empty strings")
+            raise InvalidRule(
+                "path segments must be non-empty strings or "
+                '{"wildcard": true} objects'
+            )
         if len(segment) > MAX_PATH_SEGMENT_LENGTH:
             raise InvalidRule(
                 f"path segments may be at most {MAX_PATH_SEGMENT_LENGTH} "
@@ -188,8 +218,9 @@ def validate_rule(rule: Any) -> dict[str, Any]:
     (empty, oversized, non-scalar or repeating), a non-scalar
     ``contains`` target, boolean or non-finite
     ordinal bounds, an ``exists`` value other than ``true``, empty
-    ``all``/``any`` lists, malformed ``path`` siblings, or structures past
-    the defensive size bounds.
+    ``all``/``any`` lists, malformed ``path`` siblings (including an
+    object segment that is not exactly ``{"wildcard": True}``), or
+    structures past the defensive size bounds.
     """
     nodes = 0
 
@@ -241,23 +272,38 @@ def canonical_rule_json(rule: dict[str, Any]) -> str:
     return json.dumps(rule, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-_MISSING = object()
+def _read_path_candidates(claims: Any, segments: list[Any]) -> list[Any]:
+    """Expand a declared path into its complete candidate values.
 
+    String segments descend through one same-named JSON object field and
+    never match array positions (the literal string ``"*"`` is still a
+    field name). A wildcard segment expands only when the current value is
+    a JSON array, producing one candidate per element; several wildcards
+    expand left to right into the Cartesian product of the arrays met.
 
-def _read_path(claims: Any, segments: list[str]) -> Any:
-    """Read a declared path one object field at a time.
-
-    Only JSON object fields are descended through: encountering an array
-    or scalar before the last segment, or a missing field at any level,
-    means the path is absent. Array elements never expand and indexing is
-    not supported.
+    An empty array, a non-array value at a wildcard, a missing object
+    field, or a scalar/array/non-object met while further descent is still
+    required all yield no candidates for that branch. The candidates of a
+    fully walked path may be scalars, nulls, arrays or objects.
     """
-    current = claims
+    candidates: list[Any] = [claims]
     for segment in segments:
-        if not isinstance(current, dict) or segment not in current:
-            return _MISSING
-        current = current[segment]
-    return current
+        if _is_wildcard_segment(segment):
+            candidates = [
+                element
+                for current in candidates
+                if isinstance(current, list)
+                for element in current
+            ]
+        else:
+            candidates = [
+                current[segment]
+                for current in candidates
+                if isinstance(current, dict) and segment in current
+            ]
+        if not candidates:
+            break
+    return candidates
 
 
 def _compare_order(actual: Any, key: str, bound: Any) -> bool:
@@ -291,7 +337,13 @@ def evaluate_rule(rule: dict[str, Any], claims: dict[str, Any]) -> bool:
     a non-array (including a bare scalar) or an empty/non-matching array
     all fail. ``exists`` checks whether the claim key
     or the full object path is readable at all; a ``null`` value there
-    still exists. Compound nodes keep their short-circuit semantics.
+    still exists. A path leaf carrying wildcard segments is true when
+    *any* of its complete candidates satisfies the leaf comparison
+    (``exists`` is true when at least one complete candidate is
+    readable); zero candidates — an empty array, a non-array at a
+    wildcard, a missing intermediate field, or a scalar/non-object where
+    further descent is required — fail the leaf. Compound nodes keep
+    their short-circuit semantics.
     """
     keys = set(rule.keys())
     locators = keys & _LOCATOR_KEYS
@@ -299,32 +351,40 @@ def evaluate_rule(rule: dict[str, Any], claims: dict[str, Any]) -> bool:
         (comparison,) = keys - locators
         if "claim" in locators:
             if isinstance(claims, dict) and rule["claim"] in claims:
-                actual = claims[rule["claim"]]
+                actuals = [claims[rule["claim"]]]
             else:
-                actual = _MISSING
+                actuals = []
         else:
-            actual = _read_path(claims, rule["path"])
+            actuals = _read_path_candidates(claims, rule["path"])
         if comparison == "exists":
-            return actual is not _MISSING
-        if actual is _MISSING:
-            return False
+            return bool(actuals)
         if comparison == "equals":
-            return _scalar_equals(actual, rule["equals"])
+            return any(
+                _scalar_equals(actual, rule["equals"]) for actual in actuals
+            )
         if comparison == "in":
             return any(
-                _scalar_equals(actual, candidate) for candidate in rule["in"]
+                _scalar_equals(actual, candidate)
+                for actual in actuals
+                for candidate in rule["in"]
             )
         if comparison == "contains":
             # Only an actual JSON array can contain the expected scalar;
             # elements that are objects, arrays or otherwise non-scalar
             # simply never compare equal to it.
-            if not isinstance(actual, list):
-                return False
             return any(
-                _scalar_equals(element, rule["contains"]) for element in actual
+                isinstance(actual, list)
+                and any(
+                    _scalar_equals(element, rule["contains"])
+                    for element in actual
+                )
+                for actual in actuals
             )
         if comparison in _ORDER_KEYS:
-            return _compare_order(actual, comparison, rule[comparison])
+            return any(
+                _compare_order(actual, comparison, rule[comparison])
+                for actual in actuals
+            )
         raise InvalidRule(f"unknown comparison: {comparison}")
     (key,) = keys
     if key == "all":
