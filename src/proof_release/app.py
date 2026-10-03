@@ -122,6 +122,7 @@ from proof_release.db import (
     Evidence,
     Policy,
     PolicyCommitCounter,
+    PolicyIdempotencyRecord,
     ProofEventCommitCounter,
     ProofLifecycleEvent,
     RateLimitCounter,
@@ -672,6 +673,70 @@ def _data_envelope_created_body(
             "tenant_id": tenant_id,
             "workload_id": workload_id,
             "key_version": key_version,
+            "created_at": _rfc3339(created_at),
+        },
+        separators=(",", ":"),
+        allow_nan=False,
+        ensure_ascii=False,
+    )
+
+
+def _policy_request_fingerprint(
+    tenant_id: str, workload_id: str, name: str, rule_json: str
+) -> str:
+    """Hash the request identity a keyed policy replay must match.
+
+    Covers exactly the equivalence range fixed by the contract: the
+    scope (tenant, workload), the policy name, and the canonical
+    serialization of the validated rule tree. Rules that normalize to
+    the same canonical JSON (e.g. equivalent ``in`` candidate order is
+    not normalized away, but rule key ordering and whitespace are) hash
+    identically; a different name or a different normalized rule tree
+    hashes differently. Only non-sensitive rule identity (claim names,
+    object paths, comparison operators and expected scalars) is hashed
+    — never evidence, claim values, capabilities, keys or exception
+    text. Canonical JSON with sorted keys makes equivalent requests
+    hash identically.
+    """
+    payload = json.dumps(
+        {
+            "tenant_id": tenant_id,
+            "workload_id": workload_id,
+            "name": name,
+            "rule": rule_json,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _policy_created_body(
+    policy_id: str,
+    tenant_id: str,
+    workload_id: str,
+    name: str,
+    version: int,
+    rule: dict,
+    created_at: datetime,
+) -> str:
+    """Render the exact compact 201 policy body stored for replay.
+
+    This is the wire form persisted verbatim by the first successful
+    idempotency-keyed creation and returned byte-for-byte on every later
+    same-key replay (including the original ``policy_id``, ``version``
+    and ``created_at``), so its serialization must never depend on
+    response-time clock or state. The field order and compact shape
+    match the unkeyed response model exactly.
+    """
+    return json.dumps(
+        {
+            "policy_id": policy_id,
+            "tenant_id": tenant_id,
+            "workload_id": workload_id,
+            "name": name,
+            "version": version,
+            "rule": rule,
             "created_at": _rfc3339(created_at),
         },
         separators=(",", ":"),
@@ -7873,7 +7938,21 @@ def create_app(
         return _identity_json(payload)
 
     @app.post("/v1/policies", status_code=201, response_model=PolicyCreatedResponse)
-    def create_policy(body: CreatePolicyRequest) -> PolicyCreatedResponse:
+    def create_policy(
+        request: Request, body: CreatePolicyRequest
+    ) -> PolicyCreatedResponse | Response:
+        # The idempotency key is optional and lives only in a header; the
+        # body contract is unchanged. A missing key preserves the
+        # original one-new-version-per-valid-request semantics exactly.
+        # An illegal key (duplicated header, empty value, whitespace
+        # padding, control/non-ASCII character, or over-long value) is a
+        # 422 before any state is read or written, so it never creates a
+        # policy, allocates a version or advances a lifecycle sequence.
+        idem_present, idempotency_key = _read_idempotency_key(request)
+
+        if idem_present:
+            return _create_policy_keyed(body, idempotency_key)
+
         policy_id = str(uuid.uuid4())
         now = _utcnow()
         rule_json = canonical_rule_json(body.rule)
@@ -7883,47 +7962,58 @@ def create_app(
         # (scope, name, version) constraint plus this retry loop guarantees
         # no two versions ever share a number and no version is skipped.
         with session_factory() as session:
-            for _ in range(10):
-                highest = session.scalar(
-                    select(func.max(Policy.version)).where(
-                        Policy.tenant_id == body.tenant_id,
-                        Policy.workload_id == body.workload_id,
-                        Policy.name == body.name,
+            try:
+                for _ in range(10):
+                    highest = session.scalar(
+                        select(func.max(Policy.version)).where(
+                            Policy.tenant_id == body.tenant_id,
+                            Policy.workload_id == body.workload_id,
+                            Policy.name == body.name,
+                        )
                     )
-                )
-                version = (highest or 0) + 1
-                # Sequence the creation from the per-scope lifecycle
-                # counter shared with retirement, in the same write
-                # transaction. The read-only lifecycle query bounds a
-                # replayable snapshot by this commit high-water mark,
-                # immune to both later inserts and later in-place
-                # retirements; an IntegrityError below rolls the
-                # allocation back together with the row.
-                commit_seq = _next_policy_commit_seq(
-                    session, body.tenant_id, body.workload_id
-                )
-                session.add(
-                    Policy(
-                        policy_id=policy_id,
-                        tenant_id=body.tenant_id,
-                        workload_id=body.workload_id,
-                        name=body.name,
-                        version=version,
-                        rule_json=rule_json,
-                        created_at=now,
-                        commit_seq=commit_seq,
+                    version = (highest or 0) + 1
+                    # Sequence the creation from the per-scope lifecycle
+                    # counter shared with retirement, in the same write
+                    # transaction. The read-only lifecycle query bounds a
+                    # replayable snapshot by this commit high-water mark,
+                    # immune to both later inserts and later in-place
+                    # retirements; an IntegrityError below rolls the
+                    # allocation back together with the row.
+                    commit_seq = _next_policy_commit_seq(
+                        session, body.tenant_id, body.workload_id
                     )
+                    session.add(
+                        Policy(
+                            policy_id=policy_id,
+                            tenant_id=body.tenant_id,
+                            workload_id=body.workload_id,
+                            name=body.name,
+                            version=version,
+                            rule_json=rule_json,
+                            created_at=now,
+                            commit_seq=commit_seq,
+                        )
+                    )
+                    try:
+                        session.commit()
+                    except IntegrityError:
+                        # A concurrent transaction claimed the same version
+                        # first; re-read the high-water mark and retry.
+                        session.rollback()
+                        continue
+                    break
+                else:
+                    raise HTTPException(
+                        status_code=500, detail="policy write failed"
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                session.rollback()
+                logger.error("policy write failed")
+                raise HTTPException(
+                    status_code=500, detail="policy write failed"
                 )
-                try:
-                    session.commit()
-                except IntegrityError:
-                    # A concurrent transaction claimed the same version
-                    # first; re-read the high-water mark and retry.
-                    session.rollback()
-                    continue
-                break
-            else:
-                raise HTTPException(status_code=500, detail="could not allocate version")
         return PolicyCreatedResponse(
             policy_id=policy_id,
             tenant_id=body.tenant_id,
@@ -7932,6 +8022,161 @@ def create_app(
             version=version,
             rule=body.rule,
             created_at=_rfc3339(now),
+        )
+
+    def _create_policy_keyed(
+        body: CreatePolicyRequest, idempotency_key: str
+    ) -> Response:
+        """Create one policy version under an ``Idempotency-Key``.
+
+        The policy row, its lifecycle commit sequence and the
+        idempotency record are one atomic commit: the lookup-then-insert
+        runs in a single transaction, with the unique (scope, key)
+        constraint plus the IntegrityError reread below settling
+        concurrent submissions so at most one version is ever created
+        per key. Every judgement failure raises out of the context
+        manager (or an explicit rollback), so a failed attempt leaves
+        neither a policy nor a record, consumes no version number or
+        commit sequence, and the key stays free for a recovered retry.
+        """
+        # The rule is already validated by the request model; the
+        # canonical serialization is the existing normalization under
+        # which two requests must carry the same rule tree to count as a
+        # replay.
+        rule_json = canonical_rule_json(body.rule)
+        fingerprint = _policy_request_fingerprint(
+            body.tenant_id, body.workload_id, body.name, rule_json
+        )
+
+        saved_body: str | None = None
+        for _ in range(10):
+            with session_factory() as session:
+                try:
+                    existing = session.scalar(
+                        select(PolicyIdempotencyRecord).where(
+                            PolicyIdempotencyRecord.tenant_id == body.tenant_id,
+                            PolicyIdempotencyRecord.workload_id == body.workload_id,
+                            PolicyIdempotencyRecord.idempotency_key
+                            == idempotency_key,
+                        )
+                    )
+                    if existing is not None:
+                        # A replay never creates a version, never
+                        # recomputes a version number or lifecycle commit
+                        # sequence and never changes the existing policy:
+                        # the stored first 201 is returned verbatim,
+                        # retaining the original policy_id, version and
+                        # created_at. A same-key request whose name or
+                        # normalized rule tree differs is a stable 409
+                        # that changes neither the original policy nor
+                        # this record.
+                        if not hmac.compare_digest(
+                            existing.request_fingerprint, fingerprint
+                        ):
+                            raise HTTPException(
+                                status_code=409,
+                                detail="idempotency key reused with a different request",
+                            )
+                        return Response(
+                            content=existing.response_body.encode("utf-8"),
+                            status_code=201,
+                            media_type="application/json",
+                        )
+
+                    # First keyed request for this scope+key. Allocate
+                    # the next version, its lifecycle sequence, and the
+                    # record together; an IntegrityError on either the
+                    # version or the record rolls all three back and
+                    # rereads below.
+                    now = _utcnow()
+                    policy_id = str(uuid.uuid4())
+                    highest = session.scalar(
+                        select(func.max(Policy.version)).where(
+                            Policy.tenant_id == body.tenant_id,
+                            Policy.workload_id == body.workload_id,
+                            Policy.name == body.name,
+                        )
+                    )
+                    version = (highest or 0) + 1
+                    commit_seq = _next_policy_commit_seq(
+                        session, body.tenant_id, body.workload_id
+                    )
+                    session.add(
+                        Policy(
+                            policy_id=policy_id,
+                            tenant_id=body.tenant_id,
+                            workload_id=body.workload_id,
+                            name=body.name,
+                            version=version,
+                            rule_json=rule_json,
+                            created_at=now,
+                            commit_seq=commit_seq,
+                        )
+                    )
+                    # The exact first 201 body, fixed before commit so
+                    # the stored response and the response returned to
+                    # the winner are byte-for-byte the same, including
+                    # the original policy_id, version and created_at.
+                    saved_body = _policy_created_body(
+                        policy_id,
+                        body.tenant_id,
+                        body.workload_id,
+                        body.name,
+                        version,
+                        body.rule,
+                        now,
+                    )
+                    session.add(
+                        PolicyIdempotencyRecord(
+                            record_id=str(uuid.uuid4()),
+                            tenant_id=body.tenant_id,
+                            workload_id=body.workload_id,
+                            idempotency_key=idempotency_key,
+                            request_fingerprint=fingerprint,
+                            response_body=saved_body,
+                            created_at=now,
+                        )
+                    )
+                    try:
+                        # The policy, the lifecycle sequence and the
+                        # idempotency record commit together: a crash
+                        # can never leave one without the others.
+                        session.commit()
+                    except IntegrityError:
+                        # A concurrent request claimed the same
+                        # (scope, name, version) or committed the same
+                        # (scope, key) first. Reread and settle as a
+                        # replay or a key-reuse conflict on the next
+                        # pass; the rolled-back version allocation and
+                        # commit sequence are not consumed.
+                        session.rollback()
+                        continue
+                    break
+                except HTTPException:
+                    raise
+                except Exception:
+                    # A storage failure during the lookup or insert is a
+                    # server failure: roll back fully, so neither a
+                    # policy version, a lifecycle sequence nor an
+                    # idempotency record is left behind, and the key
+                    # stays free for the same legal request to retry.
+                    session.rollback()
+                    logger.error("policy write failed")
+                    raise HTTPException(
+                        status_code=500, detail="policy write failed"
+                    )
+        else:
+            # Exhausted retries without either a committed insert or a
+            # stored record to replay: a storage-level failure that must
+            # not look like a successful creation.
+            logger.error("policy idempotency race did not settle")
+            raise HTTPException(status_code=500, detail="policy write failed")
+
+        assert saved_body is not None
+        return Response(
+            content=saved_body.encode("utf-8"),
+            status_code=201,
+            media_type="application/json",
         )
 
     @app.post("/v1/policies//retire")
