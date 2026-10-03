@@ -1085,6 +1085,64 @@ class DataEnvelopeCommitCounter(Base):
     last_seq: Mapped[int] = mapped_column(BigInteger)
 
 
+class DataEnvelopeIdempotencyRecord(Base):
+    """The first successful idempotency-keyed creation of one envelope.
+
+    At most one row exists per ``(tenant_id, workload_id,
+    idempotency_key)`` triple; the same key in a different tenant or
+    workload is an independent row and never conflicts. The row is
+    inserted in the *same* transaction as the :class:`DataEnvelope` it
+    records, so a crash can never leave an envelope without its
+    idempotency record or a record pointing at no envelope. A failed
+    creation — a 422/409/500 judgement, a lost insert race, or any
+    rollback — inserts no row, so the key stays free and a later
+    recovery re-judges the request normally.
+
+    Once committed, a same-key same-scope replay of the same normalized
+    request answers with the stored first 201 verbatim: it never
+    re-encrypts, never creates a second envelope, never advances the
+    per-scope directory sequence and never changes a key version. A
+    same-key request whose data_id or payload differs is a stable 409
+    that changes nothing.
+
+    Only the scope, the caller-chosen key, the data_id, the SHA-256
+    digest of the payload, the stored first response body and the
+    creation time are persisted — never the plaintext payload, the
+    plaintext data key, a master key, any ciphertext material or
+    exception text.
+    """
+
+    __tablename__ = "data_envelope_idempotency_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "idempotency_key",
+            name="uq_data_envelope_idempotency_scope_key",
+        ),
+    )
+
+    record_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # Caller-chosen key: 1..64 visible ASCII characters. Unique only
+    # within the (tenant, workload) scope; the same key in another scope
+    # is an independent row and never conflicts.
+    idempotency_key: Mapped[str] = mapped_column(String(64))
+    # The data_id of the envelope created by the first legal keyed
+    # request; part of the request identity a replay must match.
+    data_id: Mapped[str] = mapped_column(String(256))
+    # Hex SHA-256 of the payload bytes; irreversible, used only to
+    # detect a same-key request carrying a different payload, which is
+    # a 409 that changes nothing. The plaintext payload never
+    # participates and is never stored.
+    payload_sha256: Mapped[str] = mapped_column(String(64))
+    # The exact first 201 response body, stored verbatim (compact JSON)
+    # and replayed byte-for-byte on every later same-key replay.
+    response_body: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class ReleaseGrant(Base):
     """A one-time, TTL-bounded capability that releases one data item.
 
