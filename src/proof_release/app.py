@@ -125,6 +125,7 @@ from proof_release.db import (
     ProofLifecycleEvent,
     RateLimitCounter,
     ReleaseGrant,
+    ReleaseGrantConsumeIdempotencyRecord,
     ReleaseGrantEvent,
     RewrapBatch,
     RewrapBatchItem,
@@ -182,9 +183,9 @@ REWRAP_BATCH_MIN_LIMIT = 1
 REWRAP_BATCH_MAX_LIMIT = 200
 
 #: Name of the optional request header carrying an idempotency key on the
-#: asynchronous rewrap job submission. A missing header preserves the
-#: original "one job per request" semantics; a present key must be 1..64
-#: visible ASCII characters and may appear exactly once.
+#: asynchronous rewrap job submission and on release-grant consumption. A
+#: missing header preserves the original semantics; a present key must be
+#: 1..64 visible ASCII characters and may appear exactly once.
 IDEMPOTENCY_KEY_HEADER = "idempotency-key"
 IDEMPOTENCY_KEY_MIN_LENGTH = 1
 IDEMPOTENCY_KEY_MAX_LENGTH = 64
@@ -582,15 +583,15 @@ def _decode_cursor(
 
 
 def _read_idempotency_key(request: Request) -> tuple[bool, str | None]:
-    """Extract the optional ``Idempotency-Key`` header for a job submit.
+    """Extract the optional ``Idempotency-Key`` header for a keyed request.
 
     Returns ``(present, value)``. ``present`` is False when the header is
-    absent entirely (the original one-job-per-request semantics apply and
-    no validation runs). When present, the header must occur exactly once
-    and its value must be 1..64 visible ASCII characters; a duplicated
-    header line, an empty value, surrounding whitespace, a non-ASCII or
-    control character, or an over-long value raises an indistinguishable
-    422 before any state is read or written.
+    absent entirely (the original semantics apply and no validation runs).
+    When present, the header must occur exactly once and its value must be
+    1..64 visible ASCII characters; a duplicated header line, an empty
+    value, surrounding whitespace, a non-ASCII or control character, or an
+    over-long value raises an indistinguishable 422 before any state is
+    read or written.
     """
     raw_values = request.headers.getlist(IDEMPOTENCY_KEY_HEADER)
     if not raw_values:
@@ -598,6 +599,74 @@ def _read_idempotency_key(request: Request) -> tuple[bool, str | None]:
     if len(raw_values) != 1 or not _IDEMPOTENCY_KEY_RE.fullmatch(raw_values[0]):
         raise HTTPException(status_code=422, detail="invalid idempotency key")
     return True, raw_values[0]
+
+
+def _release_grant_consume_fingerprint(
+    grant_id: str, tenant_id: str, workload_id: str, capability_digest: str
+) -> str:
+    """Hash the request shape that must match for a keyed consume replay.
+
+    Covers the normalized grant id, the scope and the SHA-256 digest of
+    the presented capability — never the plaintext capability, which
+    leaves no trace here. Canonical JSON with sorted keys makes
+    equivalent requests hash identically.
+    """
+    payload = json.dumps(
+        {
+            "grant_id": grant_id,
+            "tenant_id": tenant_id,
+            "workload_id": workload_id,
+            "capability_sha256": capability_digest,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _release_grant_consumed_body(
+    grant_id: str, decision_id: str, data_id: str, consumed_at: datetime
+) -> str:
+    """Render the exact compact 200 body of a successful consumption.
+
+    This is the wire form stored verbatim by the first idempotency-keyed
+    consumption and returned byte-for-byte on every later replay, so its
+    formatting must never depend on mutable state. It matches the field
+    order and compact rendering of the response model exactly.
+    """
+    return json.dumps(
+        {
+            "grant_id": grant_id,
+            "decision_id": decision_id,
+            "data_id": data_id,
+            "consumed": True,
+            "consumed_at": _rfc3339(consumed_at),
+        },
+        separators=(",", ":"),
+        allow_nan=False,
+        ensure_ascii=False,
+    )
+
+
+def _keyed_consume_replay(
+    record: ReleaseGrantConsumeIdempotencyRecord, fingerprint: str
+) -> Response:
+    """Answer a keyed consume from its stored record, or conflict.
+
+    A same-key request whose normalized shape differs from the recorded
+    one is a stable 409 that changes nothing; an exact match replays the
+    stored 200 body byte-for-byte without touching grant state, events or
+    audit rows.
+    """
+    if not hmac.compare_digest(record.request_fingerprint, fingerprint):
+        raise HTTPException(
+            status_code=409,
+            detail="idempotency key reused with different request",
+        )
+    return Response(
+        content=record.response_body.encode("utf-8"),
+        media_type="application/json",
+    )
 
 
 def _rewrap_job_request_fingerprint(
@@ -11167,7 +11236,7 @@ def create_app(
         response_model=ReleaseGrantConsumedResponse,
     )
     def consume_release_grant(
-        grant_id: str, body: ConsumeReleaseGrantRequest
+        request: Request, grant_id: str, body: ConsumeReleaseGrantRequest
     ) -> ReleaseGrantConsumedResponse:
         # Grant ids are canonical lowercase UUIDs; a syntactically illegal
         # path identifier is a 422 field error indistinguishable from any
@@ -11175,6 +11244,14 @@ def create_app(
         if not grant_id.strip() or not _UUID_RE.fullmatch(grant_id.lower()):
             raise HTTPException(status_code=422, detail="invalid grant identifier")
         grant_id = grant_id.strip().lower()
+
+        # The idempotency key is optional and lives only in a header; the
+        # body contract is unchanged. A missing key preserves the original
+        # one-shot semantics exactly. An illegal key (duplicated header,
+        # empty, padded, non-visible-ASCII or longer than 64 characters)
+        # is rejected here, before any budget is spent and before any
+        # grant, event or audit state is read or written.
+        idem_present, idempotency_key = _read_idempotency_key(request)
 
         # Basic field/format validation (the request model and the path
         # check above) has passed: reserve one shared per-scope minute slot
@@ -11185,93 +11262,246 @@ def create_app(
             return limited
         digest = _nonce_digest(body.capability)
         now = _utcnow()
-        with session_factory() as session:
-            grant = session.get(ReleaseGrant, grant_id)
-            if (
-                grant is None
-                or grant.tenant_id != body.tenant_id
-                or grant.workload_id != body.workload_id
-            ):
-                raise HTTPException(status_code=404, detail="grant not found")
-            if not hmac.compare_digest(grant.capability_digest, digest):
-                raise HTTPException(status_code=401, detail="invalid capability")
-            # A settled grant can never be consumed: revocation is a
-            # terminal state exactly like consumed, and is judged before
-            # expiry so a grant revoked while pending is reported 409 even
-            # after it has since expired.
-            if grant.status == "consumed":
-                raise HTTPException(status_code=409, detail="grant already consumed")
-            if grant.status == RELEASE_GRANT_STATUS_REVOKED:
-                raise HTTPException(status_code=409, detail="grant already revoked")
-            if grant.expires_at <= now:
-                raise HTTPException(status_code=410, detail="grant expired")
-            # Atomic claim: only one concurrent consumer can flip
-            # pending -> consumed for an unexpired grant. BEGIN IMMEDIATE
-            # (SQLite) / row locks (other backends) plus the guarded UPDATE
-            # guarantee exactly one winner across consume, release and
-            # revoke, across processes and restarts.
-            result = session.execute(
-                update(ReleaseGrant)
-                .where(
-                    ReleaseGrant.grant_id == grant_id,
-                    ReleaseGrant.status == "pending",
-                    ReleaseGrant.expires_at > now,
+        if not idem_present:
+            with session_factory() as session:
+                grant = session.get(ReleaseGrant, grant_id)
+                if (
+                    grant is None
+                    or grant.tenant_id != body.tenant_id
+                    or grant.workload_id != body.workload_id
+                ):
+                    raise HTTPException(status_code=404, detail="grant not found")
+                if not hmac.compare_digest(grant.capability_digest, digest):
+                    raise HTTPException(status_code=401, detail="invalid capability")
+                # A settled grant can never be consumed: revocation is a
+                # terminal state exactly like consumed, and is judged before
+                # expiry so a grant revoked while pending is reported 409 even
+                # after it has since expired.
+                if grant.status == "consumed":
+                    raise HTTPException(status_code=409, detail="grant already consumed")
+                if grant.status == RELEASE_GRANT_STATUS_REVOKED:
+                    raise HTTPException(status_code=409, detail="grant already revoked")
+                if grant.expires_at <= now:
+                    raise HTTPException(status_code=410, detail="grant expired")
+                # Atomic claim: only one concurrent consumer can flip
+                # pending -> consumed for an unexpired grant. BEGIN IMMEDIATE
+                # (SQLite) / row locks (other backends) plus the guarded UPDATE
+                # guarantee exactly one winner across consume, release and
+                # revoke, across processes and restarts.
+                result = session.execute(
+                    update(ReleaseGrant)
+                    .where(
+                        ReleaseGrant.grant_id == grant_id,
+                        ReleaseGrant.status == "pending",
+                        ReleaseGrant.expires_at > now,
+                    )
+                    .values(status="consumed", consumed_at=now)
+                    .execution_options(synchronize_session=False)
                 )
-                .values(status="consumed", consumed_at=now)
-                .execution_options(synchronize_session=False)
-            )
-            if result.rowcount != 1:
-                session.rollback()
-                fresh = session.get(ReleaseGrant, grant_id)
-                if fresh is not None and fresh.status == "consumed":
-                    raise HTTPException(
-                        status_code=409, detail="grant already consumed"
-                    )
-                if fresh is not None and fresh.status == RELEASE_GRANT_STATUS_REVOKED:
-                    # A concurrent revocation won the shared state; the
-                    # loser only observes the terminal revoked status.
-                    raise HTTPException(
-                        status_code=409, detail="grant already revoked"
-                    )
-                raise HTTPException(status_code=410, detail="grant expired")
-            # Exactly one immutable timeline event per committed
-            # settlement: this consume presentation won pending ->
-            # consumed (reason "consume"), in the same transaction as the
-            # guarded status flip and the unchanged compliance audit.
-            _record_release_grant_event(
-                session,
-                tenant_id=grant.tenant_id,
-                workload_id=grant.workload_id,
-                grant_id=grant_id,
-                old_status=RELEASE_GRANT_STATUS_PENDING,
-                new_status=RELEASE_GRANT_STATUS_CONSUMED,
-                reason=RELEASE_GRANT_EVENT_REASON_CONSUME,
-                now=now,
-            )
-            session.add(
-                AuditEvent(
-                    event_id=str(uuid.uuid4()),
+                if result.rowcount != 1:
+                    session.rollback()
+                    fresh = session.get(ReleaseGrant, grant_id)
+                    if fresh is not None and fresh.status == "consumed":
+                        raise HTTPException(
+                            status_code=409, detail="grant already consumed"
+                        )
+                    if fresh is not None and fresh.status == RELEASE_GRANT_STATUS_REVOKED:
+                        # A concurrent revocation won the shared state; the
+                        # loser only observes the terminal revoked status.
+                        raise HTTPException(
+                            status_code=409, detail="grant already revoked"
+                        )
+                    raise HTTPException(status_code=410, detail="grant expired")
+                # Exactly one immutable timeline event per committed
+                # settlement: this consume presentation won pending ->
+                # consumed (reason "consume"), in the same transaction as the
+                # guarded status flip and the unchanged compliance audit.
+                _record_release_grant_event(
+                    session,
                     tenant_id=grant.tenant_id,
                     workload_id=grant.workload_id,
-                    event_type=AUDIT_EVENT_TYPE_GRANT,
                     grant_id=grant_id,
-                    decision_id=grant.decision_id,
-                    data_id=grant.data_id,
-                    status=AUDIT_EVENT_STATUS_CONSUMED,
-                    capability_sha256=grant.capability_digest,
-                    occurred_at=now,
+                    old_status=RELEASE_GRANT_STATUS_PENDING,
+                    new_status=RELEASE_GRANT_STATUS_CONSUMED,
+                    reason=RELEASE_GRANT_EVENT_REASON_CONSUME,
+                    now=now,
                 )
+                session.add(
+                    AuditEvent(
+                        event_id=str(uuid.uuid4()),
+                        tenant_id=grant.tenant_id,
+                        workload_id=grant.workload_id,
+                        event_type=AUDIT_EVENT_TYPE_GRANT,
+                        grant_id=grant_id,
+                        decision_id=grant.decision_id,
+                        data_id=grant.data_id,
+                        status=AUDIT_EVENT_STATUS_CONSUMED,
+                        capability_sha256=grant.capability_digest,
+                        occurred_at=now,
+                    )
+                )
+                session.commit()
+                decision_id = grant.decision_id
+                data_id = grant.data_id
+            return ReleaseGrantConsumedResponse(
+                grant_id=grant_id,
+                decision_id=decision_id,
+                data_id=data_id,
+                consumed=True,
+                consumed_at=_rfc3339(now),
             )
-            session.commit()
-            decision_id = grant.decision_id
-            data_id = grant.data_id
-        return ReleaseGrantConsumedResponse(
-            grant_id=grant_id,
-            decision_id=decision_id,
-            data_id=data_id,
-            consumed=True,
-            consumed_at=_rfc3339(now),
+
+        # Keyed presentation. The idempotency judgement runs after the
+        # budget reservation and before any business judgement: a stored
+        # record answers the request on its own (verbatim 200 replay, or a
+        # stable 409 for a same-key different-shape request) even if the
+        # grant has since expired or changed, and a replay never reads or
+        # rewrites grant state, events or audit rows. The fingerprint
+        # covers only the normalized grant id, the scope and the
+        # capability digest; the plaintext capability is never stored.
+        fingerprint = _release_grant_consume_fingerprint(
+            grant_id, body.tenant_id, body.workload_id, digest
         )
+        # The idempotency record commits in the same transaction as the
+        # pending -> consumed settlement, its timeline event and the
+        # compliance audit row, so a crash can never leave one without the
+        # others. The unique (scope, key) constraint plus the
+        # IntegrityError retry settles concurrent identical presentations:
+        # exactly one migrates the grant and records the event, and every
+        # other reads back the same stored 200.
+        for _ in range(2):
+            with session_factory() as session:
+                existing = session.scalar(
+                    select(ReleaseGrantConsumeIdempotencyRecord).where(
+                        ReleaseGrantConsumeIdempotencyRecord.tenant_id
+                        == body.tenant_id,
+                        ReleaseGrantConsumeIdempotencyRecord.workload_id
+                        == body.workload_id,
+                        ReleaseGrantConsumeIdempotencyRecord.idempotency_key
+                        == idempotency_key,
+                    )
+                )
+                if existing is not None:
+                    return _keyed_consume_replay(existing, fingerprint)
+                grant = session.get(ReleaseGrant, grant_id)
+                # The same judgements, in the same order, as the keyless
+                # path: unknown or out-of-scope grant (404), capability
+                # mismatch (401), settled grant (409), expiry (410). A
+                # failure writes nothing and does not claim the key, so a
+                # corrected later request is judged afresh.
+                if (
+                    grant is None
+                    or grant.tenant_id != body.tenant_id
+                    or grant.workload_id != body.workload_id
+                ):
+                    raise HTTPException(status_code=404, detail="grant not found")
+                if not hmac.compare_digest(grant.capability_digest, digest):
+                    raise HTTPException(status_code=401, detail="invalid capability")
+                if grant.status == "consumed":
+                    raise HTTPException(status_code=409, detail="grant already consumed")
+                if grant.status == RELEASE_GRANT_STATUS_REVOKED:
+                    raise HTTPException(status_code=409, detail="grant already revoked")
+                now = _utcnow()
+                if grant.expires_at <= now:
+                    raise HTTPException(status_code=410, detail="grant expired")
+                # The same atomic claim as the keyless path, shared with
+                # payload release and revocation: exactly one winner flips
+                # pending -> consumed for an unexpired grant.
+                result = session.execute(
+                    update(ReleaseGrant)
+                    .where(
+                        ReleaseGrant.grant_id == grant_id,
+                        ReleaseGrant.status == "pending",
+                        ReleaseGrant.expires_at > now,
+                    )
+                    .values(status="consumed", consumed_at=now)
+                    .execution_options(synchronize_session=False)
+                )
+                if result.rowcount != 1:
+                    session.rollback()
+                    # A concurrent keyed presentation of this very request
+                    # may have committed the settlement and its record;
+                    # answer from it exactly like an after-the-fact replay.
+                    existing = session.scalar(
+                        select(ReleaseGrantConsumeIdempotencyRecord).where(
+                            ReleaseGrantConsumeIdempotencyRecord.tenant_id
+                            == body.tenant_id,
+                            ReleaseGrantConsumeIdempotencyRecord.workload_id
+                            == body.workload_id,
+                            ReleaseGrantConsumeIdempotencyRecord.idempotency_key
+                            == idempotency_key,
+                        )
+                    )
+                    if existing is not None:
+                        return _keyed_consume_replay(existing, fingerprint)
+                    fresh = session.get(ReleaseGrant, grant_id)
+                    if fresh is not None and fresh.status == "consumed":
+                        raise HTTPException(
+                            status_code=409, detail="grant already consumed"
+                        )
+                    if fresh is not None and fresh.status == RELEASE_GRANT_STATUS_REVOKED:
+                        raise HTTPException(
+                            status_code=409, detail="grant already revoked"
+                        )
+                    raise HTTPException(status_code=410, detail="grant expired")
+                response_body = _release_grant_consumed_body(
+                    grant_id, grant.decision_id, grant.data_id, now
+                )
+                # The settlement, its timeline event, the compliance audit
+                # row and the idempotency record are one atomic commit.
+                _record_release_grant_event(
+                    session,
+                    tenant_id=grant.tenant_id,
+                    workload_id=grant.workload_id,
+                    grant_id=grant_id,
+                    old_status=RELEASE_GRANT_STATUS_PENDING,
+                    new_status=RELEASE_GRANT_STATUS_CONSUMED,
+                    reason=RELEASE_GRANT_EVENT_REASON_CONSUME,
+                    now=now,
+                )
+                session.add(
+                    AuditEvent(
+                        event_id=str(uuid.uuid4()),
+                        tenant_id=grant.tenant_id,
+                        workload_id=grant.workload_id,
+                        event_type=AUDIT_EVENT_TYPE_GRANT,
+                        grant_id=grant_id,
+                        decision_id=grant.decision_id,
+                        data_id=grant.data_id,
+                        status=AUDIT_EVENT_STATUS_CONSUMED,
+                        capability_sha256=grant.capability_digest,
+                        occurred_at=now,
+                    )
+                )
+                session.add(
+                    ReleaseGrantConsumeIdempotencyRecord(
+                        record_id=str(uuid.uuid4()),
+                        tenant_id=body.tenant_id,
+                        workload_id=body.workload_id,
+                        idempotency_key=idempotency_key,
+                        grant_id=grant_id,
+                        request_fingerprint=fingerprint,
+                        response_body=response_body,
+                        created_at=now,
+                    )
+                )
+                try:
+                    session.commit()
+                except IntegrityError:
+                    # A concurrent same-key request committed its record
+                    # first; this transaction rolled the settlement back,
+                    # so the grant, its events and the audit are untouched.
+                    # Reread the winner's record and answer as a replay or
+                    # a conflict.
+                    session.rollback()
+                    continue
+                return Response(
+                    content=response_body.encode("utf-8"),
+                    media_type="application/json",
+                )
+        else:  # pragma: no cover - defensive: the reread always settles
+            logger.error("release grant consume idempotency race did not settle")
+            raise HTTPException(status_code=500, detail="release grant unavailable")
 
     @app.post("/v1/release-grants//revoke")
     def revoke_release_grant_identifier_required() -> Response:
