@@ -114,6 +114,7 @@ from proof_release.db import (
     Challenge,
     ChallengeIssuanceCounter,
     DataEnvelope,
+    DataEnvelopeCommitCounter,
     Decision,
     DecisionCommitCounter,
     DecisionEvaluationNode,
@@ -420,6 +421,24 @@ def _next_trust_root_commit_seq(session, tenant_id: str, workload_id: str) -> in
     """
     return _next_scoped_commit_seq(
         session, tenant_id, workload_id, TrustRootCommitCounter
+    )
+
+
+def _next_data_envelope_commit_seq(
+    session, tenant_id: str, workload_id: str
+) -> int:
+    """Allocate the next per-scope data-envelope creation sequence.
+
+    Only envelope creation draws from this counter and it does so inside
+    the envelope's own write transaction, so the counter's last value is
+    the scope's creation high-water mark: the read-only directory fixes
+    its replayable snapshot at that value, isolating a replayed page from
+    envelopes created after the walk began. A rewrap allocates no sequence
+    (it rotates material in place), so it can never move a directory
+    boundary or change a fixed page's membership.
+    """
+    return _next_scoped_commit_seq(
+        session, tenant_id, workload_id, DataEnvelopeCommitCounter
     )
 
 
@@ -2103,6 +2122,149 @@ def _decode_trust_root_cursor(
     return boundary_at, boundary_root, snapshot_seq
 
 
+def _data_envelope_directory_cursor_payload(
+    tenant_id: str,
+    workload_id: str,
+    boundary: str,
+    *,
+    data_id: str,
+    created_after: str,
+    created_before: str,
+    snapshot_seq: int,
+) -> bytes:
+    """Canonical byte payload authenticated inside a directory cursor.
+
+    The cursor marks an exclusive ``data_id`` position and every active
+    filter plus the fixed replayable snapshot are part of the signed
+    payload, so a cursor minted for one filter set or snapshot cannot be
+    replayed against another. The snapshot membership cutoff is the
+    per-scope data-envelope creation ``commit_seq`` high-water mark (``q``)
+    established by the first query. The kind tag distinguishes these
+    cursors from every other cursor family even though all share the same
+    HMAC secret.
+    """
+    return json.dumps(
+        {
+            "k": _DATA_ENVELOPE_DIRECTORY_CURSOR_KIND,
+            "t": tenant_id,
+            "w": workload_id,
+            "d": boundary,
+            "di": data_id,
+            "a": created_after,
+            "b": created_before,
+            "q": snapshot_seq,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _encode_data_envelope_directory_cursor(
+    tenant_id: str,
+    workload_id: str,
+    boundary: str,
+    *,
+    data_id: str,
+    created_after: str,
+    created_before: str,
+    snapshot_seq: int,
+) -> str:
+    """Build an opaque, scope/filter/snapshot-bound exclusive data_id cursor."""
+    payload = _data_envelope_directory_cursor_payload(
+        tenant_id,
+        workload_id,
+        boundary,
+        data_id=data_id,
+        created_after=created_after,
+        created_before=created_before,
+        snapshot_seq=snapshot_seq,
+    )
+    mac = hmac.new(_cursor_secret(), payload, hashlib.sha256).digest()
+    return b64url_encode(payload + mac)
+
+
+def _decode_data_envelope_directory_cursor(
+    token: str,
+    tenant_id: str,
+    workload_id: str,
+    *,
+    data_id: str,
+    created_after: str,
+    created_before: str,
+) -> tuple[str, int] | None:
+    """Validate a directory cursor and return its exclusive data_id boundary.
+
+    Returns ``(data_id, snapshot_seq)`` on success or ``None`` for a
+    malformed/forged token, a cursor of any other family (rewrap batch,
+    release-grant audit, compliance audit events, proof-lifecycle events,
+    decisions, revocations, trust roots, policies, grant event timelines or
+    rewrap job listings), or one minted for any other scope, filter
+    combination or snapshot. The beginning marker (``""``) never reaches
+    this function.
+    """
+    if not _CURSOR_RE.fullmatch(token):
+        return None
+    try:
+        raw = b64url_decode(token)
+    except ValueError:
+        return None
+    # The MAC is a fixed 32-byte suffix; the JSON payload precedes it.
+    if len(raw) <= 32:
+        return None
+    payload, mac = raw[:-32], raw[-32:]
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    if decoded.get("k") != _DATA_ENVELOPE_DIRECTORY_CURSOR_KIND:
+        return None
+    boundary = decoded.get("d")
+    if not isinstance(boundary, str) or boundary == "":
+        # A resume cursor always names the last returned data_id; an empty
+        # boundary is only valid as the implicit start, which is not encoded.
+        return None
+    # The creation-order membership cutoff carried by a resume cursor. A
+    # resume cursor exists only after a non-empty page, so it always names
+    # the positive per-scope creation sequence high-water mark established
+    # by the first query (bools are rejected as ints).
+    snapshot_seq = decoded.get("q")
+    if not isinstance(snapshot_seq, int) or isinstance(snapshot_seq, bool):
+        return None
+    if snapshot_seq < 1:
+        return None
+    expected_mac = hmac.new(
+        _cursor_secret(),
+        _data_envelope_directory_cursor_payload(
+            tenant_id,
+            workload_id,
+            boundary,
+            data_id=data_id,
+            created_after=created_after,
+            created_before=created_before,
+            snapshot_seq=snapshot_seq,
+        ),
+        hashlib.sha256,
+    ).digest()
+    if not hmac.compare_digest(mac, expected_mac):
+        return None
+    # Defense in depth: the MAC already covers every field, but confirm
+    # the scope and each active filter explicitly.
+    if not hmac.compare_digest(str(decoded.get("t", "")), tenant_id):
+        return None
+    if not hmac.compare_digest(str(decoded.get("w", "")), workload_id):
+        return None
+    for key, expected in (
+        ("di", data_id),
+        ("a", created_after),
+        ("b", created_before),
+    ):
+        if not hmac.compare_digest(str(decoded.get(key, "")), expected):
+            return None
+    return boundary, snapshot_seq
+
+
 def _policy_cursor_payload(
     tenant_id: str,
     workload_id: str,
@@ -2377,6 +2539,19 @@ RELEASE_GRANT_EVENT_PAGE_SIZE = 100
 #: or rewrap job listings — all authenticated with the same secret) can
 #: never be replayed against a grant's event timeline, and vice versa.
 _RELEASE_GRANT_EVENT_CURSOR_KIND = "release-grant-events-v1"
+
+#: Fixed page size for the read-only data-envelope directory listing. As
+#: with the other read-only listings, the page size is an internal constant
+#: and never part of the request or response contract.
+DATA_ENVELOPE_DIRECTORY_PAGE_SIZE = 100
+
+#: Discriminator embedded in data-envelope directory cursors so a cursor
+#: from any other family (rewrap batch, release-grant audit, compliance
+#: audit events, proof-lifecycle events, decisions, revocations, trust
+#: roots, policies, grant event timelines or rewrap job listings — all
+#: authenticated with the same secret) can never be replayed against the
+#: directory, and vice versa.
+_DATA_ENVELOPE_DIRECTORY_CURSOR_KIND = "data-envelopes-directory-v1"
 
 
 class CreateChallengeRequest(BaseModel):
@@ -2928,6 +3103,10 @@ def _migrate_additive(engine) -> None:
         # The policy lifecycle query gained the analogous per-scope
         # sequence shared by version creation and retirement.
         _migrate_policy_commit_sequence(engine)
+        # The read-only data-envelope directory gained the per-scope
+        # creation commit-order marker after envelope creation first
+        # shipped; upgrade it dialect-neutrally.
+        _migrate_data_envelope_commit_sequence(engine)
         return
     additions = {
         "evidence": (
@@ -2984,6 +3163,13 @@ def _migrate_additive(engine) -> None:
             # rowid (commit) order.
             ("tenant_id", "VARCHAR(256)"),
             ("workload_id", "VARCHAR(256)"),
+            ("commit_seq", "BIGINT"),
+        ),
+        "data_envelopes": (
+            # The read-only envelope directory fixes its replayable
+            # snapshot by a per-scope creation commit-order marker;
+            # pre-existing rows are backfilled below in rowid (commit)
+            # order so their snapshot order is preserved.
             ("commit_seq", "BIGINT"),
         ),
     }
@@ -3061,6 +3247,128 @@ def _migrate_additive(engine) -> None:
     # The policy lifecycle query gained the analogous per-scope sequence
     # shared by version creation and the terminal retirement.
     _migrate_policy_commit_sequence(engine)
+    # The read-only data-envelope directory gained the per-scope creation
+    # sequence; legacy databases (the column is added above on SQLite) are
+    # completed identically on every backend.
+    _migrate_data_envelope_commit_sequence(engine)
+
+
+def _migrate_data_envelope_commit_sequence(engine) -> None:
+    """Bring a deployment written before the envelope sequence up to date.
+
+    The read-only data-envelope directory fixes its replayable snapshot
+    through a per-scope, gap-free, strictly increasing creation sequence
+    drawn from one counter by envelope creation (and by nothing else:
+    rewraps rotate material in place). The original data-envelopes table
+    carried no such marker, so databases written by older deployments are
+    upgraded on open on every backend:
+
+    * the nullable ``commit_seq`` column is added when missing (SQLite's
+      ALTER comes from the additive table map; locking backends get it
+      here);
+    * legacy rows are numbered per scope client-side in the directory's
+      listing order — ``data_id`` ascending, which is the directory's
+      stable key — so each scope gets a gap-free 1..N run;
+    * each scope's :class:`DataEnvelopeCommitCounter` is seeded at the
+      backfilled maximum N (only when absent) so the next creation
+      allocates N+1 rather than colliding;
+    * the unique ``(tenant_id, workload_id, commit_seq)`` index is
+      (re)created checkfirst.
+
+    No snapshot spanning the upgrade could ever have existed (no directory
+    cursors predate this change), so the exact numbering of legacy rows is
+    immaterial: every legacy envelope committed before the upgrade and
+    lies inside every fresh first query. The upgrade changes no business
+    field, response shape or secret-handling rule; a current-metadata
+    database short-circuits.
+    """
+    is_sqlite = engine.dialect.name == "sqlite"
+    envelopes_tbl = DataEnvelope.__table__
+    counters_tbl = DataEnvelopeCommitCounter.__table__
+
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        if envelopes_tbl.name not in inspector.get_table_names():
+            return
+        column_names = {
+            col["name"] for col in inspector.get_columns(envelopes_tbl.name)
+        }
+        if not is_sqlite:
+            if "commit_seq" not in column_names:
+                conn.execute(
+                    text(
+                        f"ALTER TABLE {envelopes_tbl.name} "
+                        "ADD COLUMN commit_seq BIGINT NULL"
+                    )
+                )
+
+        # Number legacy rows in Python, identically on every backend, in
+        # the directory's own stable listing order. Rows that already carry
+        # a sequence (an upgrade partially applied or a current-metadata
+        # database) are left untouched.
+        legacy_scopes = conn.execute(
+            select(
+                envelopes_tbl.c.tenant_id,
+                envelopes_tbl.c.workload_id,
+            )
+            .where(envelopes_tbl.c.commit_seq.is_(None))
+            .group_by(envelopes_tbl.c.tenant_id, envelopes_tbl.c.workload_id)
+        ).fetchall()
+
+        per_scope_max: dict[tuple[str, str], int] = {}
+        for tenant_id, workload_id in legacy_scopes:
+            ordered = conn.execute(
+                select(envelopes_tbl.c.data_id)
+                .where(
+                    envelopes_tbl.c.tenant_id == tenant_id,
+                    envelopes_tbl.c.workload_id == workload_id,
+                    envelopes_tbl.c.commit_seq.is_(None),
+                )
+                .order_by(envelopes_tbl.c.data_id)
+            ).fetchall()
+            for seq, (data_id,) in enumerate(ordered, start=1):
+                conn.execute(
+                    envelopes_tbl.update()
+                    .where(
+                        envelopes_tbl.c.tenant_id == tenant_id,
+                        envelopes_tbl.c.workload_id == workload_id,
+                        envelopes_tbl.c.data_id == data_id,
+                        envelopes_tbl.c.commit_seq.is_(None),
+                    )
+                    .values(commit_seq=seq)
+                )
+            per_scope_max[(tenant_id, workload_id)] = len(ordered)
+
+        # Seed a per-scope counter at the backfilled maximum, never
+        # overwriting a counter already present.
+        for (tenant_id, workload_id), last_seq in per_scope_max.items():
+            existing = conn.execute(
+                select(func.count())
+                .select_from(counters_tbl)
+                .where(
+                    counters_tbl.c.tenant_id == tenant_id,
+                    counters_tbl.c.workload_id == workload_id,
+                )
+            ).scalar()
+            if not existing:
+                conn.execute(
+                    counters_tbl.insert().values(
+                        tenant_id=tenant_id,
+                        workload_id=workload_id,
+                        last_seq=last_seq,
+                    )
+                )
+
+        # (Re)create the model-declared unique ordering index checkfirst.
+        index_names = {
+            idx["name"] for idx in inspector.get_indexes(envelopes_tbl.name)
+        }
+        index_name = "ix_data_envelopes_scope_commit_seq"
+        if index_name not in index_names:
+            model_index = next(
+                idx for idx in envelopes_tbl.indexes if idx.name == index_name
+            )
+            model_index.create(conn, checkfirst=True)
 
 
 def _migrate_proof_event_commit_sequence(engine) -> None:
@@ -11193,6 +11501,277 @@ def create_app(
         )
         return Response(content=body_bytes, media_type="application/json")
 
+    @app.get("/v1/data-envelopes")
+    def list_data_envelopes(
+        request: Request,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        data_id: str | None = Query(default=None),
+        created_after: str | None = Query(default=None),
+        created_before: str | None = Query(default=None),
+        cursor: str | None = Query(default=None),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return a read-only, cursor-stable directory page of envelopes.
+
+        The range is fixed by the mandatory tenant and workload and may be
+        narrowed by one explicit data identifier and an inclusive
+        creation-time window. Ordering is ``data_id`` ascending with an
+        exclusive keyset cursor; the cursor carries its own kind tag, is
+        HMAC-authenticated and is bound to the scope, every active filter
+        *and* the fixed snapshot established by the range's first
+        (cursor-less or explicit empty-cursor) query, so it can be neither
+        forged nor replayed against a different scope, filter set, snapshot
+        or query family.
+
+        The snapshot is fixed at the scope's envelope-creation commit
+        boundary: only creation advances the per-scope counter, so an
+        envelope created after the walk began lies beyond the high-water
+        mark and can never enter its fixed member set, while a fresh first
+        query sees every committed envelope. A concurrent rewrap rotates
+        material in place (allocating no sequence): it changes neither the
+        data_id order nor page membership, and each page reads only the
+        committed current ``key_version``.
+
+        The handler issues only SELECTs over metadata columns: it never
+        unwraps, decrypts, re-wraps or otherwise touches ciphertext
+        material, writes no audit row, advances no rewrap and consumes no
+        rate-limit budget. A storage failure aborts the whole request with
+        a 500 rather than returning a half page. Each directory entry
+        contains only identifiers, the key version and the creation time —
+        never ciphertext, IV, tag, wrapped key, payload, any key or
+        exception detail.
+        """
+        # --- request shape (all 422, no state is read) ------------------
+        allowed_params = {
+            "tenant_id",
+            "workload_id",
+            "data_id",
+            "created_after",
+            "created_before",
+            "cursor",
+        }
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+        # Each parameter is a single scalar string; a repeated parameter
+        # (even of an allowed name) is rejected rather than silently
+        # treated as last-wins.
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(
+                status_code=422, detail="query parameter must appear once"
+            )
+
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        # data_id is a caller-chosen identifier: any non-blank string is a
+        # legal format; existence in the scope is checked below.
+        data_filter: str | None = None
+        if data_id is not None:
+            if not data_id.strip():
+                raise HTTPException(
+                    status_code=422, detail="filter must be a non-empty string"
+                )
+            data_filter = data_id
+
+        # Timestamp filters: absent means unbounded; an explicit empty or
+        # whitespace value is an illegal format (422), not "unbounded".
+        # Only explicit-UTC RFC3339 spellings (trailing Z or +00:00) are
+        # accepted, and bounds are normalized into the cursor spelling so
+        # equivalent UTC forms cannot mint two cursor domains.
+        def _time_bound(value: str | None, name: str) -> tuple[str, datetime | None]:
+            if value is None:
+                return "", None
+            if not value.strip():
+                raise HTTPException(
+                    status_code=422, detail=f"{name} must be UTC RFC3339"
+                )
+            try:
+                parsed = _parse_utc_rfc3339(value)
+            except ValueError:
+                raise HTTPException(
+                    status_code=422, detail=f"{name} must be UTC RFC3339"
+                )
+            return _rfc3339(parsed), parsed
+
+        after_raw, after_dt = _time_bound(created_after, "created_after")
+        before_raw, before_dt = _time_bound(created_before, "created_before")
+        # The window is closed on both ends; equality is a valid
+        # single-instant window and the start must not follow the end.
+        if after_dt is not None and before_dt is not None and after_dt > before_dt:
+            raise HTTPException(
+                status_code=422,
+                detail="created_after must not be later than created_before",
+            )
+
+        # Omitted cursor or an explicit empty string starts before the
+        # smallest data_id and fixes the range's replayable snapshot.
+        # Whitespace, malformed, forged, tampered, cross-scope,
+        # cross-filter, cross-snapshot or foreign-kind cursors are
+        # indistinguishable 422s — all rejected before any state is read.
+        boundary: str | None = None
+        snapshot_seq: int | None = None
+        if cursor is not None and cursor != "":
+            if not cursor.strip() or not _CURSOR_RE.fullmatch(cursor):
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            decoded = _decode_data_envelope_directory_cursor(
+                cursor,
+                tenant_id,
+                workload_id,
+                data_id=data_filter or "",
+                created_after=after_raw,
+                created_before=before_raw,
+            )
+            if decoded is None:
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            boundary, snapshot_seq = decoded
+
+        # --- read-only metadata scan ------------------------------------
+        rows: list = []
+        try:
+            with session_factory() as session:
+                # An explicitly named data identifier must identify an
+                # envelope in exactly this tenant and workload; an unknown
+                # or cross-scope identifier is an indistinguishable 404 (an
+                # explicit resource selector, not a mere range bound). Any
+                # other filter combination that simply matches nothing
+                # returns an empty range below.
+                if data_filter is not None:
+                    # Existence probe over a metadata column only: the
+                    # directory never loads ciphertext, IV, tag or wrapped
+                    # key material, even into process memory.
+                    named = session.scalar(
+                        select(DataEnvelope.data_id)
+                        .where(
+                            DataEnvelope.tenant_id == tenant_id,
+                            DataEnvelope.workload_id == workload_id,
+                            DataEnvelope.data_id == data_filter,
+                        )
+                        .limit(1)
+                    )
+                    if named is None:
+                        raise HTTPException(
+                            status_code=404, detail="data envelope not found"
+                        )
+
+                if snapshot_seq is None:
+                    # First query of the range: fix a replayable snapshot
+                    # at the scope's current envelope-creation commit
+                    # high-water mark. Only creations advance this counter,
+                    # so an envelope created afterwards takes a greater
+                    # sequence and lies beyond the mark, never entering a
+                    # later page of this walk; rewraps allocate no sequence
+                    # and leave membership untouched.
+                    fixed_seq = session.scalar(
+                        select(DataEnvelopeCommitCounter.last_seq).where(
+                            DataEnvelopeCommitCounter.tenant_id == tenant_id,
+                            DataEnvelopeCommitCounter.workload_id == workload_id,
+                        )
+                    )
+                    # No committed envelope in the scope yet.
+                    snapshot_seq = int(fixed_seq) if fixed_seq is not None else 0
+
+                if snapshot_seq > 0:
+                    # Select only the five directory metadata columns: the
+                    # material columns never enter this read path at all.
+                    stmt = select(
+                        DataEnvelope.data_id,
+                        DataEnvelope.tenant_id,
+                        DataEnvelope.workload_id,
+                        DataEnvelope.key_version,
+                        DataEnvelope.created_at,
+                    ).where(
+                        DataEnvelope.tenant_id == tenant_id,
+                        DataEnvelope.workload_id == workload_id,
+                        # Membership: envelopes whose creation had committed
+                        # by the snapshot. Envelopes are never deleted, so
+                        # the immutable creation sequence alone bounds it.
+                        DataEnvelope.commit_seq <= snapshot_seq,
+                    )
+                    if data_filter is not None:
+                        stmt = stmt.where(DataEnvelope.data_id == data_filter)
+                    if after_dt is not None:
+                        stmt = stmt.where(DataEnvelope.created_at >= after_dt)
+                    if before_dt is not None:
+                        stmt = stmt.where(DataEnvelope.created_at <= before_dt)
+                    if boundary is not None:
+                        # Exclusive data_id keyset; data_id is immutable, so
+                        # the boundary walks the fixed snapshot set in
+                        # stable order.
+                        stmt = stmt.where(DataEnvelope.data_id > boundary)
+                    stmt = stmt.order_by(DataEnvelope.data_id.asc()).limit(
+                        DATA_ENVELOPE_DIRECTORY_PAGE_SIZE + 1
+                    )
+                    # One extra row is the "more follows" probe. The scan
+                    # is a single read-only statement over metadata
+                    # columns, so a storage failure aborts the whole
+                    # request with a 500 rather than returning a half page.
+                    rows = list(session.execute(stmt).all())
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("data envelope directory query failed")
+            raise HTTPException(
+                status_code=500, detail="data envelope directory unavailable"
+            )
+
+        has_more = len(rows) > DATA_ENVELOPE_DIRECTORY_PAGE_SIZE
+        page = rows[:DATA_ENVELOPE_DIRECTORY_PAGE_SIZE]
+
+        envelopes = [
+            {
+                # Metadata only: no ciphertext, IV, tag, wrapped key or
+                # payload is ever selected into a response entry.
+                "data_id": data_id,
+                "tenant_id": row_tenant_id,
+                "workload_id": row_workload_id,
+                # The committed current key version: rewraps update this in
+                # place without moving the row's order or membership.
+                "key_version": key_version,
+                "created_at": _rfc3339(created_at),
+            }
+            for data_id, row_tenant_id, row_workload_id, key_version, created_at in page
+        ]
+
+        if has_more:
+            next_cursor = _encode_data_envelope_directory_cursor(
+                tenant_id,
+                workload_id,
+                page[-1][0],
+                data_id=data_filter or "",
+                created_after=after_raw,
+                created_before=before_raw,
+                snapshot_seq=snapshot_seq,
+            )
+            complete = False
+        else:
+            next_cursor = ""
+            complete = True
+
+        # Compact container (envelopes, next_cursor, complete) with a
+        # single terminating newline. Every entry value is a JSON string or
+        # an int key version and complete is a boolean, so no floats, -0.0
+        # or non-finite values can appear. No envelope material, payload,
+        # data key, master key, proof or exception text is ever included.
+        body = (
+            json.dumps(
+                {
+                    "envelopes": envelopes,
+                    "next_cursor": next_cursor,
+                    "complete": complete,
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
+
     @app.post(
         "/v1/data-envelopes",
         status_code=201,
@@ -11236,6 +11815,15 @@ def create_app(
                 raise HTTPException(status_code=500, detail="encryption failed")
 
             now = _utcnow()
+            # Sequence the creation inside its own write transaction. Only
+            # creations advance this counter (a rewrap rotates material in
+            # place and allocates nothing), so the read-only directory can
+            # bound a replayable snapshot by a creation high-water mark
+            # immune to later inserts. A rolled-back creation returns the
+            # allocation as well.
+            commit_seq = _next_data_envelope_commit_seq(
+                session, body.tenant_id, body.workload_id
+            )
             envelope = DataEnvelope(
                 tenant_id=body.tenant_id,
                 workload_id=body.workload_id,
@@ -11246,6 +11834,7 @@ def create_app(
                 tag=sealed.tag,
                 wrapped_key=sealed.wrapped_key,
                 created_at=now,
+                commit_seq=commit_seq,
             )
             session.add(envelope)
             try:
