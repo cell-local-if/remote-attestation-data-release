@@ -6,9 +6,10 @@ claim name or an object path and carry exactly one comparison key::
     {"claim": "<top-level claim name>", "equals": <scalar>}
     {"path": ["<segment>", ...], "equals": <scalar>}
     {"claim": "...", "in": [<scalar>, ...]}        # 1..32 unique scalars
+    {"claim": "...", "contains": <scalar>}          # array has an equal element
     {"claim": "...", "lt"|"lte"|"gt"|"gte": <finite JSON number>}
     {"claim": "...", "exists": true}
-    {"path": [...], "in"|"lt"|"lte"|"gt"|"gte"|"exists": ...}
+    {"path": [...], "in"|"contains"|"lt"|"lte"|"gt"|"gte"|"exists": ...}
     {"all": [rule, ...]}
     {"any": [rule, ...]}
     {"not": rule}
@@ -56,7 +57,9 @@ MAX_IN_ITEMS = 32
 
 #: The comparison keys a leaf may carry exactly one of, next to its
 #: ``claim``/``path`` locator.
-_COMPARISON_KEYS = frozenset({"equals", "in", "lt", "lte", "gt", "gte", "exists"})
+_COMPARISON_KEYS = frozenset(
+    {"equals", "in", "contains", "lt", "lte", "gt", "gte", "exists"}
+)
 
 #: Comparison keys that order the actual value against one JSON number.
 _ORDER_KEYS = frozenset({"lt", "lte", "gt", "gte"})
@@ -144,6 +147,12 @@ def _validate_comparison(key: str, value: Any) -> None:
         if not _is_scalar(value):
             raise InvalidRule("equals must compare against a scalar")
         return
+    if key == "contains":
+        # Only a scalar may be sought in an array: the membership test is
+        # the same type-strict scalar equality ``equals`` applies.
+        if not _is_scalar(value):
+            raise InvalidRule("contains must compare against a scalar")
+        return
     if key == "in":
         if not isinstance(value, list) or not value:
             raise InvalidRule("in must be a non-empty list of scalars")
@@ -176,7 +185,8 @@ def validate_rule(rule: Any) -> dict[str, Any]:
     Raises :class:`InvalidRule` for anything that is not exactly one of the
     documented forms: unknown node keys, multiple/unknown keys on a node,
     missing siblings, non-scalar comparisons, malformed ``in`` sets
-    (empty, oversized, non-scalar or repeating), boolean or non-finite
+    (empty, oversized, non-scalar or repeating), a non-scalar
+    ``contains`` target, boolean or non-finite
     ordinal bounds, an ``exists`` value other than ``true``, empty
     ``all``/``any`` lists, malformed ``path`` siblings, or structures past
     the defensive size bounds.
@@ -275,7 +285,11 @@ def evaluate_rule(rule: dict[str, Any], claims: dict[str, Any]) -> bool:
     encountered while descending a path block further descent. Set,
     equality and ordering comparisons all require the actual value and the
     target to be the same scalar type — booleans are not numbers and
-    ``null`` only equals ``null``. ``exists`` checks whether the claim key
+    ``null`` only equals ``null``. ``contains`` requires the located value
+    itself to be a JSON array holding at least one element equal to the
+    expected scalar under that same type-strict equality; a missing value,
+    a non-array (including a bare scalar) or an empty/non-matching array
+    all fail. ``exists`` checks whether the claim key
     or the full object path is readable at all; a ``null`` value there
     still exists. Compound nodes keep their short-circuit semantics.
     """
@@ -299,6 +313,15 @@ def evaluate_rule(rule: dict[str, Any], claims: dict[str, Any]) -> bool:
         if comparison == "in":
             return any(
                 _scalar_equals(actual, candidate) for candidate in rule["in"]
+            )
+        if comparison == "contains":
+            # Only an actual JSON array can contain the expected scalar;
+            # elements that are objects, arrays or otherwise non-scalar
+            # simply never compare equal to it.
+            if not isinstance(actual, list):
+                return False
+            return any(
+                _scalar_equals(element, rule["contains"]) for element in actual
             )
         if comparison in _ORDER_KEYS:
             return _compare_order(actual, comparison, rule[comparison])
