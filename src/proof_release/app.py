@@ -115,6 +115,7 @@ from proof_release.db import (
     ChallengeIssuanceCounter,
     DataEnvelope,
     DataEnvelopeCommitCounter,
+    DataEnvelopeIdempotencyRecord,
     Decision,
     DecisionCommitCounter,
     DecisionEvaluationNode,
@@ -182,10 +183,11 @@ REWRAP_BATCH_DEFAULT_LIMIT = 50
 REWRAP_BATCH_MIN_LIMIT = 1
 REWRAP_BATCH_MAX_LIMIT = 200
 
-#: Name of the optional request header carrying an idempotency key on the
-#: asynchronous rewrap job submission. A missing header preserves the
-#: original "one job per request" semantics; a present key must be 1..64
-#: visible ASCII characters and may appear exactly once.
+#: Name of the optional request header carrying an idempotency key on
+#: data-envelope creation and asynchronous rewrap job submission. A
+#: missing header preserves the original one-write-per-request semantics;
+#: a present key must be 1..64 visible ASCII characters and may appear
+#: exactly once.
 IDEMPOTENCY_KEY_HEADER = "idempotency-key"
 IDEMPOTENCY_KEY_MIN_LENGTH = 1
 IDEMPOTENCY_KEY_MAX_LENGTH = 64
@@ -458,6 +460,209 @@ def _next_data_envelope_commit_seq(
     )
 
 
+def _data_envelope_payload_digest(payload: str) -> str:
+    """Hash a payload for the idempotency record's equivalence check.
+
+    Only this irreversible digest is ever persisted or compared — the
+    plaintext payload never reaches a column, and a same-key request
+    carrying a different payload is detected solely by the digest
+    mismatch.
+    """
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _data_envelope_created_body(
+    data_id: str,
+    tenant_id: str,
+    workload_id: str,
+    key_version: int,
+    created_at: datetime,
+) -> str:
+    """Render the exact compact 201 creation body stored for replay.
+
+    This is the wire form persisted verbatim by the first
+    idempotency-keyed creation and returned byte-for-byte on every later
+    same-key replay (including the original ``key_version`` and
+    ``created_at``), so its serialization must never depend on
+    response-time clock or state. Field order and formatting match the
+    keyless response exactly.
+    """
+    return json.dumps(
+        {
+            "data_id": data_id,
+            "tenant_id": tenant_id,
+            "workload_id": workload_id,
+            "key_version": key_version,
+            "created_at": _rfc3339(created_at),
+        },
+        separators=(",", ":"),
+        allow_nan=False,
+        ensure_ascii=False,
+    )
+
+
+def _create_data_envelope_keyed(
+    session_factory, body: CreateDataEnvelopeRequest, idempotency_key: str
+) -> Response:
+    """Create one envelope for an idempotency-keyed request, or replay.
+
+    The idempotency record and the envelope are one atomic commit: the
+    lookup-then-insert runs in a single transaction, with the unique
+    (scope, key) constraint plus the IntegrityError retry below settling
+    concurrent identical submissions so at most one envelope and one
+    record are ever created per key. A committed record answers every
+    later same-key equivalent request with the stored first 201 verbatim
+    — no new encryption, no envelope, no directory-sequence advancement,
+    no keyring read — and answers a same-key request with a different
+    data_id or payload with a stable 409 that changes nothing. Any
+    failure (keyring, encryption, duplicate data_id, storage) rolls back
+    and leaves no record, so the key stays free for a later recovery.
+    """
+    payload_digest = _data_envelope_payload_digest(body.payload)
+    response_text: str | None = None
+    for _ in range(2):
+        with session_factory() as session:
+            try:
+                existing = session.scalar(
+                    select(DataEnvelopeIdempotencyRecord).where(
+                        DataEnvelopeIdempotencyRecord.tenant_id == body.tenant_id,
+                        DataEnvelopeIdempotencyRecord.workload_id
+                        == body.workload_id,
+                        DataEnvelopeIdempotencyRecord.idempotency_key
+                        == idempotency_key,
+                    )
+                )
+                if existing is not None:
+                    # A stored-record judgement never re-encrypts and
+                    # never touches envelope, sequence or keyring state:
+                    # an equivalent replay gets the stored first 201
+                    # verbatim, a different request shape gets a 409.
+                    if existing.data_id != body.data_id or not hmac.compare_digest(
+                        existing.payload_sha256, payload_digest
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="idempotency key reused with a different request",
+                        )
+                    return Response(
+                        content=existing.response_body.encode("utf-8"),
+                        status_code=201,
+                        media_type="application/json",
+                    )
+
+                # First use of this key in the scope. A wholly unusable
+                # keyring is a server configuration failure; the check
+                # sits inside the transaction so a failure rolls back
+                # with no envelope and no idempotency record.
+                try:
+                    keyring = load_keyring()
+                except MasterKeyError as exc:
+                    session.rollback()
+                    logger.error("master key configuration unavailable: %s", exc)
+                    raise HTTPException(
+                        status_code=500, detail="encryption unavailable"
+                    )
+
+                # A data_id already taken in this scope (keyed or not)
+                # is the same 409 as on the keyless path; no record is
+                # written, so the key stays free.
+                if (
+                    session.get(
+                        DataEnvelope,
+                        (body.tenant_id, body.workload_id, body.data_id),
+                    )
+                    is not None
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="data_id already exists in this scope",
+                    )
+
+                # Same encryption requirements as the keyless path; a
+                # failure leaves neither an envelope nor a record.
+                try:
+                    sealed = encrypt_payload(
+                        keyring.current_key(), body.payload.encode("utf-8")
+                    )
+                except Exception:
+                    session.rollback()
+                    logger.error("payload encryption failed for data envelope")
+                    raise HTTPException(status_code=500, detail="encryption failed")
+
+                now = _utcnow()
+                commit_seq = _next_data_envelope_commit_seq(
+                    session, body.tenant_id, body.workload_id
+                )
+                response_text = _data_envelope_created_body(
+                    body.data_id,
+                    body.tenant_id,
+                    body.workload_id,
+                    keyring.current_version,
+                    now,
+                )
+                session.add(
+                    DataEnvelope(
+                        tenant_id=body.tenant_id,
+                        workload_id=body.workload_id,
+                        data_id=body.data_id,
+                        key_version=keyring.current_version,
+                        ciphertext=sealed.ciphertext,
+                        iv=sealed.iv,
+                        tag=sealed.tag,
+                        wrapped_key=sealed.wrapped_key,
+                        created_at=now,
+                        commit_seq=commit_seq,
+                    )
+                )
+                session.add(
+                    DataEnvelopeIdempotencyRecord(
+                        record_id=str(uuid.uuid4()),
+                        tenant_id=body.tenant_id,
+                        workload_id=body.workload_id,
+                        idempotency_key=idempotency_key,
+                        data_id=body.data_id,
+                        payload_sha256=payload_digest,
+                        response_body=response_text,
+                        created_at=now,
+                    )
+                )
+                try:
+                    # The envelope, its commit sequence and the
+                    # idempotency record commit together: a crash can
+                    # never leave one without the other.
+                    session.commit()
+                except IntegrityError:
+                    # A concurrent request for the same scope+key (or the
+                    # same data_id) committed first. Reread and answer as
+                    # a replay (verbatim 201), a key conflict (409) or a
+                    # duplicate data_id (409).
+                    session.rollback()
+                    continue
+                except Exception:
+                    session.rollback()
+                    logger.error("data envelope write failed")
+                    raise HTTPException(status_code=500, detail="encryption failed")
+                break
+            except HTTPException:
+                raise
+            except Exception:
+                # A storage failure during the lookup or insert is a
+                # server failure: the context manager rolls the
+                # transaction back, so neither an envelope nor an
+                # idempotency record is left behind.
+                logger.error("data envelope idempotent creation failed")
+                raise HTTPException(status_code=500, detail="encryption failed")
+    else:  # pragma: no cover - defensive: the reread always settles
+        logger.error("data envelope idempotency race did not settle")
+        raise HTTPException(status_code=500, detail="encryption failed")
+    assert response_text is not None
+    return Response(
+        content=response_text.encode("utf-8"),
+        status_code=201,
+        media_type="application/json",
+    )
+
+
 def _rfc3339(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat()
 
@@ -583,15 +788,15 @@ def _decode_cursor(
 
 
 def _read_idempotency_key(request: Request) -> tuple[bool, str | None]:
-    """Extract the optional ``Idempotency-Key`` header for a job submit.
+    """Extract the optional ``Idempotency-Key`` header of a write request.
 
     Returns ``(present, value)``. ``present`` is False when the header is
-    absent entirely (the original one-job-per-request semantics apply and
-    no validation runs). When present, the header must occur exactly once
-    and its value must be 1..64 visible ASCII characters; a duplicated
-    header line, an empty value, surrounding whitespace, a non-ASCII or
-    control character, or an over-long value raises an indistinguishable
-    422 before any state is read or written.
+    absent entirely (the original one-write-per-request semantics apply
+    and no validation runs). When present, the header must occur exactly
+    once and its value must be 1..64 visible ASCII characters; a
+    duplicated header line, an empty value, surrounding whitespace, a
+    non-ASCII or control character, or an over-long value raises an
+    indistinguishable 422 before any state is read or written.
     """
     raw_values = request.headers.getlist(IDEMPOTENCY_KEY_HEADER)
     if not raw_values:
@@ -11848,7 +12053,21 @@ def create_app(
         status_code=201,
         response_model=DataEnvelopeCreatedResponse,
     )
-    def create_data_envelope(body: CreateDataEnvelopeRequest) -> DataEnvelopeCreatedResponse:
+    def create_data_envelope(
+        request: Request, body: CreateDataEnvelopeRequest
+    ) -> DataEnvelopeCreatedResponse | Response:
+        # The optional idempotency key lives only in a header; the body
+        # contract is unchanged. A missing header keeps the original
+        # one-envelope-per-request semantics below; an illegal header is a
+        # 422 before any keyring read, encryption or write. A keyed
+        # request takes the idempotent path: one envelope per scope+key,
+        # the first 201 replayed verbatim on equivalent retries.
+        idem_present, idempotency_key = _read_idempotency_key(request)
+        if idem_present:
+            return _create_data_envelope_keyed(
+                session_factory, body, idempotency_key
+            )
+
         # The master keyring is required for this operation; its absence or
         # malformed value is a server configuration failure, never a client
         # error. Only the failure kind is logged — never the configured
