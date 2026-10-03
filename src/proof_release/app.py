@@ -5229,6 +5229,61 @@ def create_app(
     def health() -> dict[str, str]:
         return {"status": "ready"}
 
+    @app.get("/health/readiness")
+    def health_readiness(
+        request: Request,
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> JSONResponse:
+        """Report whether the service can carry its protected workloads.
+
+        Unlike ``/health`` (a fixed liveness response), every call probes
+        the two runtime dependencies independently: storage, with a single
+        minimal read-only statement confirming the connection and session
+        can execute SQL, and the master keyring, loaded with the usual
+        configuration semantics but never used to unwrap an envelope,
+        rotate a key, write an audit event or spend rate-limit budget.
+        Each dependency is reported on its own (``ok``/``unavailable``) —
+        a failure in one never suppresses the other's check — and the
+        overall status is ``ready`` only when both are ``ok``.
+
+        The probe is read-only and keeps no state between calls: a
+        recovered dependency flips the next response back to ``ready``,
+        and a failed probe leaves no half check, temporary table, audit
+        event or cached result behind. Failure details (exception text,
+        environment values, key versions, key material or fingerprints)
+        never reach the response or the logs.
+        """
+        # Request shape first: any query parameter or any body is a 422
+        # and never triggers a dependency check.
+        if request.query_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+
+        checks: dict[str, str] = {}
+        try:
+            with session_factory() as session:
+                session.execute(text("SELECT 1"))
+            checks["database"] = "ok"
+        except Exception:
+            logger.error("readiness database check failed")
+            checks["database"] = "unavailable"
+        try:
+            load_keyring()
+            checks["keyring"] = "ok"
+        except MasterKeyError:
+            logger.error("readiness keyring check failed")
+            checks["keyring"] = "unavailable"
+
+        ready = all(result == "ok" for result in checks.values())
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={
+                "status": "ready" if ready else "not_ready",
+                "checks": checks,
+            },
+        )
+
     @app.post("/v1/challenges", status_code=201, response_model=ChallengeCreatedResponse)
     def create_challenge(body: CreateChallengeRequest) -> ChallengeCreatedResponse:
         # Reaching the handler means every request field (tenant_id,
