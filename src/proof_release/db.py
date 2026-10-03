@@ -1005,9 +1005,30 @@ class DataEnvelope(Base):
     All four material columns are NOT NULL so a successful insert is a
     single atomic write: there is no observable state in which part of the
     envelope exists. The plaintext is never recoverable from any column.
+
+    ``commit_seq`` carries no secret and never leaves the service; it is
+    the per-scope gap-free sequence allocated inside the creation
+    transaction that lets the read-only directory query fix a replayable
+    snapshot to the business commit boundary on every backend.
     """
 
     __tablename__ = "data_envelopes"
+    __table_args__ = (
+        # Per-scope commit order: the immutable high-water mark that fixes
+        # the directory listing's replayable snapshot. Unique so two
+        # concurrent creations can never mint the same sequence; together
+        # with the per-scope counter row taken FOR UPDATE (and BEGIN
+        # IMMEDIATE on SQLite) this makes the order gap-free on every
+        # backend, and the index covers the scoped snapshot predicate. The
+        # composite primary key already covers the data_id ordering.
+        Index(
+            "ix_data_envelopes_scope_commit_seq",
+            "tenant_id",
+            "workload_id",
+            "commit_seq",
+            unique=True,
+        ),
+    )
     # A data_id is unique within a tenant/workload scope; the composite
     # primary key is also the lookup key for the GET endpoint.
     tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
@@ -1020,6 +1041,48 @@ class DataEnvelope(Base):
     tag: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     wrapped_key: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    # Gap-free per-scope sequence allocated in the envelope's own creation
+    # transaction, strictly increasing in business commit order on every
+    # backend. NULL only on rows written before the column existed
+    # (backfilled on open); every new envelope carries a positive value.
+    # The read-only directory bounds its replayable snapshot membership by
+    # this marker, never by write timing.
+    commit_seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+
+class DataEnvelopeCommitCounter(Base):
+    """Per-scope monotonic allocator for data-envelope ``commit_seq``.
+
+    Exactly one row exists per ``(tenant_id, workload_id)``. It is an
+    internal ordering device — never exposed on any response and holding
+    no payload, key or envelope material — whose sole purpose is to make
+    the read-only directory query's snapshot cutoff the business commit
+    boundary on every backend:
+
+    * the next value is read ``FOR UPDATE`` (locking backends) so
+      concurrent creations in one scope serialize on the counter row
+      itself, not merely on the latest envelope (a lock that would not
+      gap-lock a new maximum);
+    * on SQLite every write transaction already begins as BEGIN
+      IMMEDIATE, serializing all writers process-wide;
+    * the scope's first allocation inserts the anchor inside a savepoint,
+      so the unique-anchor race never rolls the surrounding creation back.
+
+    The counter advances in the same transaction as the envelope it
+    sequences, so a committed envelope's sequence is final and strictly
+    greater than every envelope that committed before it in the scope,
+    independent of write timing or identical ``created_at`` values.
+    Rewrap only updates key material in place and never advances this
+    counter, so rotations change neither the ordering nor page membership.
+    """
+
+    __tablename__ = "data_envelope_commit_counters"
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # Last per-scope commit sequence handed out; 1 for the scope's first
+    # envelope, strictly increasing for every later creation.
+    last_seq: Mapped[int] = mapped_column(BigInteger)
 
 
 class ReleaseGrant(Base):
