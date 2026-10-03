@@ -4,7 +4,7 @@ A rule is a small JSON tree. Leaf nodes locate a value with a top-level
 claim name or an object path and carry exactly one comparison key::
 
     {"claim": "<top-level claim name>", "equals": <scalar>}
-    {"path": ["<segment>", ...], "equals": <scalar>}
+    {"path": ["<segment>", ...], "equals": <scalar>}   # segment: string or {"wildcard": true}
     {"claim": "...", "in": [<scalar>, ...]}        # 1..32 unique scalars
     {"claim": "...", "contains": <scalar>}          # array has an equal element
     {"claim": "...", "lt"|"lte"|"gt"|"gte": <finite JSON number>}
@@ -19,6 +19,13 @@ only claim *names* (or object paths) and expected scalar values — they
 never contain raw evidence, nonces or claim material — so persisting
 their canonical serialization is compatible with the no-raw-evidence
 guarantee.
+
+A path segment is either a plain string naming one object field (the
+string ``"*"`` is just a literal field name) or the object
+``{"wildcard": true}``, which expands every element of a JSON array at
+that position so the remaining segments apply to each element. Multiple
+wildcards expand left to right into the full set of candidate paths, and
+a leaf comparison succeeds when any complete candidate satisfies it.
 """
 
 from __future__ import annotations
@@ -97,16 +104,28 @@ def _validate_path(path: Any) -> None:
     """Validate the ``path`` sibling of a path leaf.
 
     It must be a non-empty list of at most :data:`MAX_PATH_SEGMENTS`
-    segments; each segment is a non-blank string no longer than
-    :data:`MAX_PATH_SEGMENT_LENGTH` characters. A segment names exactly
-    one object field — dots embedded in a segment are literal characters
-    of that single name and never split it.
+    segments. A segment is either a non-blank string no longer than
+    :data:`MAX_PATH_SEGMENT_LENGTH` characters naming exactly one object
+    field — dots embedded in a segment are literal characters of that
+    single name and never split it, and the string ``"*"`` is a literal
+    field name like any other — or the object ``{"wildcard": true}``
+    marking array traversal at that position. The wildcard object must
+    carry exactly that one key with the JSON boolean ``true``: any other
+    object shape, extra keys or a truthy stand-in such as ``1`` is
+    rejected.
     """
     if not isinstance(path, list) or not path:
         raise InvalidRule("path must be a non-empty list of segments")
     if len(path) > MAX_PATH_SEGMENTS:
         raise InvalidRule(f"path may name at most {MAX_PATH_SEGMENTS} segments")
     for segment in path:
+        if isinstance(segment, dict):
+            if set(segment.keys()) != {"wildcard"} or segment["wildcard"] is not True:
+                raise InvalidRule(
+                    "wildcard path segments must be exactly "
+                    '{"wildcard": true}'
+                )
+            continue
         if not isinstance(segment, str) or not segment or not segment.strip():
             raise InvalidRule("path segments must be non-empty strings")
         if len(segment) > MAX_PATH_SEGMENT_LENGTH:
@@ -241,23 +260,36 @@ def canonical_rule_json(rule: dict[str, Any]) -> str:
     return json.dumps(rule, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-_MISSING = object()
+def _read_path(claims: Any, segments: list[Any]) -> list[Any]:
+    """Expand a declared path into every candidate value it names.
 
-
-def _read_path(claims: Any, segments: list[str]) -> Any:
-    """Read a declared path one object field at a time.
-
-    Only JSON object fields are descended through: encountering an array
-    or scalar before the last segment, or a missing field at any level,
-    means the path is absent. Array elements never expand and indexing is
-    not supported.
+    String segments descend one object field; a ``{"wildcard": true}``
+    segment expands every element of a JSON array at that position, with
+    the remaining segments applied to each element independently, so
+    multiple wildcards expand left to right into the full set of
+    candidate paths. Any mismatch — a missing field, a non-object while
+    a string segment remains, a non-array at a wildcard position, or a
+    scalar with segments still to go — yields no candidate down that
+    branch. The result is the (possibly empty) list of values every
+    complete candidate path reaches; each may be a scalar, null, an
+    array or an object.
     """
-    current = claims
+    candidates = [claims]
     for segment in segments:
-        if not isinstance(current, dict) or segment not in current:
-            return _MISSING
-        current = current[segment]
-    return current
+        following: list[Any] = []
+        if isinstance(segment, dict):
+            # Wildcard segment: expand every element of a JSON array.
+            for current in candidates:
+                if isinstance(current, list):
+                    following.extend(current)
+        else:
+            for current in candidates:
+                if isinstance(current, dict) and segment in current:
+                    following.append(current[segment])
+        candidates = following
+        if not candidates:
+            break
+    return candidates
 
 
 def _compare_order(actual: Any, key: str, bound: Any) -> bool:
@@ -280,18 +312,22 @@ def _compare_order(actual: Any, key: str, bound: Any) -> bool:
 def evaluate_rule(rule: dict[str, Any], claims: dict[str, Any]) -> bool:
     """Evaluate a validated rule against top-level verified claims.
 
-    A missing claim or object path simply fails its comparison (an absent
-    key is *not* equal to an explicit ``null``), and non-object values
-    encountered while descending a path block further descent. Set,
-    equality and ordering comparisons all require the actual value and the
-    target to be the same scalar type — booleans are not numbers and
-    ``null`` only equals ``null``. ``contains`` requires the located value
-    itself to be a JSON array holding at least one element equal to the
-    expected scalar under that same type-strict equality; a missing value,
-    a non-array (including a bare scalar) or an empty/non-matching array
-    all fail. ``exists`` checks whether the claim key
-    or the full object path is readable at all; a ``null`` value there
-    still exists. Compound nodes keep their short-circuit semantics.
+    A missing claim or a path that reaches no candidate simply fails its
+    comparison (an absent key is *not* equal to an explicit ``null``),
+    and non-object values encountered while descending a path block
+    further descent. A path whose wildcard segments expand an array
+    produces one candidate per element path; the leaf's comparison then
+    holds when *any* complete candidate satisfies it. Set, equality and
+    ordering comparisons all require the actual value and the target to
+    be the same scalar type — booleans are not numbers and ``null`` only
+    equals ``null``. ``contains`` requires a candidate value itself to be
+    a JSON array holding at least one element equal to the expected
+    scalar under that same type-strict equality; a missing value, a
+    non-array (including a bare scalar) or an empty/non-matching array
+    all fail. ``exists`` checks whether the claim key is present or at
+    least one complete candidate path is readable at all; a ``null``
+    value there still exists. Compound nodes keep their short-circuit
+    semantics.
     """
     keys = set(rule.keys())
     locators = keys & _LOCATOR_KEYS
@@ -299,32 +335,40 @@ def evaluate_rule(rule: dict[str, Any], claims: dict[str, Any]) -> bool:
         (comparison,) = keys - locators
         if "claim" in locators:
             if isinstance(claims, dict) and rule["claim"] in claims:
-                actual = claims[rule["claim"]]
+                candidates = [claims[rule["claim"]]]
             else:
-                actual = _MISSING
+                candidates = []
         else:
-            actual = _read_path(claims, rule["path"])
+            candidates = _read_path(claims, rule["path"])
         if comparison == "exists":
-            return actual is not _MISSING
-        if actual is _MISSING:
-            return False
+            return bool(candidates)
         if comparison == "equals":
-            return _scalar_equals(actual, rule["equals"])
+            return any(
+                _scalar_equals(actual, rule["equals"]) for actual in candidates
+            )
         if comparison == "in":
             return any(
-                _scalar_equals(actual, candidate) for candidate in rule["in"]
+                _scalar_equals(actual, candidate)
+                for actual in candidates
+                for candidate in rule["in"]
             )
         if comparison == "contains":
             # Only an actual JSON array can contain the expected scalar;
             # elements that are objects, arrays or otherwise non-scalar
             # simply never compare equal to it.
-            if not isinstance(actual, list):
-                return False
             return any(
-                _scalar_equals(element, rule["contains"]) for element in actual
+                isinstance(actual, list)
+                and any(
+                    _scalar_equals(element, rule["contains"])
+                    for element in actual
+                )
+                for actual in candidates
             )
         if comparison in _ORDER_KEYS:
-            return _compare_order(actual, comparison, rule[comparison])
+            return any(
+                _compare_order(actual, comparison, rule[comparison])
+                for actual in candidates
+            )
         raise InvalidRule(f"unknown comparison: {comparison}")
     (key,) = keys
     if key == "all":
