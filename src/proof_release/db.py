@@ -1183,6 +1183,66 @@ class ReleaseGrantEvent(Base):
     occurred_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
+class ReleaseGrantConsumeIdempotencyRecord(Base):
+    """The first successful idempotency-keyed consumption of one grant.
+
+    At most one row exists per ``(tenant_id, workload_id,
+    idempotency_key)`` triple; the same key in a different tenant or
+    workload is an independent row and never conflicts. The row is
+    inserted in the *same* transaction as the winning pending -> consumed
+    grant settlement, its timeline event and its audit event, so a crash
+    can never leave a settled grant without its idempotency record or a
+    record pointing at an unsettled grant. A failed consume — a 404/401/
+    409/410/500 judgement, a lost settlement race, or any rollback —
+    inserts no row, so the key stays free and a later recovery re-judges
+    the request normally.
+
+    Once committed, a same-key same-scope replay answers with the stored
+    first 200 verbatim without touching the grant: the grant is not read
+    for re-judgement, no status or timestamp changes, and no event or
+    audit row is appended — even if the grant has since expired or
+    undergone a later change. A same-key request whose normalized grant,
+    scope or capability differs is a stable 409 that changes nothing.
+
+    The stored fingerprint covers only non-sensitive request identity:
+    the normalized grant id, the scope and the capability *digest* —
+    never the plaintext capability. The stored response is the exact
+    compact JSON body first returned to the caller. No capability
+    plaintext, evidence, payload or key material is ever stored here.
+    """
+
+    __tablename__ = "release_grant_consume_idempotency_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "idempotency_key",
+            name="uq_release_grant_consume_idempotency_scope_key",
+        ),
+    )
+
+    record_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # Caller-chosen key: 1..64 visible ASCII characters. Unique only
+    # within the (tenant, workload) scope; the same key in another scope
+    # is an independent row and never conflicts.
+    idempotency_key: Mapped[str] = mapped_column(String(64))
+    # Grant settled by the first legal keyed consume; every later replay
+    # of this key answers with that same consumption's original 200.
+    grant_id: Mapped[str] = mapped_column(String(36), index=True)
+    # Hex SHA-256 over the normalized request identity (canonical
+    # grant_id, tenant_id, workload_id and the capability digest); used
+    # only to detect a same-key request with different content, which is
+    # a 409 that changes nothing. The plaintext capability never
+    # participates.
+    request_fingerprint: Mapped[str] = mapped_column(String(64))
+    # The exact first 200 response body, stored verbatim (compact JSON)
+    # and replayed byte-for-byte on every later same-key replay.
+    response_body: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class RewrapBatch(Base):
     """One page of a scoped, cursor-driven envelope rewrap batch.
 
