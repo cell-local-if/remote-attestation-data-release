@@ -122,6 +122,7 @@ from proof_release.db import (
     Evidence,
     Policy,
     PolicyCommitCounter,
+    PolicyIdempotencyRecord,
     ProofEventCommitCounter,
     ProofLifecycleEvent,
     RateLimitCounter,
@@ -672,6 +673,66 @@ def _data_envelope_created_body(
             "tenant_id": tenant_id,
             "workload_id": workload_id,
             "key_version": key_version,
+            "created_at": _rfc3339(created_at),
+        },
+        separators=(",", ":"),
+        allow_nan=False,
+        ensure_ascii=False,
+    )
+
+
+def _policy_request_fingerprint(
+    tenant_id: str, workload_id: str, name: str, rule_json: str
+) -> str:
+    """Hash the request identity that must match for a keyed replay.
+
+    Covers exactly the equivalence range fixed by the contract: the
+    tenant, the workload, the policy name and the canonical (sorted,
+    compact) JSON of the validated rule tree. Rules contain only claim
+    names and scalar comparison values, so only this non-sensitive
+    identity is hashed — no evidence, claim values, capabilities or keys
+    ever participate. Canonical JSON with sorted keys makes equivalent
+    requests hash identically.
+    """
+    payload = json.dumps(
+        {
+            "tenant_id": tenant_id,
+            "workload_id": workload_id,
+            "name": name,
+            "rule": rule_json,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _policy_created_body(
+    policy_id: str,
+    tenant_id: str,
+    workload_id: str,
+    name: str,
+    version: int,
+    rule: dict,
+    created_at: datetime,
+) -> str:
+    """Render the exact compact 201 creation body stored for replay.
+
+    This is the wire form persisted verbatim by the first
+    idempotency-keyed policy creation and returned byte-for-byte on
+    every later same-key replay (including the original ``policy_id``,
+    ``version`` and ``created_at``), so its serialization must never
+    depend on response-time clock or state. The field order and compact
+    shape match the unkeyed response model exactly.
+    """
+    return json.dumps(
+        {
+            "policy_id": policy_id,
+            "tenant_id": tenant_id,
+            "workload_id": workload_id,
+            "name": name,
+            "version": version,
+            "rule": rule,
             "created_at": _rfc3339(created_at),
         },
         separators=(",", ":"),
@@ -7872,8 +7933,171 @@ def create_app(
             payload["updated_at"] = _rfc3339(prior_updated_at)
         return _identity_json(payload)
 
+    def _create_policy_keyed(
+        body: CreatePolicyRequest, idempotency_key: str
+    ) -> Response:
+        """Create one policy version under an ``Idempotency-Key``.
+
+        The policy row, its per-scope lifecycle commit sequence and the
+        idempotency record are one atomic commit: the lookup-then-insert
+        runs in a single transaction, with the unique (scope, key)
+        constraint plus the IntegrityError reread below settling
+        concurrent identical submissions so at most one version and one
+        record ever exist per key. Every judgement failure raises out of
+        the context manager, which rolls back, so a failed attempt leaves
+        neither a policy nor a record and the key stays free for a
+        recovered retry.
+        """
+        rule_json = canonical_rule_json(body.rule)
+        # Irreversible request identity over the normalized request
+        # shape: the scope, the policy name and the canonical rule tree.
+        fingerprint = _policy_request_fingerprint(
+            body.tenant_id, body.workload_id, body.name, rule_json
+        )
+
+        saved_body: str | None = None
+        for _ in range(10):
+            with session_factory() as session:
+                try:
+                    existing = session.scalar(
+                        select(PolicyIdempotencyRecord).where(
+                            PolicyIdempotencyRecord.tenant_id == body.tenant_id,
+                            PolicyIdempotencyRecord.workload_id
+                            == body.workload_id,
+                            PolicyIdempotencyRecord.idempotency_key
+                            == idempotency_key,
+                        )
+                    )
+                    if existing is not None:
+                        # A replay never creates a version, never advances
+                        # the lifecycle sequence and never changes the
+                        # stored policy: the stored first 201 is returned
+                        # verbatim. A same-key request whose name or
+                        # normalized rule differs is a stable 409 that
+                        # changes nothing.
+                        if not hmac.compare_digest(
+                            existing.request_fingerprint, fingerprint
+                        ):
+                            raise HTTPException(
+                                status_code=409,
+                                detail="idempotency key reused with a different request",
+                            )
+                        return Response(
+                            content=existing.response_body.encode("utf-8"),
+                            status_code=201,
+                            media_type="application/json",
+                        )
+
+                    # First keyed request for this scope+key. Allocate the
+                    # next version and the lifecycle commit sequence in
+                    # this same write transaction, exactly as on the
+                    # keyless path; a replay never reaches here, so a
+                    # replay never consumes either.
+                    policy_id = str(uuid.uuid4())
+                    now = _utcnow()
+                    highest = session.scalar(
+                        select(func.max(Policy.version)).where(
+                            Policy.tenant_id == body.tenant_id,
+                            Policy.workload_id == body.workload_id,
+                            Policy.name == body.name,
+                        )
+                    )
+                    version = (highest or 0) + 1
+                    commit_seq = _next_policy_commit_seq(
+                        session, body.tenant_id, body.workload_id
+                    )
+                    session.add(
+                        Policy(
+                            policy_id=policy_id,
+                            tenant_id=body.tenant_id,
+                            workload_id=body.workload_id,
+                            name=body.name,
+                            version=version,
+                            rule_json=rule_json,
+                            created_at=now,
+                            commit_seq=commit_seq,
+                        )
+                    )
+                    # The exact first 201 body, fixed before commit so the
+                    # stored response and the response returned to the
+                    # winner are byte-for-byte the same, including the
+                    # original policy_id, version and created_at.
+                    saved_body = _policy_created_body(
+                        policy_id,
+                        body.tenant_id,
+                        body.workload_id,
+                        body.name,
+                        version,
+                        body.rule,
+                        now,
+                    )
+                    session.add(
+                        PolicyIdempotencyRecord(
+                            record_id=str(uuid.uuid4()),
+                            tenant_id=body.tenant_id,
+                            workload_id=body.workload_id,
+                            idempotency_key=idempotency_key,
+                            request_fingerprint=fingerprint,
+                            response_body=saved_body,
+                            created_at=now,
+                        )
+                    )
+                    try:
+                        # The policy version, its lifecycle sequence and
+                        # the idempotency record commit together: a crash
+                        # can never leave one without the others.
+                        session.commit()
+                    except IntegrityError:
+                        # A concurrent transaction committed first —
+                        # either the same scope+key (its record is now
+                        # visible) or the same (scope, name, version).
+                        # Reread and settle as a replay, a key-reuse
+                        # conflict or a fresh version allocation on the
+                        # next pass.
+                        session.rollback()
+                        continue
+                    except Exception:
+                        session.rollback()
+                        logger.error("policy write failed")
+                        raise HTTPException(
+                            status_code=500, detail="policy write failed"
+                        )
+                except HTTPException:
+                    raise
+                except Exception:
+                    session.rollback()
+                    logger.error("policy write failed")
+                    raise HTTPException(
+                        status_code=500, detail="policy write failed"
+                    )
+                break
+        else:  # pragma: no cover - defensive: the reread always settles
+            logger.error("policy idempotency race did not settle")
+            raise HTTPException(status_code=500, detail="policy write failed")
+
+        assert saved_body is not None
+        return Response(
+            content=saved_body.encode("utf-8"),
+            status_code=201,
+            media_type="application/json",
+        )
+
     @app.post("/v1/policies", status_code=201, response_model=PolicyCreatedResponse)
-    def create_policy(body: CreatePolicyRequest) -> PolicyCreatedResponse:
+    def create_policy(
+        request: Request, body: CreatePolicyRequest
+    ) -> PolicyCreatedResponse | Response:
+        # The idempotency key is optional and lives only in a header; the
+        # body contract is unchanged. A missing key preserves the original
+        # one-version-per-request semantics exactly. An illegal key
+        # (duplicated header, empty, whitespace-padded, non-visible-ASCII
+        # or longer than 64 characters) is rejected here, after body
+        # validation and before any version allocation, sequence
+        # allocation or write, so an invalid key never creates a policy,
+        # never consumes a version number and never writes a record.
+        idem_present, idempotency_key = _read_idempotency_key(request)
+        if idem_present:
+            return _create_policy_keyed(body, idempotency_key)
+
         policy_id = str(uuid.uuid4())
         now = _utcnow()
         rule_json = canonical_rule_json(body.rule)

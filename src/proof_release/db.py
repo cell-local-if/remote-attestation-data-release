@@ -836,6 +836,62 @@ class PolicyCommitCounter(Base):
     last_seq: Mapped[int] = mapped_column(BigInteger)
 
 
+class PolicyIdempotencyRecord(Base):
+    """The first successful idempotency-keyed creation of a policy version.
+
+    At most one row exists per ``(tenant_id, workload_id,
+    idempotency_key)`` triple; the same key in a different tenant or
+    workload is an independent row and never conflicts. The row is
+    inserted in the *same* transaction as the :class:`Policy` version it
+    records and the per-scope lifecycle sequence allocation, so a crash
+    can never leave a policy version without its idempotency record or a
+    record pointing at no version. A failed creation — a 422 judgement, a
+    lost insert race, or any rollback — inserts no row, so the key stays
+    free and a later recovery re-judges the request normally.
+
+    Once committed, a same-key same-scope replay of the same normalized
+    request (same name and same canonical rule tree) answers with the
+    stored first 201 verbatim: it never creates a second version, never
+    advances the per-scope lifecycle sequence and never changes the
+    stored policy. A same-key request whose name or normalized rule
+    differs is a stable 409 that changes nothing.
+
+    Only the scope, the caller-chosen key, the SHA-256 fingerprint of the
+    normalized request shape, the stored first response body and the
+    creation time are persisted — never evidence, claims, capabilities,
+    keys or exception text. The table is internal: it is never exposed on
+    any response.
+    """
+
+    __tablename__ = "policy_idempotency_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "idempotency_key",
+            name="uq_policy_idempotency_scope_key",
+        ),
+    )
+
+    record_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # Caller-chosen key: 1..64 visible ASCII characters. Unique only
+    # within the (tenant, workload) scope; the same key in another scope
+    # is an independent row and never conflicts.
+    idempotency_key: Mapped[str] = mapped_column(String(64))
+    # Hex SHA-256 over the normalized request identity (scope, policy
+    # name and the canonical rule JSON); used only to detect a same-key
+    # request with different content, which is a 409 that changes
+    # nothing. Rules contain only claim names and scalar comparisons, so
+    # no evidence, claim values or secrets participate.
+    request_fingerprint: Mapped[str] = mapped_column(String(64))
+    # The exact first 201 response body, stored verbatim (compact JSON)
+    # and replayed byte-for-byte on every later same-key replay.
+    response_body: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class Decision(Base):
     """An auditable release decision for one evidence/policy-version pair.
 
