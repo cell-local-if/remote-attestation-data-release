@@ -5229,6 +5229,72 @@ def create_app(
     def health() -> dict[str, str]:
         return {"status": "ready"}
 
+    @app.get("/health/readiness")
+    def health_readiness(
+        request: Request,
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> JSONResponse:
+        """Report whether the service can currently serve its dependencies.
+
+        A standalone readiness probe for callers deciding whether proof,
+        authorization and data-release traffic can be carried. The request
+        takes no input: any query parameter is a 422 and any non-empty body
+        (including whitespace or non-JSON) is a 422, both rejected before
+        any dependency is touched and without changing any state.
+
+        Each call independently re-checks both dependencies. The storage
+        check is a single minimal read-only statement confirming a
+        connection can be obtained and a session can execute SQL. The
+        keyring check loads the currently configured keyring with the
+        existing configuration semantics; it never unwraps an envelope,
+        rotates a key, writes an audit row or consumes rate-limit budget.
+        Both checks run on every call, so one failing dependency never
+        suppresses the other's result. When both succeed the response is
+        200 with status ``ready``; otherwise it is 503 with status
+        ``not_ready`` and each dependency reported as ``ok`` or
+        ``unavailable``. The checks are read-only and side-effect free:
+        they leave no partial result, temporary table, audit event or
+        cached state, so the entry point flips back to 200 as soon as the
+        dependencies recover. Failure detail (storage exceptions,
+        environment variables, key versions, key bytes, key fingerprints
+        and raw configuration) never appears in the response or the logs.
+        """
+        # --- request shape (all 422, no dependency is touched) ----------
+        if request.query_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+
+        checks: dict[str, str] = {}
+
+        try:
+            with session_factory() as session:
+                session.execute(text("SELECT 1"))
+            checks["database"] = "ok"
+        except Exception:
+            # The exception may carry connection or environment detail;
+            # only a fixed, detail-free message is ever logged.
+            logger.warning("readiness database check failed")
+            checks["database"] = "unavailable"
+
+        try:
+            load_keyring()
+            checks["keyring"] = "ok"
+        except Exception:
+            # Key material, versions and raw configuration stay out of the
+            # logs; only the failure kind is recorded.
+            logger.warning("readiness keyring check failed")
+            checks["keyring"] = "unavailable"
+
+        ready = all(status == "ok" for status in checks.values())
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={
+                "status": "ready" if ready else "not_ready",
+                "checks": checks,
+            },
+        )
+
     @app.post("/v1/challenges", status_code=201, response_model=ChallengeCreatedResponse)
     def create_challenge(body: CreateChallengeRequest) -> ChallengeCreatedResponse:
         # Reaching the handler means every request field (tenant_id,
