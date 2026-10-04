@@ -15,10 +15,11 @@ import hashlib
 import hmac
 import json
 import os
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Dict
+from typing import Callable, Dict, Mapping
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
@@ -33,8 +34,10 @@ __all__ = [
     "VerificationContext",
     "VerificationResult",
     "Verifier",
+    "VerifierPluginError",
     "VerifierRegistry",
     "AttestedNonceJSONVerifier",
+    "AttestedNonceJSONV2Verifier",
     "X509AttestedNonceJSONVerifier",
     "CrlValidationError",
     "ParsedCrl",
@@ -51,11 +54,18 @@ __all__ = [
 #: Built-in format identifier for the reference verifier.
 ATTESTED_NONCE_JSON = "attested-nonce-json"
 
+#: Built-in format identifier for the shared-key-rotation verifier.
+ATTESTED_NONCE_JSON_V2 = "attested-nonce-json-v2"
+
 #: Built-in format identifier for the X.509 certificate-chain verifier.
 X509_ATTESTED_NONCE_JSON = "x509-attested-nonce-json"
 
 #: Environment variable holding the MAC secret for the built-in verifier.
 ATTESTED_NONCE_SECRET_ENV = "PROOF_RELEASE_ATTESTED_NONCE_SECRET"
+
+#: Environment variable holding the kid -> shared-key JSON object for the
+#: v2 verifier.
+ATTESTED_NONCE_KEYS_ENV = "PROOF_RELEASE_ATTESTED_NONCE_KEYS"
 
 #: Development-only fallback secret. Deployments must set the env var above;
 #: this constant exists so the format is usable out of the box in tests and
@@ -117,6 +127,17 @@ class VerificationResult:
 
     accepted: bool
     detail: str | None = None
+
+
+class VerifierPluginError(RuntimeError):
+    """A verifier suffered an internal failure (e.g. broken configuration).
+
+    Distinct from an ordinary rejection: the service maps this to a 500
+    ``"verifier plugin failure"`` and leaves the evidence unsettled so the
+    request can be retried once the fault is fixed. Messages must never
+    carry raw evidence, key material, or other private context — only the
+    exception type is logged and a fixed detail string is returned.
+    """
 
 
 class Verifier(ABC):
@@ -274,6 +295,173 @@ class AttestedNonceJSONVerifier(Verifier):
         except (binascii.Error, ValueError):
             return _reject()
         if not hmac.compare_digest(expected_mac, mac_hex.lower()):
+            return _reject()
+
+        return VerificationResult(accepted=True)
+
+
+#: Maximum number of kid -> key entries accepted in the v2 key document.
+MAX_ATTESTED_NONCE_KEYS = 32
+
+#: Length in bytes of every shared key in the v2 key document.
+ATTESTED_NONCE_V2_KEY_BYTES = 32
+
+#: A v2 key id: 1-64 unreserved base64url characters.
+_KID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+#: The exact key set of a v2 evidence document; nothing missing, nothing extra.
+_V2_EVIDENCE_KEYS = frozenset({"kid", "nonce", "claims", "mac"})
+
+_V2_MAC_HEX_ALPHABET = frozenset("0123456789abcdef")
+
+
+def _parse_attested_nonce_keys(raw: str) -> Dict[str, bytes]:
+    """Parse the v2 key document, raising :class:`VerifierPluginError`.
+
+    The document is a JSON object of at most 32 entries mapping a key id
+    (``^[A-Za-z0-9_-]{1,64}$``) to an unpadded-base64url 32-byte shared
+    key. Any deviation — malformed JSON, a non-object shape, too many
+    entries, an illegal kid, a non-string value, or a wrong key length —
+    is a plugin failure, never a rejection.
+    """
+    try:
+        document = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise VerifierPluginError("attested-nonce keys are not valid JSON")
+    if not isinstance(document, dict) or len(document) > MAX_ATTESTED_NONCE_KEYS:
+        raise VerifierPluginError("attested-nonce keys have an invalid shape")
+    keys: Dict[str, bytes] = {}
+    for kid, value in document.items():
+        if not isinstance(kid, str) or _KID_PATTERN.fullmatch(kid) is None:
+            raise VerifierPluginError("attested-nonce keys contain an invalid kid")
+        if not isinstance(value, str) or not _is_unpadded_base64url(value):
+            raise VerifierPluginError("attested-nonce keys contain an invalid key")
+        decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        if len(decoded) != ATTESTED_NONCE_V2_KEY_BYTES:
+            raise VerifierPluginError("attested-nonce keys contain an invalid key")
+        keys[kid] = decoded
+    return keys
+
+
+class AttestedNonceJSONV2Verifier(Verifier):
+    """Built-in verifier for the ``attested-nonce-json-v2`` format.
+
+    Same idea as :class:`AttestedNonceJSONVerifier` but with shared-key
+    rotation: the evidence names the key it was produced with, and the
+    service holds a keyring of up to 32 shared keys::
+
+        {"kid": "<key id>", "nonce": "<unpadded base64url>",
+         "claims": {...}, "mac": "<64 lowercase hex>"}
+
+    The document must contain exactly these four keys. ``kid`` matches
+    ``^[A-Za-z0-9_-]{1,64}$``; ``nonce`` is the unpadded-base64url
+    challenge nonce; ``claims`` is a JSON object; ``mac`` is 64 lowercase
+    hex characters. Any missing key, extra key, or type error is a plain
+    rejection.
+
+    The keyring comes from the ``PROOF_RELEASE_ATTESTED_NONCE_KEYS``
+    environment variable: a JSON object of at most 32 entries mapping a
+    key id to an unpadded-base64url 32-byte shared key. A missing
+    variable, malformed JSON, a wrong shape, too many entries, an illegal
+    kid, or a wrong key length is a plugin failure (the service answers
+    500 and leaves the evidence unsettled) — never a rejection. The
+    keyring is re-read on every verification, so a fixed configuration
+    takes effect on retry; an evidence record that already settled is
+    never re-verified. A ``kid`` absent from an otherwise valid keyring
+    is an ordinary rejection.
+
+    The MAC key is derived per tenant and workload from the selected
+    shared key, exactly as in v1::
+
+        mac_key = HMAC-SHA256(shared_key, tenant_id + ":" + workload_id)
+
+    and the MAC is HMAC-SHA256 over the format name, a NUL separator and
+    the canonical JSON (sorted keys, compact separators, UTF-8) of
+    ``{"claims": ..., "kid": ..., "nonce": ...}``::
+
+        mac = HMAC-SHA256(mac_key,
+                          "attested-nonce-json-v2" + NUL + canonical_json)
+    """
+
+    format_name = ATTESTED_NONCE_JSON_V2
+
+    def __init__(
+        self,
+        keys: Mapping[str, bytes] | None = None,
+        *,
+        keys_provider: Callable[[], Mapping[str, bytes]] | None = None,
+    ) -> None:
+        self._keys = keys
+        self._keys_provider = keys_provider
+
+    def _current_keys(self) -> Mapping[str, bytes]:
+        if self._keys is not None:
+            return self._keys
+        if self._keys_provider is not None:
+            return self._keys_provider()
+        raw = os.environ.get(ATTESTED_NONCE_KEYS_ENV)
+        if raw is None:
+            raise VerifierPluginError("attested-nonce keys are not configured")
+        return _parse_attested_nonce_keys(raw)
+
+    def verify(self, context: VerificationContext) -> VerificationResult:
+        try:
+            document = json.loads(context.evidence)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return _reject()
+        if not isinstance(document, dict):
+            return _reject()
+        if set(document.keys()) != _V2_EVIDENCE_KEYS:
+            return _reject()
+
+        kid = document["kid"]
+        nonce = document["nonce"]
+        claims = document["claims"]
+        mac_hex = document["mac"]
+        if not isinstance(kid, str) or _KID_PATTERN.fullmatch(kid) is None:
+            return _reject()
+        if not isinstance(nonce, str) or not _is_unpadded_base64url(nonce):
+            return _reject()
+        if not isinstance(claims, dict):
+            return _reject()
+        if (
+            not isinstance(mac_hex, str)
+            or len(mac_hex) != 64
+            or any(c not in _V2_MAC_HEX_ALPHABET for c in mac_hex)
+        ):
+            return _reject()
+
+        # The attested nonce must be exactly the nonce of the bound challenge.
+        if not hmac.compare_digest(
+            hashlib.sha256(nonce.encode("ascii")).hexdigest(),
+            context.challenge.nonce_digest,
+        ):
+            return _reject()
+
+        # Configuration faults raise VerifierPluginError (a 500 that leaves
+        # the evidence unsettled); they are never folded into a rejection.
+        keys = self._current_keys()
+        shared_key = keys.get(kid)
+        if shared_key is None:
+            # A well-formed keyring that simply does not hold this kid.
+            return _reject()
+
+        mac_key = hmac.new(
+            shared_key,
+            f"{context.tenant_id}:{context.workload_id}".encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+        signed_payload = (
+            ATTESTED_NONCE_JSON_V2.encode("ascii")
+            + b"\x00"
+            + json.dumps(
+                {"claims": claims, "kid": kid, "nonce": nonce},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        expected_mac = hmac.new(mac_key, signed_payload, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected_mac, mac_hex):
             return _reject()
 
         return VerificationResult(accepted=True)
@@ -892,6 +1080,7 @@ class X509AttestedNonceJSONVerifier(Verifier):
 #: Process-wide registry used by the service unless one is supplied.
 default_registry = VerifierRegistry()
 default_registry.register(AttestedNonceJSONVerifier())
+default_registry.register(AttestedNonceJSONV2Verifier())
 default_registry.register(X509AttestedNonceJSONVerifier())
 
 
