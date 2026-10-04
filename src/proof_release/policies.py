@@ -42,6 +42,8 @@ __all__ = [
     "explain_rule",
     "rule_structure",
     "canonical_rule_json",
+    "rule_values_equal",
+    "compare_rules",
     "MAX_RULE_DEPTH",
     "MAX_RULE_NODES",
     "MAX_PATH_SEGMENTS",
@@ -486,3 +488,148 @@ def rule_structure(rule: dict[str, Any]) -> list[tuple[tuple[int, ...], str]]:
 
     visit(rule, [])
     return skeleton
+
+
+def rule_values_equal(left: Any, right: Any) -> bool:
+    """JSON equality under the rule evaluator's numeric comparison rules.
+
+    Object key order is insignificant and arrays compare positionally.
+    Strings, booleans and null are strictly distinct from one another and
+    from every number, while two finite JSON numbers compare by value —
+    exactly the type-strict scalar equality :func:`evaluate_rule` applies,
+    so ``1`` and ``1.0`` are the same value but ``true`` and ``1`` are not.
+    The comparison is structural only: it never inspects claim names,
+    paths or values beyond equality, and touches no evidence.
+    """
+    if left is None or right is None:
+        return left is None and right is None
+    if isinstance(left, bool) or isinstance(right, bool):
+        return (
+            isinstance(left, bool)
+            and isinstance(right, bool)
+            and left == right
+        )
+    if isinstance(left, str) or isinstance(right, str):
+        return isinstance(left, str) and isinstance(right, str) and left == right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return left == right
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            rule_values_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right)
+        )
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(
+            rule_values_equal(left[key], right[key]) for key in left
+        )
+    return False
+
+
+def _rule_node_form(node: dict[str, Any]) -> str:
+    """The structural form of one validated rule node.
+
+    This is :func:`explain_rule`'s ``node_type``: ``leaf`` for a
+    locator/comparison node regardless of which locator or comparison it
+    carries, otherwise the compound key ``all``/``any``/``not``.
+    """
+    if set(node.keys()) & _LOCATOR_KEYS:
+        return "leaf"
+    (key,) = set(node.keys())
+    return key
+
+
+def _rule_node_children(node: dict[str, Any], form: str) -> list[Any]:
+    """The ordered child nodes of a compound node (``[]`` for a leaf)."""
+    if form in ("all", "any"):
+        return node[form]
+    if form == "not":
+        return [node["not"]]
+    return []
+
+
+def compare_rules(
+    left: dict[str, Any], right: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Diff two validated rule trees as a stable, ordered change list.
+
+    Equality is :func:`rule_values_equal` over the whole tree: object key
+    order and JSON whitespace are insignificant, arrays compare
+    positionally, and numbers compare by value while strings, booleans and
+    null stay strictly distinct. The result is a list of entries, each::
+
+        {"change": "added"|"removed"|"changed",
+         "rule_path": [int, ...], "left": <node|null>, "right": <node|null>}
+
+    ``rule_path`` is the integer child-index path :func:`explain_rule`
+    assigns (root ``[]``, first child ``[0]``). ``added``/``removed``
+    record a complete node present only on the right/left side, with the
+    missing side ``null``; ``changed`` records two nodes at the same path
+    that differ. When two nodes share form and child count but are still
+    unequal, only the first differing child is descended into; when the
+    form differs, or an ``all``/``any`` node's child count differs, the
+    difference is recorded as one ``changed`` entry at the current path —
+    with each extra trailing ``all``/``any`` child additionally itemized
+    as ``added``/``removed`` at its own path — and no common child is
+    descended into. Entries are emitted in pre-order, which is also their
+    lexicographic ``rule_path`` order, so the list is stable. Equal trees
+    yield an empty list. The diff is pure: it reads only the two trees and
+    touches no state, claim value or evidence.
+    """
+    changes: list[dict[str, Any]] = []
+
+    def record(
+        change: str, path: list[int], left_node: Any, right_node: Any
+    ) -> None:
+        changes.append(
+            {
+                "change": change,
+                "rule_path": list(path),
+                "left": left_node,
+                "right": right_node,
+            }
+        )
+
+    def visit(left_node: Any, right_node: Any, path: list[int]) -> None:
+        if rule_values_equal(left_node, right_node):
+            return
+        left_form = _rule_node_form(left_node)
+        right_form = _rule_node_form(right_node)
+        if left_form != right_form:
+            record("changed", path, left_node, right_node)
+            return
+        left_children = _rule_node_children(left_node, left_form)
+        right_children = _rule_node_children(right_node, right_form)
+        if len(left_children) != len(right_children):
+            # Only an all/any node can keep one form across a different
+            # child count. The nodes differ at this path, and each extra
+            # trailing child is a complete node of its own.
+            record("changed", path, left_node, right_node)
+            common = min(len(left_children), len(right_children))
+            for position in range(common, len(left_children)):
+                record(
+                    "removed",
+                    [*path, position],
+                    left_children[position],
+                    None,
+                )
+            for position in range(common, len(right_children)):
+                record(
+                    "added",
+                    [*path, position],
+                    None,
+                    right_children[position],
+                )
+            return
+        if not left_children:
+            # Two unequal leaves have no child to descend into.
+            record("changed", path, left_node, right_node)
+            return
+        for position, (left_child, right_child) in enumerate(
+            zip(left_children, right_children)
+        ):
+            if not rule_values_equal(left_child, right_child):
+                visit(left_child, right_child, [*path, position])
+                return
+
+    visit(left, right, [])
+    return changes

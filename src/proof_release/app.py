@@ -152,6 +152,7 @@ from proof_release.envelopes import (
 from proof_release.policies import (
     InvalidRule,
     canonical_rule_json,
+    compare_rules,
     evaluate_rule,
     explain_rule,
     rule_structure,
@@ -8935,6 +8936,135 @@ def create_app(
                     "policies": policies,
                     "next_cursor": next_cursor,
                     "complete": complete,
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
+
+    @app.get("/v1/policies/compare")
+    def compare_policies(
+        request: Request,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        left_policy_id: str = Query(...),
+        right_policy_id: str = Query(...),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Compare the immutable rule trees of two persisted versions.
+
+        The range is fixed by the mandatory tenant and workload plus the
+        two policy identifiers, all canonical lowercase UUIDs; any missing,
+        blank, repeated, unknown or malformed parameter and any non-empty
+        request body is a 422 judged before any policy is read. An unknown
+        or cross-scope identifier on either side is one indistinguishable
+        404 (existence is never revealed); comparing a version with itself
+        is legal. Only the immutable rule trees participate in
+        ``identical`` — name, version, created_at and status never do —
+        under the rule evaluator's numeric equality (``1`` equals ``1.0``,
+        ``true`` does not equal ``1``), with object key order and JSON
+        whitespace insignificant and arrays positional. Comparing a
+        retired version is legal, changes nothing and never readmits it
+        to decisions. The handler issues only SELECTs — it never creates,
+        retires or otherwise mutates a version, appends no audit record
+        and takes no decision — and a storage failure aborts the whole
+        request with a 500 rather than returning a partial comparison.
+        """
+        # --- request shape (all 422, no storage touched) ----------------
+        allowed_params = {
+            "tenant_id",
+            "workload_id",
+            "left_policy_id",
+            "right_policy_id",
+        }
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+        # Each parameter is a single scalar string; a repeated parameter
+        # (even of an allowed name) is rejected rather than silently
+        # treated as last-wins.
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(
+                status_code=422, detail="query parameter must appear once"
+            )
+
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        # Both identifiers must be canonical lowercase UUIDs; a blank,
+        # whitespace-padded, upper-case or otherwise malformed value is a
+        # format error judged before any policy is read.
+        if not _UUID_RE.fullmatch(left_policy_id) or not _UUID_RE.fullmatch(
+            right_policy_id
+        ):
+            raise HTTPException(
+                status_code=422, detail="invalid policy identifier"
+            )
+
+        # --- read-only fetch --------------------------------------------
+        try:
+            with session_factory() as session:
+                left_policy = session.get(Policy, left_policy_id)
+                right_policy = session.get(Policy, right_policy_id)
+                for policy in (left_policy, right_policy):
+                    # Do not reveal whether an out-of-scope or unknown
+                    # policy exists: unknown id and scope mismatch share
+                    # one indistinguishable 404.
+                    if (
+                        policy is None
+                        or policy.tenant_id != tenant_id
+                        or policy.workload_id != workload_id
+                    ):
+                        raise HTTPException(
+                            status_code=404, detail="policy not found"
+                        )
+                left_rule = json.loads(left_policy.rule_json)
+                right_rule = json.loads(right_policy.rule_json)
+                sides = [
+                    {
+                        "policy_id": policy.policy_id,
+                        "name": policy.name,
+                        "version": policy.version,
+                        "status": policy.status,
+                        "created_at": _rfc3339(policy.created_at),
+                        "retired_at": (
+                            _rfc3339(policy.retired_at)
+                            if policy.retired_at is not None
+                            else None
+                        ),
+                    }
+                    for policy in (left_policy, right_policy)
+                ]
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("policy compare failed")
+            raise HTTPException(
+                status_code=500, detail="policy registry unavailable"
+            )
+
+        changes = compare_rules(left_rule, right_rule)
+
+        # Compact container (tenant_id, workload_id, left, right,
+        # identical, changes) with a single terminating newline. Rule
+        # numbers re-serialize from the persisted canonical JSON without
+        # float coercion, and no evidence, claim value, capability, key or
+        # exception text is ever included.
+        body = (
+            json.dumps(
+                {
+                    "tenant_id": tenant_id,
+                    "workload_id": workload_id,
+                    "left": sides[0],
+                    "right": sides[1],
+                    "identical": not changes,
+                    "changes": changes,
                 },
                 separators=(",", ":"),
                 allow_nan=False,
