@@ -41,6 +41,8 @@ __all__ = [
     "evaluate_rule",
     "explain_rule",
     "rule_structure",
+    "rules_equal",
+    "diff_rules",
     "canonical_rule_json",
     "MAX_RULE_DEPTH",
     "MAX_RULE_NODES",
@@ -486,3 +488,150 @@ def rule_structure(rule: dict[str, Any]) -> list[tuple[tuple[int, ...], str]]:
 
     visit(rule, [])
     return skeleton
+
+
+def _json_values_equal(left: Any, right: Any) -> bool:
+    """Structural JSON equality under the evaluator's scalar semantics.
+
+    Object key order is insignificant and arrays compare element-wise by
+    position. Scalars use the same type-strict equality
+    :func:`_scalar_equals` defines: numbers of either width compare by
+    value (``1`` equals ``1.0``) while booleans are never numbers and
+    ``null`` only equals ``null``.
+    """
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(
+            _json_values_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            _json_values_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right)
+        )
+    if isinstance(left, (dict, list)) or isinstance(right, (dict, list)):
+        return False
+    return _scalar_equals(left, right)
+
+
+def rules_equal(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """True when two validated rule trees are structurally equal.
+
+    Only the rule trees participate: policy metadata (name, version,
+    status, timestamps) never does. Equality is
+    :func:`_json_values_equal` over the two trees, so object key order
+    and JSON whitespace in the persisted serialization are insignificant,
+    arrays compare by position, strings, booleans and null are strictly
+    distinct, and numbers follow the evaluator's numeric equality.
+    """
+    return _json_values_equal(left, right)
+
+
+def _node_form(node: dict[str, Any]) -> str:
+    """The structural form of a validated rule node.
+
+    One of ``leaf``, ``all``, ``any`` or ``not`` — the same classification
+    :func:`explain_rule` and :func:`rule_structure` emit as ``node_type``.
+    """
+    keys = set(node.keys())
+    if len(keys) == 2 and keys & _LOCATOR_KEYS:
+        return "leaf"
+    (key,) = keys
+    return key
+
+
+def diff_rules(
+    left: dict[str, Any], right: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Diff two validated rule trees as a stable list of node changes.
+
+    The result is empty exactly when :func:`rules_equal` holds. Every
+    entry carries, in order::
+
+        {"change": "added"|"removed"|"changed",
+         "rule_path": [int, ...], "left": <node|null>, "right": <node|null>}
+
+    ``rule_path`` is the integer child-index path :func:`explain_rule`
+    defines. ``added``/``removed`` name a complete node only the
+    right/left tree carries (the absent side is ``null``); ``changed``
+    names two unequal nodes at the same path. Two nodes of different
+    forms, or two unequal leaves, record a single ``changed`` at their
+    path without descending. Two unequal ``all``/``any``/``not`` nodes
+    with equal child counts descend into only the first differing child.
+    An ``all``/``any`` pair whose child counts differ records one
+    ``changed`` at its own path plus one ``added``/``removed`` per
+    trailing child of the longer list. Entries are stably sorted by
+    ``(rule_path, change)``.
+    """
+    changes: list[dict[str, Any]] = []
+
+    def visit(
+        left_node: dict[str, Any], right_node: dict[str, Any], path: list[int]
+    ) -> None:
+        if _json_values_equal(left_node, right_node):
+            return
+        left_form = _node_form(left_node)
+        right_form = _node_form(right_node)
+        if left_form != right_form or left_form == "leaf":
+            changes.append(
+                {
+                    "change": "changed",
+                    "rule_path": list(path),
+                    "left": left_node,
+                    "right": right_node,
+                }
+            )
+            return
+        if left_form == "not":
+            visit(left_node["not"], right_node["not"], [*path, 0])
+            return
+        # all/any under the same keyword.
+        key = left_form
+        left_children = left_node[key]
+        right_children = right_node[key]
+        if len(left_children) == len(right_children):
+            # Same form and child count but still unequal: record only
+            # the first differing child.
+            for position in range(len(left_children)):
+                if not _json_values_equal(
+                    left_children[position], right_children[position]
+                ):
+                    visit(
+                        left_children[position],
+                        right_children[position],
+                        [*path, position],
+                    )
+                    break
+            return
+        # Child counts differ: one changed entry at this path, plus one
+        # added/removed entry per trailing child of the longer list.
+        changes.append(
+            {
+                "change": "changed",
+                "rule_path": list(path),
+                "left": left_node,
+                "right": right_node,
+            }
+        )
+        common = min(len(left_children), len(right_children))
+        for position in range(common, len(right_children)):
+            changes.append(
+                {
+                    "change": "added",
+                    "rule_path": [*path, position],
+                    "left": None,
+                    "right": right_children[position],
+                }
+            )
+        for position in range(common, len(left_children)):
+            changes.append(
+                {
+                    "change": "removed",
+                    "rule_path": [*path, position],
+                    "left": left_children[position],
+                    "right": None,
+                }
+            )
+
+    visit(left, right, [])
+    changes.sort(key=lambda entry: (entry["rule_path"], entry["change"]))
+    return changes

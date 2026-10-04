@@ -152,6 +152,7 @@ from proof_release.envelopes import (
 from proof_release.policies import (
     InvalidRule,
     canonical_rule_json,
+    diff_rules,
     evaluate_rule,
     explain_rule,
     rule_structure,
@@ -8935,6 +8936,147 @@ def create_app(
                     "policies": policies,
                     "next_cursor": next_cursor,
                     "complete": complete,
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
+
+    @app.get("/v1/policies/compare")
+    def compare_policies(
+        request: Request,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        left_policy_id: str = Query(...),
+        right_policy_id: str = Query(...),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Compare the immutable rule trees of two persisted versions.
+
+        The request carries exactly the four required query parameters —
+        ``tenant_id``, ``workload_id``, ``left_policy_id`` and
+        ``right_policy_id`` — and no body. A missing, blank, wrong-typed,
+        duplicated or unknown parameter, a non-canonical (non-lowercase)
+        policy UUID, or any non-empty body is a 422 raised before any
+        policy is read. An unknown or out-of-scope identifier on either
+        side is one indistinguishable 404 (existence is never revealed);
+        comparing a version with itself is legal. The handler issues only
+        SELECTs: it never creates, retires or otherwise mutates a version,
+        appends no audit record and influences no decision, and a storage
+        failure aborts the whole request with a 500.
+
+        Only the two immutable rule trees determine ``identical`` and
+        ``changes``; name, version, status and timestamps are reported but
+        never compared. Comparing a retired version is legal and changes
+        nothing: the version keeps its status and never re-enters
+        decisioning. The response is compact JSON with a single
+        terminating newline and contains no evidence, claim value,
+        capability, key or exception text.
+        """
+        # --- request shape (all 422, no storage touched) ----------------
+        allowed_params = {
+            "tenant_id",
+            "workload_id",
+            "left_policy_id",
+            "right_policy_id",
+        }
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+        # Each parameter is a single scalar string; a repeated parameter
+        # (even of an allowed name) is rejected rather than silently
+        # treated as last-wins.
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(
+                status_code=422, detail="query parameter must appear once"
+            )
+
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        # Both identifiers must be canonical lowercase UUIDs; the raw
+        # values must match exactly. This runs before any storage access.
+        if not _UUID_RE.fullmatch(left_policy_id) or not _UUID_RE.fullmatch(
+            right_policy_id
+        ):
+            raise HTTPException(
+                status_code=422, detail="invalid policy identifier"
+            )
+
+        # --- read-only lookup -------------------------------------------
+        try:
+            with session_factory() as session:
+                left_row = session.get(Policy, left_policy_id)
+                # A version compared with itself is one row read once.
+                right_row = (
+                    left_row
+                    if right_policy_id == left_policy_id
+                    else session.get(Policy, right_policy_id)
+                )
+                for row in (left_row, right_row):
+                    # Do not reveal whether an out-of-scope or unknown
+                    # policy exists: unknown id and scope mismatch share
+                    # one indistinguishable 404.
+                    if (
+                        row is None
+                        or row.tenant_id != tenant_id
+                        or row.workload_id != workload_id
+                    ):
+                        raise HTTPException(
+                            status_code=404, detail="policy not found"
+                        )
+                # The persisted canonical rule JSON is re-parsed without
+                # float coercion, so decimals and -0.0 compare exactly as
+                # created.
+                left_rule = json.loads(left_row.rule_json)
+                right_rule = json.loads(right_row.rule_json)
+
+                def _side(row: Policy) -> dict:
+                    return {
+                        "policy_id": row.policy_id,
+                        "name": row.name,
+                        "version": row.version,
+                        "status": row.status,
+                        "created_at": _rfc3339(row.created_at),
+                        "retired_at": (
+                            _rfc3339(row.retired_at)
+                            if row.retired_at is not None
+                            else None
+                        ),
+                    }
+
+                left_side = _side(left_row)
+                right_side = _side(right_row)
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("policy compare failed")
+            raise HTTPException(
+                status_code=500, detail="policy registry unavailable"
+            )
+
+        changes = diff_rules(left_rule, right_rule)
+        # Compact container (tenant_id, workload_id, left, right,
+        # identical, changes) with a single terminating newline. Rule
+        # numbers round-trip verbatim from the persisted canonical JSON;
+        # the only other non-string scalars are the integer versions and
+        # the boolean identical, so floats and non-finite values are
+        # impossible there.
+        body = (
+            json.dumps(
+                {
+                    "tenant_id": tenant_id,
+                    "workload_id": workload_id,
+                    "left": left_side,
+                    "right": right_side,
+                    "identical": not changes,
+                    "changes": changes,
                 },
                 separators=(",", ":"),
                 allow_nan=False,
