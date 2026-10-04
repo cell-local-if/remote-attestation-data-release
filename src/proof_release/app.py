@@ -137,6 +137,7 @@ from proof_release.db import (
     TrustRoot,
     TrustRootCommitCounter,
     WorkloadIdentityClaim,
+    WorkloadIdentityIdempotencyRecord,
     WorkloadIdentityProfile,
 )
 from proof_release.envelopes import (
@@ -904,6 +905,67 @@ def _canonical_claim_set(
         separators=(",", ":"),
     ).encode("utf-8")
     return ordered, hashlib.sha256(canonical).hexdigest()
+
+
+def _workload_identity_request_fingerprint(
+    tenant_id: str, workload_id: str, trust_root_id: str, claims_fingerprint: str
+) -> str:
+    """Hash the request identity a keyed registration replay must match.
+
+    Covers exactly the equivalence range fixed by the contract: the scope
+    (tenant, workload), the anchor trust root and the normalized claim-set
+    fingerprint (claims compare as an unordered, de-duplicated set, so a
+    reordered or duplicated submission of the same set hashes identically).
+    Only this non-sensitive identity is hashed — never certificate
+    material, evidence, capabilities, keys or exception text. Canonical
+    JSON with sorted keys makes equivalent requests hash identically.
+    """
+    payload = json.dumps(
+        {
+            "tenant_id": tenant_id,
+            "workload_id": workload_id,
+            "trust_root_id": trust_root_id,
+            "claims_fingerprint": claims_fingerprint,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _workload_identity_created_body(
+    profile_id: str,
+    tenant_id: str,
+    workload_id: str,
+    trust_root_id: str,
+    claims: list[tuple[str, str, str]],
+    created_at: datetime,
+) -> str:
+    """Render the exact compact 201 registration body.
+
+    This is the wire form persisted verbatim by the first successful
+    idempotency-keyed registration and returned byte-for-byte on every
+    later same-key replay (including the original ``profile_id`` and
+    ``created_at``), so its serialization must never depend on
+    response-time clock or state. The field order and compact shape match
+    the unkeyed response exactly; claims are the de-duplicated set in
+    first-seen order.
+    """
+    return json.dumps(
+        {
+            "profile_id": profile_id,
+            "tenant_id": tenant_id,
+            "workload_id": workload_id,
+            "trust_root_id": trust_root_id,
+            "claims": [
+                {"issuer": issuer, "subject": subject, "uri": uri}
+                for issuer, subject, uri in claims
+            ],
+            "created_at": _rfc3339(created_at),
+        },
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 def _identity_json(payload) -> Response:
@@ -7297,7 +7359,9 @@ def create_app(
         return _compact_json(payload)
 
     @app.post("/v1/workload-identities", status_code=201)
-    def register_workload_identity(body: RegisterWorkloadIdentityRequest) -> Response:
+    def register_workload_identity(
+        request: Request, body: RegisterWorkloadIdentityRequest
+    ) -> Response:
         """Register a workload identity profile under a configured trust root.
 
         Field and format validation is completed by the request model
@@ -7312,6 +7376,17 @@ def create_app(
         identifiers, the scope, the non-sensitive comparison strings and
         a timestamp — never certificate material or exception detail.
         """
+        # The idempotency key is optional and lives only in a header; the
+        # body contract is unchanged. A missing key preserves the original
+        # one-profile-per-distinct-claim-set semantics exactly. An illegal
+        # key (duplicated header, empty value, whitespace padding,
+        # control/non-ASCII character, or over-long value) is a 422 before
+        # any state is read or written.
+        idem_present, idempotency_key = _read_idempotency_key(request)
+
+        if idem_present:
+            return _register_workload_identity_keyed(body, idempotency_key)
+
         raw_claims = [
             (claim.issuer, claim.subject, claim.uri) for claim in body.claims
         ]
@@ -7414,23 +7489,218 @@ def create_app(
                 raise HTTPException(
                     status_code=500, detail="workload identity registration failed"
                 )
-        body_bytes = json.dumps(
-            {
-                "profile_id": profile_id,
-                "tenant_id": body.tenant_id,
-                "workload_id": body.workload_id,
-                "trust_root_id": body.trust_root_id,
-                "claims": [
-                    {"issuer": issuer, "subject": subject, "uri": uri}
-                    for issuer, subject, uri in claims
-                ],
-                "created_at": _rfc3339(now),
-            },
-            separators=(",", ":"),
-            allow_nan=False,
+        body_bytes = _workload_identity_created_body(
+            profile_id,
+            body.tenant_id,
+            body.workload_id,
+            body.trust_root_id,
+            claims,
+            now,
         ).encode("utf-8")
         return Response(
             content=body_bytes, status_code=201, media_type="application/json"
+        )
+
+    def _register_workload_identity_keyed(
+        body: RegisterWorkloadIdentityRequest, idempotency_key: str
+    ) -> Response:
+        """Register one workload identity profile under an ``Idempotency-Key``.
+
+        The profile, its claims and the idempotency record are one atomic
+        commit under the trust-root row lock: the lookup-then-insert runs
+        in a single transaction, with the unique (scope, key) constraint
+        plus the IntegrityError reread below settling concurrent
+        submissions so at most one profile is ever created per key. Every
+        judgement failure raises out of the context manager (or an
+        explicit rollback), so a failed attempt leaves neither a profile,
+        nor claims, nor a record, and the key stays free for a recovered
+        retry.
+        """
+        raw_claims = [
+            (claim.issuer, claim.subject, claim.uri) for claim in body.claims
+        ]
+        # The same set normalization as the unkeyed path: a replay is
+        # recognized on the normalized claim set, not the raw submission.
+        claims, claims_fingerprint = _canonical_claim_set(raw_claims)
+        fingerprint = _workload_identity_request_fingerprint(
+            body.tenant_id, body.workload_id, body.trust_root_id, claims_fingerprint
+        )
+
+        saved_body: str | None = None
+        for _ in range(10):
+            with session_factory() as session:
+                try:
+                    existing = session.scalar(
+                        select(WorkloadIdentityIdempotencyRecord).where(
+                            WorkloadIdentityIdempotencyRecord.tenant_id
+                            == body.tenant_id,
+                            WorkloadIdentityIdempotencyRecord.workload_id
+                            == body.workload_id,
+                            WorkloadIdentityIdempotencyRecord.idempotency_key
+                            == idempotency_key,
+                        )
+                    )
+                    if existing is not None:
+                        # A replay never creates a profile and never
+                        # changes the existing claims: the stored first
+                        # 201 is returned verbatim, retaining the original
+                        # profile_id and created_at. A same-key request
+                        # whose trust root or normalized claim set differs
+                        # is a stable 409 that changes neither the
+                        # original profile nor this record.
+                        if not hmac.compare_digest(
+                            existing.request_fingerprint, fingerprint
+                        ):
+                            raise HTTPException(
+                                status_code=409,
+                                detail="idempotency key conflict",
+                            )
+                        return Response(
+                            content=existing.response_body.encode("utf-8"),
+                            status_code=201,
+                            media_type="application/json",
+                        )
+
+                    # First keyed request for this scope+key. The trust
+                    # root must exist in exactly this scope; an unknown or
+                    # cross-scope root is an indistinguishable 404 that
+                    # writes nothing and leaves the key free. The row lock
+                    # is held for the rest of the registration, exactly as
+                    # on the unkeyed path, so X.509 verification observes
+                    # the same commit boundary.
+                    trust_root = session.scalar(
+                        select(TrustRoot)
+                        .where(
+                            TrustRoot.root_id == body.trust_root_id,
+                            TrustRoot.tenant_id == body.tenant_id,
+                            TrustRoot.workload_id == body.workload_id,
+                        )
+                        .with_for_update()
+                    )
+                    if trust_root is None:
+                        raise HTTPException(
+                            status_code=404, detail="trust root not found"
+                        )
+                    # A duplicate claim set under this trust root is a
+                    # judgement failure, exactly as on the unkeyed path:
+                    # nothing is written and the key stays free.
+                    duplicate = session.scalar(
+                        select(WorkloadIdentityProfile.profile_id).where(
+                            WorkloadIdentityProfile.trust_root_id
+                            == body.trust_root_id,
+                            WorkloadIdentityProfile.claims_fingerprint
+                            == claims_fingerprint,
+                        )
+                    )
+                    if duplicate is not None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="workload identity profile already registered",
+                        )
+
+                    profile_id = str(uuid.uuid4())
+                    now = _utcnow()
+                    session.add(
+                        WorkloadIdentityProfile(
+                            profile_id=profile_id,
+                            tenant_id=body.tenant_id,
+                            workload_id=body.workload_id,
+                            trust_root_id=body.trust_root_id,
+                            claims_fingerprint=claims_fingerprint,
+                            status=WORKLOAD_IDENTITY_STATUS_ACTIVE,
+                            created_at=now,
+                        )
+                    )
+                    for seq, (issuer, subject, uri) in enumerate(claims):
+                        session.add(
+                            WorkloadIdentityClaim(
+                                claim_id=str(uuid.uuid4()),
+                                profile_id=profile_id,
+                                tenant_id=body.tenant_id,
+                                workload_id=body.workload_id,
+                                trust_root_id=body.trust_root_id,
+                                issuer=issuer,
+                                subject=subject,
+                                uri=uri,
+                                seq=seq,
+                            )
+                        )
+                    # The exact first 201 body, fixed before commit so the
+                    # stored response and the response returned to the
+                    # winner are byte-for-byte the same, including the
+                    # original profile_id and created_at.
+                    saved_body = _workload_identity_created_body(
+                        profile_id,
+                        body.tenant_id,
+                        body.workload_id,
+                        body.trust_root_id,
+                        claims,
+                        now,
+                    )
+                    session.add(
+                        WorkloadIdentityIdempotencyRecord(
+                            record_id=str(uuid.uuid4()),
+                            tenant_id=body.tenant_id,
+                            workload_id=body.workload_id,
+                            idempotency_key=idempotency_key,
+                            request_fingerprint=fingerprint,
+                            response_body=saved_body,
+                            created_at=now,
+                        )
+                    )
+                    try:
+                        # The profile, its claims and the idempotency
+                        # record commit together: a crash can never leave
+                        # one without the others.
+                        session.commit()
+                    except IntegrityError:
+                        # A concurrent request committed first — either
+                        # the same scope+key (its record is now visible)
+                        # or the same claim set under this trust root.
+                        # Reread and settle as a replay, a key conflict or
+                        # a duplicate claim set on the next pass.
+                        session.rollback()
+                        continue
+                    except Exception:
+                        # Any other commit/write failure rolls the whole
+                        # (profile + claims + record) transaction back, so
+                        # no half profile survives and the key stays free.
+                        session.rollback()
+                        logger.error("workload identity profile write failed")
+                        raise HTTPException(
+                            status_code=500,
+                            detail="workload identity registration failed",
+                        )
+                    break
+                except HTTPException:
+                    # 404/409 judgements and the controlled 500 above keep
+                    # their status; a read-only judgement has written
+                    # nothing.
+                    raise
+                except Exception:
+                    # A failure during the locked lookups is likewise a
+                    # full rollback and a sanitized 500: no profile, claim
+                    # or record row can exist.
+                    session.rollback()
+                    logger.error("workload identity registration failed")
+                    raise HTTPException(
+                        status_code=500,
+                        detail="workload identity registration failed",
+                    )
+        else:
+            # Exhausted retries without either a committed insert or a
+            # stored record to replay: a storage-level failure that must
+            # not look like a successful registration.
+            logger.error("workload identity idempotency race did not settle")
+            raise HTTPException(
+                status_code=500, detail="workload identity registration failed"
+            )
+
+        assert saved_body is not None
+        return Response(
+            content=saved_body.encode("utf-8"),
+            status_code=201,
+            media_type="application/json",
         )
 
     @app.get("/v1/workload-identities")

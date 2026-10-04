@@ -711,6 +711,60 @@ class WorkloadIdentityClaim(Base):
     seq: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class WorkloadIdentityIdempotencyRecord(Base):
+    """The first successful idempotency-keyed workload identity registration.
+
+    At most one row exists per ``(tenant_id, workload_id,
+    idempotency_key)`` triple; the same key in a different tenant or
+    workload is an independent row and never conflicts. The row is
+    inserted in the *same* transaction as the :class:`WorkloadIdentityProfile`
+    and its :class:`WorkloadIdentityClaim` rows it records, so a crash can
+    never leave a profile without its idempotency record or a record
+    pointing at no profile. A failed registration — a 404/409/422/500
+    judgement or any rollback — inserts no row, so the key stays free and
+    a later recovery re-judges the request normally.
+
+    Once committed, a same-key same-scope replay of the same normalized
+    request (same trust root and the same claim *set*) answers with the
+    stored first 201 verbatim: it never creates a second profile and never
+    changes the existing claims. A same-key request whose trust root or
+    normalized claim set differs is a stable 409 that changes nothing.
+
+    Only the scope, the caller-chosen key, the SHA-256 digest of the
+    normalized request identity (scope, trust root id and the claim-set
+    fingerprint), the stored first response body and the creation time are
+    persisted — never certificate material, evidence, capabilities,
+    private keys or exception text.
+    """
+
+    __tablename__ = "workload_identity_idempotency_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "idempotency_key",
+            name="uq_workload_identity_idempotency_scope_key",
+        ),
+    )
+
+    record_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # Caller-chosen key: 1..64 visible ASCII characters. Unique only
+    # within the (tenant, workload) scope; the same key in another scope
+    # is an independent row and never conflicts.
+    idempotency_key: Mapped[str] = mapped_column(String(64))
+    # Hex SHA-256 over the normalized request identity (tenant_id,
+    # workload_id, trust_root_id and the claim-set fingerprint); used only
+    # to detect a same-key request carrying a different trust root or
+    # claim set, which is a 409 that changes nothing.
+    request_fingerprint: Mapped[str] = mapped_column(String(64))
+    # The exact first 201 response body, stored verbatim (compact JSON)
+    # and replayed byte-for-byte on every later same-key replay.
+    response_body: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class Policy(Base):
     """A versioned release policy scoped to a tenant and workload.
 
