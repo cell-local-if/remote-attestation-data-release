@@ -163,6 +163,7 @@ from proof_release.verifiers import (
     ChallengeContext,
     CrlValidationError,
     VerificationContext,
+    VerifierPluginError,
     VerifierRegistry,
     default_registry,
     parse_crl,
@@ -6113,6 +6114,22 @@ def create_app(
                 try:
                     result = verifier.verify(verification_context)
                     accepted = bool(result.accepted)
+                except VerifierPluginError as exc:
+                    # A plugin that cannot run (e.g. the v2 shared-key
+                    # configuration is missing or invalid) fails closed:
+                    # the exception rolls the transaction back, leaving the
+                    # evidence received for a later retry. Log only
+                    # non-sensitive identifiers and the exception type.
+                    logger.error(
+                        "verifier %s for format %r failed on evidence %s: %s",
+                        type(verifier).__name__,
+                        evidence.evidence_format,
+                        evidence.evidence_id,
+                        type(exc).__name__,
+                    )
+                    raise HTTPException(
+                        status_code=500, detail="verifier plugin failure"
+                    )
                 except Exception as exc:
                     # Log only non-sensitive identifiers and the exception type —
                     # never the traceback/message, since a faulty plugin could
