@@ -136,6 +136,7 @@ from proof_release.db import (
     RewrapJobIdempotencyRecord,
     TrustRoot,
     TrustRootCommitCounter,
+    VerificationRateLimitCounter,
     WorkloadIdentityClaim,
     WorkloadIdentityIdempotencyRecord,
     WorkloadIdentityProfile,
@@ -222,6 +223,17 @@ GRANT_BUDGET_PER_MINUTE = 5
 #: independent of the one-time-grant budget (different counter table):
 #: grant consumption, revocation and payload release do not draw from it.
 CHALLENGE_ISSUANCE_BUDGET_PER_MINUTE = 5
+
+#: Per-(tenant, workload) admission budget for
+#: ``POST /v1/evidence/{evidence_id}/verify``: at most this many fully
+#: validated requests may enter the verifier during one UTC natural
+#: minute. Only requests whose identity, challenge binding, nonce, digest
+#: and format all check out — and whose evidence is still unsettled —
+#: reach the budget, so 404/401/422 responses and settled-evidence replays
+#: spend nothing. The budget lives in its own counter table and is fully
+#: independent of both the one-time-grant budget and the challenge
+#: issuance budget: the three never share rows, quota or lock traffic.
+VERIFICATION_BUDGET_PER_MINUTE = 5
 
 #: Fixed page size for the read-only release-grant audit listing. The
 #: listing is cursor-driven; the page size is an internal constant and is
@@ -4503,6 +4515,112 @@ def create_app(
                 raise HTTPException(status_code=500, detail="rate limit unavailable")
         return None
 
+    def _reserve_verification_slot(tenant_id: str, workload_id: str) -> None:
+        """Reserve one slot of the per-scope, per-UTC-minute verification budget.
+
+        Called only after every pre-validator check (identity, challenge
+        binding, nonce, digest, format, not-yet-settled) has passed and
+        before the verifier starts. Returns ``None`` when the request is
+        admitted: one durable slot is committed in its own transaction, so
+        the reservation survives restarts and is never refunded when the
+        verifier, a revocation registry or the settlement later fails —
+        the evidence simply stays ``received`` for a retry that will need a
+        fresh slot. An over-budget minute raises 429 with the fixed detail
+        and a ``Retry-After`` of the whole seconds remaining in the
+        current UTC minute; nothing is written. A counter read or write
+        that cannot complete raises 500 and the caller never enters the
+        verifier.
+        """
+        now = _utcnow()
+        window_start = _utc_minute_window(now)
+        with session_factory() as session:
+            try:
+                admitted = False
+                for _ in range(2):
+                    # Lock the scope's minute row when one exists. SQLite
+                    # ignores FOR UPDATE but every write transaction already
+                    # begins as BEGIN IMMEDIATE, serializing concurrent
+                    # reservations process-wide; on locking backends the row
+                    # lock orders them so exactly the budgeted number of
+                    # requests in the minute can be admitted.
+                    row = session.scalar(
+                        select(VerificationRateLimitCounter)
+                        .where(
+                            VerificationRateLimitCounter.tenant_id == tenant_id,
+                            VerificationRateLimitCounter.workload_id
+                            == workload_id,
+                            VerificationRateLimitCounter.window_start
+                            == window_start,
+                        )
+                        .with_for_update()
+                    )
+                    if row is None:
+                        # The first admitted request of the minute
+                        # initializes the counter at one. A concurrent
+                        # initializer on a locking backend may win the
+                        # unique constraint; that race is retried as an
+                        # increment below.
+                        session.add(
+                            VerificationRateLimitCounter(
+                                tenant_id=tenant_id,
+                                workload_id=workload_id,
+                                window_start=window_start,
+                                count=1,
+                            )
+                        )
+                        try:
+                            session.flush()
+                        except IntegrityError:
+                            session.rollback()
+                            continue
+                        admitted = True
+                        break
+                    if row.count >= VERIFICATION_BUDGET_PER_MINUTE:
+                        # Budget exhausted: no counter write, no settlement,
+                        # no lifecycle event and no audit. The retry hint is
+                        # the whole seconds left in the current UTC minute,
+                        # recomputed at response time.
+                        session.rollback()
+                        raise HTTPException(
+                            status_code=429,
+                            detail="verification rate limit exceeded",
+                            headers={
+                                "Retry-After": str(
+                                    _seconds_until_next_minute(_utcnow())
+                                )
+                            },
+                        )
+                    row.count = row.count + 1
+                    admitted = True
+                    break
+                if not admitted:
+                    # Defensive: the unique-insert retry loop failed to
+                    # settle, which the single retry above makes
+                    # unreachable.
+                    session.rollback()
+                    logger.error(
+                        "verification rate-limit reservation could not settle"
+                    )
+                    raise HTTPException(
+                        status_code=500,
+                        detail="verification rate limit unavailable",
+                    )
+                session.commit()
+            except HTTPException:
+                raise
+            except Exception:
+                # A counter read/write that cannot complete fails closed:
+                # the whole reservation transaction rolls back, leaving no
+                # half count, and the evidence stays received so the
+                # identical request can be retried after recovery.
+                session.rollback()
+                logger.error("verification rate-limit counter unavailable")
+                raise HTTPException(
+                    status_code=500,
+                    detail="verification rate limit unavailable",
+                )
+        return None
+
     # ------------------------------------------------------------------
     # Persistent asynchronous rewrap jobs
     # ------------------------------------------------------------------
@@ -5756,6 +5874,67 @@ def create_app(
     ) -> EvidenceVerifiedResponse:
         evidence_digest = hashlib.sha256(body.evidence.encode("utf-8")).hexdigest()
         nonce_digest = _nonce_digest(body.nonce)
+        # Admission gate for the persistent per-scope verification budget.
+        # This read-only pre-flight runs, in the same order and with the
+        # same responses as the settlement transaction below, every check
+        # that must pass before the verifier may start: unknown or
+        # cross-scope evidence is 404, a nonce mismatch is 401, a digest
+        # mismatch or an unregistered format is 422, and an already
+        # settled evidence returns its stored conclusion verbatim without
+        # reading a verifier plugin. None of these outcomes touches the
+        # budget. Only a request that passes all of them against evidence
+        # still in ``received`` reserves a slot and enters the verifier.
+        with session_factory() as session:
+            evidence = session.scalar(
+                select(Evidence).where(Evidence.evidence_id == evidence_id)
+            )
+            if (
+                evidence is None
+                or evidence.tenant_id != body.tenant_id
+                or evidence.workload_id != body.workload_id
+            ):
+                raise HTTPException(status_code=404, detail="evidence not found")
+
+            challenge = session.get(Challenge, evidence.challenge_id)
+            if (
+                challenge is None
+                or challenge.tenant_id != body.tenant_id
+                or challenge.workload_id != body.workload_id
+            ):
+                raise HTTPException(status_code=404, detail="evidence not found")
+
+            if not hmac.compare_digest(challenge.nonce_digest, nonce_digest):
+                raise HTTPException(status_code=401, detail="invalid nonce")
+
+            if evidence.status in ("verified", "rejected"):
+                # Settled replay: the first conclusion is returned verbatim,
+                # no plugin is read and no budget is consumed.
+                return EvidenceVerifiedResponse(
+                    evidence_id=evidence.evidence_id,
+                    challenge_id=evidence.challenge_id,
+                    status=evidence.status,
+                    verified_at=_rfc3339(evidence.verified_at),
+                )
+
+            if not hmac.compare_digest(evidence.evidence_sha256, evidence_digest):
+                raise HTTPException(
+                    status_code=422, detail="evidence digest mismatch"
+                )
+
+            if registry.get(evidence.evidence_format) is None:
+                raise HTTPException(
+                    status_code=422, detail="unsupported evidence format"
+                )
+
+        # Every pre-validator check passed and the evidence is still
+        # received: atomically reserve one slot of this scope's per-minute
+        # verification budget before the verifier starts. The reservation
+        # commits in its own transaction, so it survives restarts and is
+        # never refunded by a later verifier, registry or settlement
+        # failure. Over budget is a 429 that changes nothing; a counter
+        # failure is a 500 with the evidence left received.
+        _reserve_verification_slot(body.tenant_id, body.workload_id)
+
         with session_factory() as session:
             # Lock the evidence row for the duration of verification. On
             # locking backends a concurrent verifier blocks here until the

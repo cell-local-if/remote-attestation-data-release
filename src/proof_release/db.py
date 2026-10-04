@@ -1901,3 +1901,50 @@ class ChallengeIssuanceCounter(Base):
     # Number of challenges issued during this window; capped at the
     # per-minute issuance budget by the atomic admission transaction.
     count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class VerificationRateLimitCounter(Base):
+    """Persistent per-scope admission counter for evidence verification.
+
+    One row exists per ``(tenant_id, workload_id, window_start)`` triple,
+    where ``window_start`` is the UTC natural minute (seconds and
+    sub-seconds truncated) in which a fully validated ``POST
+    /v1/evidence/{evidence_id}/verify`` request was admitted into the
+    verifier. The budget is attributed solely to the two request scope
+    fields: the evidence id, challenge id, nonce and evidence bytes never
+    participate in the window. This counter is deliberately separate from
+    both :class:`RateLimitCounter` (one-time-grant consumption, revocation
+    and payload release) and :class:`ChallengeIssuanceCounter` (challenge
+    issuance): verification is independent of all of them, so the counters
+    never share rows, quota or lock traffic, and different tenants or
+    workloads never share a row.
+
+    A slot is reserved in its own committed transaction after every
+    pre-validator check (identity, challenge binding, nonce, digest,
+    format, not-yet-settled) has passed and before the verifier starts, so
+    the count is durable (it survives process restarts) and is never
+    refunded when the verifier or a revocation registry later fails with
+    500. A rejected (over-budget) request writes nothing — no counter, no
+    settlement, no lifecycle event and no audit. A new UTC minute starts
+    a new row, which restores the quota automatically; quotas are never
+    borrowed across scopes or minutes.
+    """
+
+    __tablename__ = "verification_rate_limit_counters"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "window_start",
+            name="uq_verification_rate_limit_counter_scope_window",
+        ),
+    )
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # UTC minute boundary at which the window starts, truncated to seconds.
+    window_start: Mapped[datetime] = mapped_column(UTCDateTime(), primary_key=True)
+    # Number of requests admitted into the verifier during this window;
+    # capped at the per-minute verification budget by the atomic
+    # reservation transaction.
+    count: Mapped[int] = mapped_column(Integer, default=0)
