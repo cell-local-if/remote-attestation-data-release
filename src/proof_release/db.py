@@ -1258,6 +1258,80 @@ class DataEnvelopeIdempotencyRecord(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
+class DataEnvelopeRewrapIdempotencyRecord(Base):
+    """The first successful idempotency-keyed single-envelope rewrap.
+
+    This table belongs exclusively to ``POST
+    /v1/data-envelopes/{data_id}/rewrap``: it is a different table from
+    :class:`DataEnvelopeIdempotencyRecord` (envelope creation),
+    :class:`RewrapBatch` submission state and
+    :class:`RewrapJobIdempotencyRecord` (asynchronous jobs), so a key
+    used on any of those operations never conflicts with the same key
+    used here and vice versa.
+
+    At most one row exists per ``idempotency_key``. The key namespace is
+    global for this operation: the scope (tenant, workload) and the
+    data_id are part of the recorded request identity, so a same-key
+    request naming a different tenant, workload or data_id is a stable
+    409 rather than an independent replay. The row is inserted in the
+    *same* transaction as the envelope's ``key_version`` and
+    ``wrapped_key`` rotation (and its rewrap audit event), so a crash can
+    never leave a rotated envelope without its idempotency record, nor a
+    record claiming a rotation that did not commit. A failed rewrap — a
+    404/422/500 judgement, a lost update race, or any rollback — inserts
+    no row, so the key stays free and a later recovery re-judges the
+    request normally.
+
+    Once committed, a same-key replay of the same request identity
+    answers with the stored first 200 verbatim: it never re-wraps, never
+    changes a key version, never appends another audit event, and
+    reports the original ``key_version`` and ``rotated_at`` even if the
+    keyring has since rotated again. A same-key request whose scope,
+    data_id or other request shape differs is a stable 409 that changes
+    neither the envelope nor the stored record.
+
+    Only the scope, the caller-chosen key, the data_id, an irreversible
+    SHA-256 digest of the non-sensitive request identity, the stored
+    first response body and the creation time are persisted — never the
+    plaintext payload, a master key, the data key, ciphertext, iv, tag
+    or wrapped key, and never exception text.
+    """
+
+    __tablename__ = "data_envelope_rewrap_idempotency_records"
+    __table_args__ = (
+        # The key is globally unique for this operation: scope and
+        # data_id live inside the recorded request identity, so a
+        # same-key request for another scope/data_id is a 409, not an
+        # independent row. The constraint is also what settles concurrent
+        # identical submissions as exactly one rotation plus replays.
+        UniqueConstraint(
+            "idempotency_key",
+            name="uq_data_envelope_rewrap_idempotency_key",
+        ),
+    )
+
+    record_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # Caller-chosen key: 1..64 visible ASCII characters. Unique for this
+    # operation across every scope; the same key on envelope creation, a
+    # rewrap batch or an asynchronous job lives in another table and
+    # never conflicts.
+    idempotency_key: Mapped[str] = mapped_column(String(64))
+    # The data_id rewrapped by the first legal keyed request; part of
+    # the request identity a replay must match.
+    data_id: Mapped[str] = mapped_column(String(256))
+    # Hex SHA-256 over the normalized request identity (canonical
+    # tenant_id, workload_id and data_id); used only to detect a
+    # same-key request carrying a different scope or data_id, which is a
+    # 409 that changes nothing. No key or envelope material participates.
+    request_fingerprint: Mapped[str] = mapped_column(String(64))
+    # The exact first 200 response body, stored verbatim (compact JSON)
+    # and replayed byte-for-byte on every later same-key replay.
+    response_body: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class ReleaseGrant(Base):
     """A one-time, TTL-bounded capability that releases one data item.
 

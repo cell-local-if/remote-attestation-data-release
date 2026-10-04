@@ -116,6 +116,7 @@ from proof_release.db import (
     DataEnvelope,
     DataEnvelopeCommitCounter,
     DataEnvelopeIdempotencyRecord,
+    DataEnvelopeRewrapIdempotencyRecord,
     Decision,
     DecisionCommitCounter,
     DecisionEvaluationNode,
@@ -675,6 +676,61 @@ def _data_envelope_created_body(
             "workload_id": workload_id,
             "key_version": key_version,
             "created_at": _rfc3339(created_at),
+        },
+        separators=(",", ":"),
+        allow_nan=False,
+        ensure_ascii=False,
+    )
+
+
+def _data_envelope_rewrap_fingerprint(
+    tenant_id: str, workload_id: str, data_id: str
+) -> str:
+    """Hash the request identity a keyed single-envelope rewrap must match.
+
+    Covers exactly the equivalence range fixed by the contract: the
+    scope (tenant, workload) from the body and the data_id from the
+    path. The rewrap body carries nothing else, so this is the whole
+    request shape. Only this non-sensitive identity is hashed — no
+    payload, master key, data key or envelope material (ciphertext, iv,
+    tag, wrapped_key) participates. Canonical JSON with sorted keys
+    makes equivalent requests hash identically.
+    """
+    payload = json.dumps(
+        {
+            "tenant_id": tenant_id,
+            "workload_id": workload_id,
+            "data_id": data_id,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _data_envelope_rewrapped_body(
+    data_id: str,
+    tenant_id: str,
+    workload_id: str,
+    key_version: int,
+    rotated_at: datetime,
+) -> str:
+    """Render the exact compact 200 rewrap body stored for replay.
+
+    This is the wire form persisted verbatim by the first successful
+    idempotency-keyed rewrap and returned byte-for-byte on every later
+    same-key replay (including the original ``key_version`` and
+    ``rotated_at``), so its serialization must never depend on
+    response-time clock, keyring or envelope state. The field order and
+    compact shape match the unkeyed response model exactly.
+    """
+    return json.dumps(
+        {
+            "data_id": data_id,
+            "tenant_id": tenant_id,
+            "workload_id": workload_id,
+            "key_version": key_version,
+            "rotated_at": _rfc3339(rotated_at),
         },
         separators=(",", ":"),
         allow_nan=False,
@@ -12963,13 +13019,252 @@ def create_app(
                 wrapped_key=b64url_encode(envelope.wrapped_key),
             )
 
+    def _rewrap_data_envelope_keyed(
+        data_id: str, body: RewrapDataEnvelopeRequest, idempotency_key: str
+    ) -> Response:
+        """Rewrap one envelope under an ``Idempotency-Key``.
+
+        The envelope rotation (when the stored version is behind the
+        current one), its rewrap audit event and the idempotency record
+        are one atomic commit: the lookup-then-insert runs in a single
+        transaction, with the globally unique key constraint plus the
+        IntegrityError reread below settling concurrent identical
+        submissions so at most one rewrap ever happens per key and every
+        loser replays the winner's first 200 byte-for-byte. Every
+        judgement failure raises out of the context manager, which rolls
+        back, so a failed attempt changes neither the envelope nor the
+        keyring-facing state and leaves no record — the key stays free
+        for a recovered retry.
+        """
+        if not data_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        fingerprint = _data_envelope_rewrap_fingerprint(
+            body.tenant_id, body.workload_id, data_id
+        )
+
+        saved_body: str | None = None
+        for _ in range(2):
+            with session_factory() as session:
+                # The key namespace for this operation is global, so the
+                # record is looked up by the key alone; the stored scope
+                # and data_id are then compared as the request identity.
+                existing = session.scalar(
+                    select(DataEnvelopeRewrapIdempotencyRecord).where(
+                        DataEnvelopeRewrapIdempotencyRecord.idempotency_key
+                        == idempotency_key,
+                    )
+                )
+                if existing is not None:
+                    # A replay never re-wraps, never changes a key
+                    # version or wrapped_key, never appends an audit
+                    # event and never re-checks the keyring — even if
+                    # the keyring has since rotated again or gone bad,
+                    # the stored first 200 is returned verbatim. The
+                    # canonical fingerprint covers the tenant, workload
+                    # and data_id, so a same-key request naming another
+                    # scope or data_id hashes differently and is a
+                    # stable 409 that changes neither the envelope nor
+                    # this record. Both digests are ASCII hex, so a
+                    # constant-time compare is always safe here even for
+                    # non-ASCII scope identifiers.
+                    if not hmac.compare_digest(
+                        existing.request_fingerprint, fingerprint
+                    ):
+                        raise HTTPException(
+                            status_code=409, detail="idempotency key conflict"
+                        )
+                    return Response(
+                        content=existing.response_body.encode("utf-8"),
+                        status_code=200,
+                        media_type="application/json",
+                    )
+
+                # First keyed request for this key. A wholly unusable
+                # keyring is a server configuration failure; the check
+                # sits inside the transaction so a failure rolls back
+                # (envelope untouched, no record).
+                try:
+                    keyring = load_keyring()
+                except MasterKeyError as exc:
+                    session.rollback()
+                    logger.error("master key configuration unavailable: %s", exc)
+                    raise HTTPException(
+                        status_code=500, detail="encryption unavailable"
+                    )
+
+                # The composite key binds the row to exactly this scope;
+                # unknown and cross-scope data_ids are indistinguishable.
+                envelope = session.get(
+                    DataEnvelope, (body.tenant_id, body.workload_id, data_id)
+                )
+                if envelope is None:
+                    raise HTTPException(
+                        status_code=404, detail="data envelope not found"
+                    )
+
+                rotated_at = _utcnow()
+                stored_version = envelope.key_version
+                if stored_version != keyring.current_version:
+                    try:
+                        unwrapping_key = keyring.key_for(stored_version)
+                    except MasterKeyError:
+                        # The historical key needed to unwrap is gone;
+                        # the row must stay exactly as it is and the key
+                        # must stay free.
+                        logger.error(
+                            "master key version %s unavailable for rewrap",
+                            stored_version,
+                        )
+                        raise HTTPException(
+                            status_code=500, detail="encryption unavailable"
+                        )
+                    to_version = keyring.current_version
+                    # Unwrap under the stored version and re-wrap under
+                    # the current one. The plaintext data key lives only
+                    # in a local variable; ciphertext, iv, tag,
+                    # created_at and data_id are untouched. On any
+                    # failure the transaction rolls back: no material
+                    # change and no record.
+                    try:
+                        new_wrapped_key = rewrap_data_key(
+                            unwrapping_key,
+                            keyring.current_key(),
+                            envelope.wrapped_key,
+                        )
+                    except Exception:
+                        session.rollback()
+                        logger.error("data envelope rewrap failed")
+                        raise HTTPException(
+                            status_code=500, detail="encryption failed"
+                        )
+                    # Guarded update: rotate only if the row still holds
+                    # the version we unwrapped. A concurrent rotation
+                    # (same-key loser, a keyless call or a batch/job)
+                    # that settled first leaves current-version
+                    # material; roll back and re-judge on the next pass
+                    # as a same-key replay or a current-version no-op.
+                    result = session.execute(
+                        update(DataEnvelope)
+                        .where(
+                            DataEnvelope.tenant_id == body.tenant_id,
+                            DataEnvelope.workload_id == body.workload_id,
+                            DataEnvelope.data_id == data_id,
+                            DataEnvelope.key_version == stored_version,
+                        )
+                        .values(
+                            key_version=to_version, wrapped_key=new_wrapped_key
+                        )
+                        .execution_options(synchronize_session=False)
+                    )
+                    if result.rowcount != 1:
+                        session.rollback()
+                        continue
+                    # The compliance event commits in the same
+                    # transaction as the material rotation and the
+                    # idempotency record; an already-current no-op (the
+                    # branch below) writes no event because it changes
+                    # no material.
+                    session.add(
+                        AuditEvent(
+                            event_id=str(uuid.uuid4()),
+                            tenant_id=body.tenant_id,
+                            workload_id=body.workload_id,
+                            event_type=AUDIT_EVENT_TYPE_REWRAP,
+                            grant_id=None,
+                            decision_id=None,
+                            data_id=data_id,
+                            status=AUDIT_EVENT_STATUS_REWRAPPED,
+                            capability_sha256=None,
+                            occurred_at=rotated_at,
+                        )
+                    )
+                    final_version = to_version
+                else:
+                    # Already wrapped under the current version: no
+                    # material changes and no audit event, exactly as on
+                    # the keyless path. The first 200 is still recorded
+                    # so every later same-key replay returns this same
+                    # response without re-judging.
+                    final_version = stored_version
+
+                # Fix the exact first 200 body before commit so the
+                # stored response and the response returned to the
+                # winner are byte-for-byte the same.
+                saved_body = _data_envelope_rewrapped_body(
+                    data_id,
+                    body.tenant_id,
+                    body.workload_id,
+                    final_version,
+                    rotated_at,
+                )
+                session.add(
+                    DataEnvelopeRewrapIdempotencyRecord(
+                        record_id=str(uuid.uuid4()),
+                        tenant_id=body.tenant_id,
+                        workload_id=body.workload_id,
+                        idempotency_key=idempotency_key,
+                        data_id=data_id,
+                        request_fingerprint=fingerprint,
+                        response_body=saved_body,
+                        created_at=rotated_at,
+                    )
+                )
+                try:
+                    # The envelope rotation, its audit event and the
+                    # idempotency record commit together: a crash can
+                    # never leave a rotated envelope without its record,
+                    # a record claiming an uncommitted rewrap, or half a
+                    # record.
+                    session.commit()
+                except IntegrityError:
+                    # A concurrent request for the same key committed
+                    # first. Reread its record on the next pass and
+                    # answer as a replay (verbatim 200) or a conflict
+                    # (409).
+                    session.rollback()
+                    continue
+                except Exception:
+                    session.rollback()
+                    logger.error("data envelope rewrap write failed")
+                    raise HTTPException(
+                        status_code=500, detail="encryption failed"
+                    )
+                break
+        else:  # pragma: no cover - defensive: the reread always settles
+            logger.error("data envelope rewrap idempotency race did not settle")
+            raise HTTPException(status_code=500, detail="encryption failed")
+
+        assert saved_body is not None
+        return Response(
+            content=saved_body.encode("utf-8"),
+            status_code=200,
+            media_type="application/json",
+        )
+
     @app.post(
         "/v1/data-envelopes/{data_id}/rewrap",
         response_model=DataEnvelopeRewrappedResponse,
     )
     def rewrap_data_envelope(
-        data_id: str, body: RewrapDataEnvelopeRequest
-    ) -> DataEnvelopeRewrappedResponse:
+        request: Request,
+        data_id: str,
+        body: RewrapDataEnvelopeRequest,
+    ) -> DataEnvelopeRewrappedResponse | Response:
+        # The idempotency key is optional and lives only in a header;
+        # the path and body contracts are unchanged. A missing key
+        # preserves the original rewrap-on-every-call semantics exactly.
+        # An illegal key (duplicated header, empty, surrounding
+        # whitespace, a control or non-ASCII character, or longer than
+        # 64 characters) is rejected here, after body validation and
+        # before the path check, keyring load or any envelope read or
+        # write, so an invalid key never loads the keyring, never reads
+        # or rotates an envelope and never writes a record.
+        idem_present, idempotency_key = _read_idempotency_key(request)
+
+        if idem_present:
+            return _rewrap_data_envelope_keyed(data_id, body, idempotency_key)
+
         if not data_id.strip():
             raise HTTPException(status_code=422, detail="invalid scope parameters")
         # The keyring must name both the envelope's stored version (to
