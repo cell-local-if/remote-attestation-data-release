@@ -1258,6 +1258,64 @@ class DataEnvelopeIdempotencyRecord(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
+class DataEnvelopeRewrapIdempotencyRecord(Base):
+    """The first successful idempotency-keyed rewrap of one envelope.
+
+    At most one row exists per ``(tenant_id, workload_id,
+    idempotency_key)`` triple; the same key in a different tenant or
+    workload — or on the envelope-creation, rewrap-batch or rewrap-job
+    idempotency tables — is an independent record and never conflicts.
+    The row is inserted in the *same* transaction as the envelope's
+    ``key_version``/``wrapped_key`` rotation it records, so a crash can
+    never leave rotated material without its idempotency record or a
+    record pointing at an unrotated envelope. A failed rewrap — a
+    404/422/500 judgement, a lost rotation race, or any rollback —
+    inserts no row, so the key stays free and a later recovery re-judges
+    the request normally.
+
+    Once committed, a same-key same-scope replay of the same request
+    answers with the stored first 200 verbatim: it never re-wraps, never
+    appends an audit event and never changes a key version. A same-key
+    request in the same scope whose data_id or request shape differs is
+    a stable 409 that changes nothing.
+
+    Only the scope, the caller-chosen key, the data_id, the SHA-256
+    fingerprint of the request identity, the stored first response body
+    and the record time are persisted — never the plaintext payload, the
+    plaintext data key, a master key, the ciphertext, iv, tag or
+    wrapped_key, or exception text.
+    """
+
+    __tablename__ = "data_envelope_rewrap_idempotency_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "idempotency_key",
+            name="uq_data_envelope_rewrap_idempotency_scope_key",
+        ),
+    )
+
+    record_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # Caller-chosen key: 1..64 visible ASCII characters. Unique only
+    # within the (tenant, workload) scope; the same key in another scope
+    # is an independent row and never conflicts.
+    idempotency_key: Mapped[str] = mapped_column(String(64))
+    # The data_id rewrapped by the first legal keyed request; part of
+    # the request identity a replay must match.
+    data_id: Mapped[str] = mapped_column(String(256))
+    # Hex SHA-256 over the request identity (scope and data_id); used
+    # only to detect a same-key request with a different shape, which is
+    # a 409 that changes nothing.
+    request_fingerprint: Mapped[str] = mapped_column(String(64))
+    # The exact first 200 response body, stored verbatim (compact JSON)
+    # and replayed byte-for-byte on every later same-key replay.
+    response_body: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class ReleaseGrant(Base):
     """A one-time, TTL-bounded capability that releases one data item.
 
