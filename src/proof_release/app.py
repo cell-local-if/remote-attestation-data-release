@@ -136,6 +136,7 @@ from proof_release.db import (
     RewrapJobIdempotencyRecord,
     TrustRoot,
     TrustRootCommitCounter,
+    VerificationAdmissionCounter,
     WorkloadIdentityClaim,
     WorkloadIdentityIdempotencyRecord,
     WorkloadIdentityProfile,
@@ -222,6 +223,19 @@ GRANT_BUDGET_PER_MINUTE = 5
 #: independent of the one-time-grant budget (different counter table):
 #: grant consumption, revocation and payload release do not draw from it.
 CHALLENGE_ISSUANCE_BUDGET_PER_MINUTE = 5
+
+#: Per-(tenant, workload) admission budget for ``POST
+#: /v1/evidence/{evidence_id}/verify``: at most this many requests may
+#: enter the verifier during one UTC natural minute. Only requests whose
+#: evidence is still ``received`` and whose identity, challenge binding,
+#: nonce, digest and format checks all passed reserve a slot, so every
+#: earlier judgement (422/404/401 and idempotent replays of a settled
+#: evidence) is unchanged and spends nothing. A reserved slot is durable
+#: and is never refunded — in particular a verifier plugin failure or an
+#: unavailable X.509 revocation registry (500) keeps it. The budget uses
+#: its own counter table: it shares nothing with challenge issuance or
+#: the one-time-grant budget.
+VERIFICATION_BUDGET_PER_MINUTE = 5
 
 #: Fixed page size for the read-only release-grant audit listing. The
 #: listing is cursor-driven; the page size is an internal constant and is
@@ -500,6 +514,21 @@ def _too_many_requests_response(now: datetime) -> Response:
     )
     return Response(
         content=body, status_code=429, media_type="application/json"
+    )
+
+
+def _verification_rate_limited_response() -> Response:
+    """Build the verification-admission 429: fixed detail plus Retry-After.
+
+    The body carries only the fixed ``detail`` string and the whole seconds
+    until the next UTC minute travel in the ``Retry-After`` header,
+    recomputed at response time so repeated rejections may carry decreasing
+    values without extending the window.
+    """
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "verification rate limit exceeded"},
+        headers={"Retry-After": str(_seconds_until_next_minute(_utcnow()))},
     )
 
 
@@ -4503,6 +4532,71 @@ def create_app(
                 raise HTTPException(status_code=500, detail="rate limit unavailable")
         return None
 
+    def _keep_verification_slot(
+        session, tenant_id: str, workload_id: str, window_start: datetime
+    ) -> None:
+        """Keep a reserved verification slot when verification then fails.
+
+        Called on every failure path *after* a verification slot was
+        reserved (a verifier plugin failure, an unavailable trust-root,
+        revocation, CRL or workload-identity registry, or any unexpected
+        error): the consumed slot is never refunded, while the evidence
+        itself stays ``received``. The reservation lives in the failing
+        transaction, where the counter increment is the only pending write,
+        so when that transaction is still healthy the increment is simply
+        committed on its own; when the transaction is already broken (a
+        failed registry query poisons it on locking backends) the increment
+        is replayed in a fresh transaction against the original window. A
+        failure to retain the slot can only be logged — the 500 response to
+        the caller is unchanged either way.
+        """
+        try:
+            session.commit()
+            return
+        except Exception:
+            try:
+                session.rollback()
+            except Exception:  # pragma: no cover - defensive
+                pass
+        try:
+            with session_factory() as compensation:
+                for _ in range(2):
+                    row = compensation.scalar(
+                        select(VerificationAdmissionCounter)
+                        .where(
+                            VerificationAdmissionCounter.tenant_id == tenant_id,
+                            VerificationAdmissionCounter.workload_id
+                            == workload_id,
+                            VerificationAdmissionCounter.window_start
+                            == window_start,
+                        )
+                        .with_for_update()
+                    )
+                    if row is None:
+                        # The rolled-back reservation was the minute's
+                        # first: re-install the row in a savepoint so a
+                        # concurrent first insert costs only the savepoint.
+                        try:
+                            with compensation.begin_nested():
+                                compensation.add(
+                                    VerificationAdmissionCounter(
+                                        tenant_id=tenant_id,
+                                        workload_id=workload_id,
+                                        window_start=window_start,
+                                        count=1,
+                                    )
+                                )
+                        except IntegrityError:
+                            continue
+                        break
+                    row.count = row.count + 1
+                    break
+                compensation.commit()
+        except Exception:
+            logger.error(
+                "verification rate-limit slot could not be retained"
+            )
+
     # ------------------------------------------------------------------
     # Persistent asynchronous rewrap jobs
     # ------------------------------------------------------------------
@@ -5810,6 +5904,98 @@ def create_app(
                     status_code=422, detail="unsupported evidence format"
                 )
 
+            # --- per-scope verification admission budget -----------------
+            # Every pre-verifier judgement has now passed: the evidence
+            # exists in this scope, the challenge is bound to it, the nonce
+            # and the evidence digest match, the format is registered and
+            # the evidence is still received. Reserve exactly one slot of
+            # this scope's per-UTC-minute verification budget before the
+            # verifier (and the X.509 revocation registries) run. The
+            # reservation lives in this transaction — which already holds
+            # the evidence row lock, so concurrent verifications of the
+            # same evidence can never multiply-reserve — and commits
+            # atomically with the settlement on the success path; every
+            # later failure keeps the consumed slot (see
+            # _keep_verification_slot). An over-budget request writes
+            # nothing: no counter, no settlement, no lifecycle event, no
+            # audit row.
+            window_start = _utc_minute_window(_utcnow())
+            try:
+                admitted = False
+                for _ in range(2):
+                    # Lock the scope's minute row when one exists. SQLite
+                    # ignores FOR UPDATE but every write transaction already
+                    # begins as BEGIN IMMEDIATE, serializing concurrent
+                    # admissions process-wide; on locking backends the row
+                    # lock orders them so exactly the budgeted number of
+                    # requests in the minute can be admitted.
+                    counter = session.scalar(
+                        select(VerificationAdmissionCounter)
+                        .where(
+                            VerificationAdmissionCounter.tenant_id
+                            == body.tenant_id,
+                            VerificationAdmissionCounter.workload_id
+                            == body.workload_id,
+                            VerificationAdmissionCounter.window_start
+                            == window_start,
+                        )
+                        .with_for_update()
+                    )
+                    if counter is None:
+                        # The first admitted request of the minute
+                        # initializes the counter at one. The insert runs in
+                        # a savepoint so a concurrent first insert on a
+                        # locking backend costs only the savepoint — never
+                        # the evidence row lock this transaction holds.
+                        try:
+                            with session.begin_nested():
+                                session.add(
+                                    VerificationAdmissionCounter(
+                                        tenant_id=body.tenant_id,
+                                        workload_id=body.workload_id,
+                                        window_start=window_start,
+                                        count=1,
+                                    )
+                                )
+                        except IntegrityError:
+                            continue
+                        admitted = True
+                        break
+                    if counter.count >= VERIFICATION_BUDGET_PER_MINUTE:
+                        # Budget exhausted: no counter write, no settlement,
+                        # no lifecycle event and no audit row. The retry
+                        # hint is recomputed at response time.
+                        session.rollback()
+                        return _verification_rate_limited_response()
+                    counter.count = counter.count + 1
+                    admitted = True
+                    break
+                if not admitted:
+                    # Defensive: the unique-insert retry loop failed to
+                    # settle, which the single retry above makes
+                    # unreachable.
+                    session.rollback()
+                    logger.error(
+                        "verification rate-limit reservation could not settle"
+                    )
+                    raise HTTPException(
+                        status_code=500,
+                        detail="verification rate limit unavailable",
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                # A counter read/write that cannot complete fails closed:
+                # the whole transaction rolls back, leaving the evidence
+                # received and no count written, so the identical request
+                # can be retried once the counter recovers.
+                session.rollback()
+                logger.error("verification rate-limit counter unavailable")
+                raise HTTPException(
+                    status_code=500,
+                    detail="verification rate limit unavailable",
+                )
+
             challenge_context = ChallengeContext(
                 challenge_id=challenge.challenge_id,
                 nonce_digest=challenge.nonce_digest,
@@ -5907,7 +6093,14 @@ def create_app(
                         # (e.g. an unavailable registry) is a 500 before
                         # any settlement write; nothing about the evidence
                         # changes, so it stays received and re-verifiable.
-                        session.rollback()
+                        # The reserved verification slot is kept, not
+                        # refunded.
+                        _keep_verification_slot(
+                            session,
+                            body.tenant_id,
+                            body.workload_id,
+                            window_start,
+                        )
                         logger.error(
                             "trust root status query failed for evidence %s",
                             evidence.evidence_id,
@@ -5951,6 +6144,14 @@ def create_app(
                                     .limit(1)
                                 )
                             except Exception:
+                                # The reserved verification slot is kept,
+                                # not refunded.
+                                _keep_verification_slot(
+                                    session,
+                                    body.tenant_id,
+                                    body.workload_id,
+                                    window_start,
+                                )
                                 logger.error(
                                     "revocation registry query failed for evidence %s",
                                     evidence.evidence_id,
@@ -6007,7 +6208,14 @@ def create_app(
                                     .limit(1)
                                 )
                             except Exception:
-                                session.rollback()
+                                # The reserved verification slot is kept,
+                                # not refunded.
+                                _keep_verification_slot(
+                                    session,
+                                    body.tenant_id,
+                                    body.workload_id,
+                                    window_start,
+                                )
                                 logger.error(
                                     "CRL registry query failed for evidence %s",
                                     evidence.evidence_id,
@@ -6021,8 +6229,15 @@ def create_app(
                                     # The highest CRLNumber is past its
                                     # nextUpdate with no newer snapshot:
                                     # fail closed rather than trusting a
-                                    # stale revocation list.
-                                    session.rollback()
+                                    # stale revocation list. The reserved
+                                    # verification slot is kept, not
+                                    # refunded.
+                                    _keep_verification_slot(
+                                        session,
+                                        body.tenant_id,
+                                        body.workload_id,
+                                        window_start,
+                                    )
                                     logger.error(
                                         "current CRL expired for evidence %s",
                                         evidence.evidence_id,
@@ -6038,7 +6253,14 @@ def create_app(
                                         )
                                     )
                                 except (ValueError, TypeError):
-                                    session.rollback()
+                                    # The reserved verification slot is
+                                    # kept, not refunded.
+                                    _keep_verification_slot(
+                                        session,
+                                        body.tenant_id,
+                                        body.workload_id,
+                                        window_start,
+                                    )
                                     logger.error(
                                         "stored trust root certificate is "
                                         "unparseable for evidence %s",
@@ -6073,7 +6295,14 @@ def create_app(
                                             )
                                         ).all()
                                     except Exception:
-                                        session.rollback()
+                                        # The reserved verification slot is
+                                        # kept, not refunded.
+                                        _keep_verification_slot(
+                                            session,
+                                            body.tenant_id,
+                                            body.workload_id,
+                                            window_start,
+                                        )
                                         logger.error(
                                             "CRL entry query failed for "
                                             "evidence %s",
@@ -6119,8 +6348,12 @@ def create_app(
                     # A plugin that cannot run (e.g. the v2 shared-key
                     # configuration is missing or invalid) fails closed:
                     # the exception rolls the transaction back, leaving the
-                    # evidence received for a later retry. Log only
+                    # evidence received for a later retry. The reserved
+                    # verification slot is kept, not refunded. Log only
                     # non-sensitive identifiers and the exception type.
+                    _keep_verification_slot(
+                        session, body.tenant_id, body.workload_id, window_start
+                    )
                     logger.error(
                         "verifier %s for format %r failed on evidence %s: %s",
                         type(verifier).__name__,
@@ -6134,7 +6367,11 @@ def create_app(
                 except Exception as exc:
                     # Log only non-sensitive identifiers and the exception type —
                     # never the traceback/message, since a faulty plugin could
-                    # embed raw evidence or private context in it.
+                    # embed raw evidence or private context in it. The reserved
+                    # verification slot is kept, not refunded.
+                    _keep_verification_slot(
+                        session, body.tenant_id, body.workload_id, window_start
+                    )
                     logger.error(
                         "verifier %s for format %r failed on evidence %s: %s",
                         type(verifier).__name__,
@@ -6184,7 +6421,10 @@ def create_app(
                         )
                     ).all()
                 except Exception:
-                    session.rollback()
+                    # The reserved verification slot is kept, not refunded.
+                    _keep_verification_slot(
+                        session, body.tenant_id, body.workload_id, window_start
+                    )
                     logger.error(
                         "workload identity profile query failed for evidence %s",
                         evidence.evidence_id,

@@ -1901,3 +1901,51 @@ class ChallengeIssuanceCounter(Base):
     # Number of challenges issued during this window; capped at the
     # per-minute issuance budget by the atomic admission transaction.
     count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class VerificationAdmissionCounter(Base):
+    """Persistent per-scope admission counter for evidence verification.
+
+    One row exists per ``(tenant_id, workload_id, window_start)`` triple,
+    where ``window_start`` is the UTC natural minute (seconds and
+    sub-seconds truncated) in which a ``POST
+    /v1/evidence/{evidence_id}/verify`` request was admitted into the
+    verifier. Only requests whose evidence was still ``received`` and whose
+    identity, challenge binding, nonce, digest and format checks all passed
+    reserve a slot; requests rejected before that point (422/404/401 and
+    idempotent replays of a settled evidence) never touch this table. The
+    budget is attributed solely to the two scope fields and is deliberately
+    separate from both :class:`ChallengeIssuanceCounter` and
+    :class:`RateLimitCounter`: verification, challenge issuance and
+    one-time-grant actions never share rows, quota or lock traffic, and
+    different tenants or workloads never share a row.
+
+    A slot is reserved inside the verification transaction itself, so on
+    the success path the count commits atomically with the settlement it
+    admitted; when verification fails after the reservation (a verifier
+    plugin failure or an unavailable X.509 revocation registry) the
+    consumed slot is kept — committed on its own or replayed against the
+    original window — and never refunded, while the evidence stays
+    ``received`` for a later retry. A rejected (over-budget) request writes
+    nothing. A new UTC minute starts a new row, which restores the quota
+    automatically; quotas are never borrowed across scopes or minutes.
+    """
+
+    __tablename__ = "verification_admission_counters"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "window_start",
+            name="uq_verification_admission_counter_scope_window",
+        ),
+    )
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # UTC minute boundary at which the window starts, truncated to seconds.
+    window_start: Mapped[datetime] = mapped_column(UTCDateTime(), primary_key=True)
+    # Number of requests admitted into the verifier during this window;
+    # capped at the per-minute verification budget by the atomic admission
+    # transaction.
+    count: Mapped[int] = mapped_column(Integer, default=0)
