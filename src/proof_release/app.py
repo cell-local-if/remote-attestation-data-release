@@ -129,6 +129,7 @@ from proof_release.db import (
     ReleaseGrant,
     ReleaseGrantConsumeIdempotencyRecord,
     ReleaseGrantEvent,
+    ReleaseGrantIdempotencyRecord,
     RewrapBatch,
     RewrapBatchItem,
     RewrapJob,
@@ -683,6 +684,37 @@ def _read_idempotency_key(request: Request) -> tuple[bool, str | None]:
     if len(raw_values) != 1 or not _IDEMPOTENCY_KEY_RE.fullmatch(raw_values[0]):
         raise HTTPException(status_code=422, detail="invalid idempotency key")
     return True, raw_values[0]
+
+
+def _release_grant_create_fingerprint(
+    tenant_id: str,
+    workload_id: str,
+    decision_id: str,
+    data_id: str,
+    ttl_seconds: int,
+) -> str:
+    """Hash the request identity that must match for a keyed create replay.
+
+    Covers exactly the equivalence range fixed by the contract: the
+    tenant, the workload, the decision id, the data id and the TTL. The
+    TTL is the model-coerced integer, so requests that normalize to the
+    same value hash identically. Only this non-sensitive identity is
+    hashed — the capability never participates (it does not exist yet
+    and only its digest is ever persisted). Canonical JSON with sorted
+    keys makes equivalent requests hash identically.
+    """
+    payload = json.dumps(
+        {
+            "tenant_id": tenant_id,
+            "workload_id": workload_id,
+            "decision_id": decision_id,
+            "data_id": data_id,
+            "ttl_seconds": ttl_seconds,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _release_grant_consume_fingerprint(
@@ -9773,14 +9805,210 @@ def create_app(
             decided_at=_rfc3339(decided_at),
         )
 
+    def _create_release_grant_keyed(
+        body: CreateReleaseGrantRequest, idempotency_key: str
+    ) -> ReleaseGrantCreatedResponse:
+        """Mint one release grant under an ``Idempotency-Key``.
+
+        The grant, its pending timeline event, its pending audit event
+        and the idempotency record are one atomic commit: the
+        lookup-then-insert runs in a single transaction, with the unique
+        (scope, key) constraint plus the IntegrityError reread below
+        settling concurrent same-key submissions so at most one grant is
+        ever minted per key. Every judgement failure raises out of the
+        context manager (or an explicit rollback), so a failed attempt
+        leaves neither a grant nor a record, and the key stays free for
+        a recovered retry. The capability is returned exactly once — on
+        the winning 201 — and only its SHA-256 digest is persisted; a
+        replay never mints or returns a second capability.
+        """
+        fingerprint = _release_grant_create_fingerprint(
+            body.tenant_id,
+            body.workload_id,
+            body.decision_id,
+            body.data_id,
+            body.ttl_seconds,
+        )
+
+        def _stored_record(session):
+            return session.scalar(
+                select(ReleaseGrantIdempotencyRecord).where(
+                    ReleaseGrantIdempotencyRecord.tenant_id == body.tenant_id,
+                    ReleaseGrantIdempotencyRecord.workload_id
+                    == body.workload_id,
+                    ReleaseGrantIdempotencyRecord.idempotency_key
+                    == idempotency_key,
+                )
+            )
+
+        def _replay(record) -> None:
+            # The key is spent: a same-content replay is told the grant
+            # already exists (the capability was returned exactly once on
+            # the first 201 and is never regenerated), and a same-key
+            # request with different normalized content is a conflict.
+            # Neither mints a grant, appends an event or audit row, or
+            # touches the original grant.
+            if not hmac.compare_digest(
+                record.request_fingerprint, fingerprint
+            ):
+                raise HTTPException(
+                    status_code=409, detail="idempotency key conflict"
+                )
+            raise HTTPException(
+                status_code=409, detail="release grant already issued"
+            )
+
+        # Capabilities are 32 bytes from the CSPRNG, rendered unpadded
+        # base64url. The plaintext lives only on this stack frame and the
+        # winning create response; only its SHA-256 digest is persisted.
+        capability_bytes = secrets.token_bytes(CAPABILITY_BYTES)
+        capability = base64.urlsafe_b64encode(capability_bytes).rstrip(
+            b"="
+        ).decode("ascii")
+        now = _utcnow()
+        expires_at = now + timedelta(seconds=body.ttl_seconds)
+        grant_id = str(uuid.uuid4())
+        for _ in range(2):
+            with session_factory() as session:
+                existing = _stored_record(session)
+                if existing is not None:
+                    _replay(existing)
+                # First keyed request for this scope+key. Judgement runs
+                # in its existing order; every failure raises out of the
+                # context manager, which rolls back, so no idempotency
+                # row is left behind and the key stays free for a
+                # recovered retry.
+                decision = session.get(Decision, body.decision_id)
+                # Decisions carry no scope columns of their own; their
+                # scope is the scope of the evidence they were taken
+                # against.
+                evidence = (
+                    session.get(Evidence, decision.evidence_id)
+                    if decision is not None
+                    else None
+                )
+                if (
+                    decision is None
+                    or evidence is None
+                    or evidence.tenant_id != body.tenant_id
+                    or evidence.workload_id != body.workload_id
+                ):
+                    # Do not reveal whether an out-of-scope decision
+                    # exists; the key is not consumed by the 404.
+                    raise HTTPException(
+                        status_code=404, detail="decision not found"
+                    )
+                if decision.status != DECISION_STATUS_ALLOWED:
+                    # A denied (or any future non-allowed) decision can
+                    # never authorize data release; the key stays free.
+                    raise HTTPException(
+                        status_code=409, detail="decision is not allowed"
+                    )
+                grant = ReleaseGrant(
+                    grant_id=grant_id,
+                    tenant_id=body.tenant_id,
+                    workload_id=body.workload_id,
+                    decision_id=body.decision_id,
+                    data_id=body.data_id,
+                    capability_digest=_nonce_digest(capability),
+                    status="pending",
+                    issued_at=now,
+                    expires_at=expires_at,
+                    consumed_at=None,
+                )
+                session.add(grant)
+                # The per-grant migration timeline records exactly one
+                # event per committed state transition in the same
+                # transaction as the grant row (and the unchanged
+                # compliance audit below): the empty-state birth into
+                # pending with reason "issued".
+                _record_release_grant_event(
+                    session,
+                    tenant_id=body.tenant_id,
+                    workload_id=body.workload_id,
+                    grant_id=grant_id,
+                    old_status=None,
+                    new_status=RELEASE_GRANT_STATUS_PENDING,
+                    reason=RELEASE_GRANT_EVENT_REASON_ISSUED,
+                    now=now,
+                )
+                # The compliance event commits in the same transaction as
+                # the grant row, so a pending event exists if and only if
+                # the grant did. Only identifiers, the fixed status, the
+                # timestamp and the capability digest are recorded —
+                # never the capability.
+                session.add(
+                    AuditEvent(
+                        event_id=str(uuid.uuid4()),
+                        tenant_id=body.tenant_id,
+                        workload_id=body.workload_id,
+                        event_type=AUDIT_EVENT_TYPE_GRANT,
+                        grant_id=grant_id,
+                        decision_id=body.decision_id,
+                        data_id=body.data_id,
+                        status=AUDIT_EVENT_STATUS_PENDING,
+                        capability_sha256=grant.capability_digest,
+                        occurred_at=now,
+                    )
+                )
+                session.add(
+                    ReleaseGrantIdempotencyRecord(
+                        record_id=str(uuid.uuid4()),
+                        tenant_id=body.tenant_id,
+                        workload_id=body.workload_id,
+                        idempotency_key=idempotency_key,
+                        grant_id=grant_id,
+                        request_fingerprint=fingerprint,
+                        created_at=now,
+                    )
+                )
+                try:
+                    # The grant, both events and the idempotency record
+                    # commit together: a crash can never leave a grant
+                    # without its record or a record pointing at no
+                    # grant.
+                    session.commit()
+                except IntegrityError:
+                    # A concurrent request for the same scope+key
+                    # committed first. Reread its record and answer as a
+                    # replay (409 "release grant already issued") or a
+                    # conflict (409 "idempotency key conflict").
+                    session.rollback()
+                    continue
+                break
+        else:  # pragma: no cover - defensive: the reread always settles
+            logger.error("release grant create idempotency race did not settle")
+            raise HTTPException(status_code=500, detail="grant unavailable")
+
+        return ReleaseGrantCreatedResponse(
+            grant_id=grant_id,
+            decision_id=body.decision_id,
+            data_id=body.data_id,
+            capability=capability,
+            pending=True,
+            issued_at=_rfc3339(now),
+            expires_at=_rfc3339(expires_at),
+        )
+
     @app.post(
         "/v1/release-grants",
         status_code=201,
         response_model=ReleaseGrantCreatedResponse,
     )
     def create_release_grant(
-        body: CreateReleaseGrantRequest,
+        request: Request, body: CreateReleaseGrantRequest
     ) -> ReleaseGrantCreatedResponse:
+        # The optional idempotency key lives only in a header; the body
+        # contract is unchanged. A missing key preserves the original
+        # one-grant-per-request semantics exactly. A present but illegal
+        # key (a duplicated header line, an empty value, surrounding
+        # whitespace, a control or non-ASCII character, or an over-long
+        # value) is an indistinguishable 422 raised before any state is
+        # read or written and before any budget could be spent.
+        idem_present, idempotency_key = _read_idempotency_key(request)
+        if idem_present:
+            return _create_release_grant_keyed(body, idempotency_key)
+
         # Capabilities are 32 bytes from the CSPRNG, rendered unpadded
         # base64url. The plaintext lives only on this stack frame and the
         # create response; only its SHA-256 digest is persisted.
