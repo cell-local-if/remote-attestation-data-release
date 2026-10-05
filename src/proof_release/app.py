@@ -160,6 +160,7 @@ from proof_release.policies import (
 )
 from proof_release.verifiers import (
     ATTESTED_NONCE_JSON,
+    ATTESTED_NONCE_JSON_V2,
     X509_ATTESTED_NONCE_JSON,
     ChallengeContext,
     CrlValidationError,
@@ -9191,6 +9192,7 @@ def create_app(
             # format error rather than guessed at.
             if evidence.evidence_format not in (
                 ATTESTED_NONCE_JSON,
+                ATTESTED_NONCE_JSON_V2,
                 X509_ATTESTED_NONCE_JSON,
             ):
                 raise HTTPException(
