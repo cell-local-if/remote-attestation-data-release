@@ -3221,6 +3221,27 @@ class RetirePolicyRequest(BaseModel):
     _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
 
 
+class EvaluatePolicyRequest(BaseModel):
+    """Scope and claims for a read-only trial evaluation of one version.
+
+    The body carries only the two non-blank scope strings and the claims
+    object; any missing, blank, wrong-typed or unknown field, and a
+    ``claims`` value that is not a JSON object, is rejected as a client
+    error before the handler touches storage. The claims are evaluated in
+    memory only — they are never persisted, echoed or logged.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    # A JSON object of top-level claims. Values pass through untouched
+    # (no float coercion), exactly as the decision path's parsed claims.
+    claims: dict
+
+    _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
+
+
 class CreateDecisionRequest(BaseModel):
     tenant_id: StrictStr = Field(min_length=1)
     workload_id: StrictStr = Field(min_length=1)
@@ -9023,6 +9044,113 @@ def create_app(
             status_code=200,
             media_type="application/json",
         )
+
+    @app.post("/v1/policies//evaluate")
+    def evaluate_policy_identifier_required(
+        body: EvaluatePolicyRequest,
+    ) -> Response:
+        # An empty path segment is a missing policy identifier: a 422
+        # client error rather than a routing-level 404 or 405. It never
+        # reads or modifies a policy version.
+        raise HTTPException(status_code=422, detail="invalid policy identifier")
+
+    @app.post("/v1/policies/{policy_id}/evaluate")
+    def evaluate_policy(policy_id: str, body: EvaluatePolicyRequest) -> Response:
+        """Evaluate one immutable policy version against caller claims.
+
+        A read-only trial ("dry run") of the exact rule tree of the
+        version named by the path, against the claims object in the body.
+        The path identifier must be a canonical lowercase UUID and the
+        body carries only the two non-blank scope strings and the claims
+        object; any missing, blank, wrong-typed, incomplete or unknown
+        field, a malformed path identifier, or a ``claims`` value that is
+        not a JSON object is a 422 raised before any storage is read. An
+        unknown policy or one outside the body's tenant/workload is an
+        indistinguishable 404 (existence is never revealed).
+
+        The handler issues only SELECTs: it never creates a decision,
+        audit record, lifecycle event, idempotency record or counter
+        entry, and never changes the policy's status — a retired version
+        evaluates exactly like an active one, and the answer always
+        reflects this immutable version rather than any newer one. The
+        evaluation uses the same rule semantics and the same complete
+        depth-first explanation as a formal decision; every node carries
+        only its position, structural type and boolean outcome, so the
+        response contains no claim names, paths, expected or actual
+        values, evidence or key material. A storage failure aborts the
+        whole request with a 500 rather than returning a partial
+        evaluation, and a repeated request returns the identical result
+        except for ``checked_at``.
+        """
+        # A path identifier that is missing (empty segment, handled by the
+        # dedicated route above), blank, whitespace-padded or not a
+        # canonical lowercase UUID is a format error; the raw value must
+        # match exactly. This runs before any storage access.
+        if not _UUID_RE.fullmatch(policy_id):
+            raise HTTPException(status_code=422, detail="invalid policy identifier")
+
+        checked_at = _utcnow()
+        try:
+            with session_factory() as session:
+                policy = session.get(Policy, policy_id)
+                if (
+                    policy is None
+                    or policy.tenant_id != body.tenant_id
+                    or policy.workload_id != body.workload_id
+                ):
+                    # Do not reveal whether an out-of-scope or unknown
+                    # policy exists: unknown id and scope mismatch share
+                    # one indistinguishable 404.
+                    raise HTTPException(status_code=404, detail="policy not found")
+                # The persisted canonical rule JSON is re-parsed without
+                # float coercion, so numbers compare exactly as created.
+                rule = json.loads(policy.rule_json)
+                policy_version = policy.version
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("policy evaluation failed")
+            raise HTTPException(
+                status_code=500, detail="policy evaluation unavailable"
+            )
+
+        # Pure in-memory evaluation against the caller-supplied claims;
+        # nothing here touches storage or any other state.
+        allowed = evaluate_rule(rule, body.claims)
+        evaluation = explain_rule(rule, body.claims)
+        if not evaluation or evaluation[0]["outcome"] != allowed:
+            # Defensive: a validated rule always has a root whose outcome
+            # is the overall verdict. Treat a mismatch as a server-side
+            # integrity failure rather than returning an explanation that
+            # contradicts the verdict.
+            logger.error("policy evaluation explanation mismatch")
+            raise HTTPException(
+                status_code=500, detail="policy evaluation unavailable"
+            )
+
+        # Compact JSON with a single terminating newline. Every value is a
+        # string, integer or boolean, or a (possibly empty) list of
+        # integers — no floats, nulls or non-finite values — and no claim
+        # name, claim value, comparison target, evidence, capability or
+        # key material appears.
+        body_bytes = (
+            json.dumps(
+                {
+                    "policy_id": policy_id,
+                    "policy_version": policy_version,
+                    "tenant_id": body.tenant_id,
+                    "workload_id": body.workload_id,
+                    "allowed": allowed,
+                    "checked_at": _rfc3339(checked_at),
+                    "evaluation": evaluation,
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body_bytes, media_type="application/json")
 
     @app.get("/v1/policies")
     def list_policies(
