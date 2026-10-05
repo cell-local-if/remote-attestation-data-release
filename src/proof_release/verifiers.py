@@ -182,6 +182,18 @@ class VerifierRegistry:
     def get(self, format_name: str) -> Verifier | None:
         return self._verifiers.get(format_name)
 
+    def format_names(self) -> list[str]:
+        """Snapshot the registered evidence format names, sorted ascending.
+
+        The snapshot is taken from a single copy of the registry mapping,
+        so a concurrent register/unregister never produces a partial or
+        duplicated list; each name appears exactly once, ordered by
+        Unicode code point. Only the registered ``evidence_format``
+        strings are returned — never verifier instances, class names or
+        any plugin internals.
+        """
+        return sorted(list(self._verifiers))
+
     def __contains__(self, format_name: object) -> bool:
         return format_name in self._verifiers
 

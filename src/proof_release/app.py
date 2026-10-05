@@ -14247,6 +14247,46 @@ def create_app(
             content=body, status_code=status_code, media_type="application/json"
         )
 
+    @app.get("/v1/verifiers")
+    def list_verifiers(
+        request: Request,
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return the read-only directory of registered evidence formats.
+
+        The directory takes no input: any query parameter (including a
+        repeated or blank one) is a 422 and any non-empty body is a 422,
+        both rejected before the registry is read. The response is the
+        complete, deterministic snapshot of the ``evidence_format`` names
+        the verifier registry currently accepts — deduplicated, ordered
+        by Unicode code point, with ``count`` equal to the array length —
+        rendered as compact JSON terminated by a single newline. The
+        handler never verifies evidence, never calls a plugin, never
+        writes state, never consumes rate-limit budget and returns only
+        format names — no verifier instances, class or module names,
+        configuration, key material, certificates, evidence or exception
+        text. A registry read or snapshot failure is a 500 with no
+        partial list; the same request succeeds once the registry
+        recovers.
+        """
+        # --- request shape (all 422, the registry is not touched) -------
+        if request.query_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+
+        try:
+            formats = registry.format_names()
+        except Exception:
+            # The failure may carry plugin or environment detail; only a
+            # fixed, detail-free message is ever logged or returned.
+            logger.error("verifier registry snapshot failed")
+            raise HTTPException(
+                status_code=500, detail="verifier registry unavailable"
+            )
+
+        return _compact_json_line({"formats": formats, "count": len(formats)})
+
     @app.get("/v1/key-rotation/status")
     def get_key_rotation_status(
         request: Request,
