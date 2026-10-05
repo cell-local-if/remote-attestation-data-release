@@ -1151,6 +1151,15 @@ class DataEnvelope(Base):
     data_id: Mapped[str] = mapped_column(String(256), primary_key=True)
     # Master key version under which wrapped_key was produced.
     key_version: Mapped[int] = mapped_column(Integer)
+    # Queryable metadata label chosen at creation (``unclassified`` when
+    # the request omitted one). It is pure metadata: it never participates
+    # in encryption, policy evaluation, authorization, release or rewrap,
+    # and it never touches the material columns. NULL only on rows written
+    # before the column existed (backfilled to ``unclassified`` on open);
+    # every new envelope carries a value.
+    classification: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
     ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     iv: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     tag: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
@@ -1217,14 +1226,14 @@ class DataEnvelopeIdempotencyRecord(Base):
     request answers with the stored first 201 verbatim: it never
     re-encrypts, never creates a second envelope, never advances the
     per-scope directory sequence and never changes a key version. A
-    same-key request whose data_id or payload differs is a stable 409
-    that changes nothing.
+    same-key request whose data_id, payload or classification differs is
+    a stable 409 that changes nothing.
 
-    Only the scope, the caller-chosen key, the data_id, the SHA-256
-    digest of the payload, the stored first response body and the
-    creation time are persisted — never the plaintext payload, the
-    plaintext data key, a master key, any ciphertext material or
-    exception text.
+    Only the scope, the caller-chosen key, the data_id, the effective
+    classification, the SHA-256 digest of the payload, the stored first
+    response body and the creation time are persisted — never the
+    plaintext payload, the plaintext data key, a master key, any
+    ciphertext material or exception text.
     """
 
     __tablename__ = "data_envelope_idempotency_records"
@@ -1247,6 +1256,14 @@ class DataEnvelopeIdempotencyRecord(Base):
     # The data_id of the envelope created by the first legal keyed
     # request; part of the request identity a replay must match.
     data_id: Mapped[str] = mapped_column(String(256))
+    # The effective classification of the first legal keyed request
+    # (``unclassified`` when it omitted one); part of the request identity
+    # a replay must match. NULL only on rows written before the column
+    # existed (backfilled to ``unclassified`` on open, so a pre-upgrade
+    # record is replayed as an unclassified request).
+    classification: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
     # Hex SHA-256 of the payload bytes; irreversible, used only to
     # detect a same-key request carrying a different payload, which is
     # a 409 that changes nothing. The plaintext payload never

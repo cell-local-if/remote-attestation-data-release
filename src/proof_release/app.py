@@ -246,6 +246,16 @@ _NONCE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 #: Cursors are strict unpadded base64url tokens; empty string is reserved
 #: for the beginning-of-scope cursor and never travels through this pattern.
 _CURSOR_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+#: Classification assigned to an envelope whose creation request omitted
+#: one, and to every envelope and idempotency record written before the
+#: metadata existed (backfilled on open).
+DATA_ENVELOPE_DEFAULT_CLASSIFICATION = "unclassified"
+#: A classification is 1..32 lowercase ASCII characters: the first must be
+#: a letter, the rest letters, digits, underscores or hyphens. It is pure
+#: metadata — it never participates in encryption, policy evaluation,
+#: authorization, release or rewrap.
+_CLASSIFICATION_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 #: UUID syntax accepted on the batch lookup path before hitting storage.
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -526,6 +536,25 @@ def _optional_non_blank(value: str | None) -> str | None:
     return _require_non_blank(value)
 
 
+def _effective_classification(value: str | None) -> str:
+    """Return the classification a request carries, or raise a 422.
+
+    An omitted classification defaults to ``unclassified``; a present one
+    must match the metadata shape exactly (1..32 lowercase ASCII, letter
+    first, then letters/digits/underscores/hyphens). A blank, wrongly
+    cased, over-long or otherwise off-shape value is one
+    indistinguishable 422 raised before any state is read or written, so
+    an invalid creation never encrypts, never creates an envelope, never
+    advances the directory sequence and never writes an idempotency
+    record.
+    """
+    if value is None:
+        return DATA_ENVELOPE_DEFAULT_CLASSIFICATION
+    if not _CLASSIFICATION_RE.fullmatch(value):
+        raise HTTPException(status_code=422, detail="invalid classification")
+    return value
+
+
 def _cursor_secret() -> bytes:
     return os.environ.get(CURSOR_SECRET_ENV, _DEMO_CURSOR_SECRET).encode("utf-8")
 
@@ -660,6 +689,7 @@ def _data_envelope_created_body(
     workload_id: str,
     key_version: int,
     created_at: datetime,
+    classification: str,
 ) -> str:
     """Render the exact compact 201 creation body stored for replay.
 
@@ -677,6 +707,7 @@ def _data_envelope_created_body(
             "workload_id": workload_id,
             "key_version": key_version,
             "created_at": _rfc3339(created_at),
+            "classification": classification,
         },
         separators=(",", ":"),
         allow_nan=False,
@@ -2626,6 +2657,7 @@ def _data_envelope_cursor_payload(
     data_id: str,
     created_after: str,
     created_before: str,
+    classification: str,
     snapshot_seq: int,
 ) -> bytes:
     """Canonical byte payload authenticated inside a directory cursor.
@@ -2648,6 +2680,7 @@ def _data_envelope_cursor_payload(
             "di": data_id,
             "a": created_after,
             "b": created_before,
+            "c": classification,
             "q": snapshot_seq,
         },
         separators=(",", ":"),
@@ -2663,6 +2696,7 @@ def _encode_data_envelope_cursor(
     data_id: str,
     created_after: str,
     created_before: str,
+    classification: str,
     snapshot_seq: int,
 ) -> str:
     """Build an opaque, scope/filter/snapshot-bound exclusive cursor."""
@@ -2673,6 +2707,7 @@ def _encode_data_envelope_cursor(
         data_id=data_id,
         created_after=created_after,
         created_before=created_before,
+        classification=classification,
         snapshot_seq=snapshot_seq,
     )
     mac = hmac.new(_cursor_secret(), payload, hashlib.sha256).digest()
@@ -2687,6 +2722,7 @@ def _decode_data_envelope_cursor(
     data_id: str,
     created_after: str,
     created_before: str,
+    classification: str,
 ) -> tuple[str, int] | None:
     """Validate a directory cursor and return ``(boundary_data_id, seq)``.
 
@@ -2734,6 +2770,7 @@ def _decode_data_envelope_cursor(
             data_id=data_id,
             created_after=created_after,
             created_before=created_before,
+            classification=classification,
             snapshot_seq=snapshot_seq,
         ),
         hashlib.sha256,
@@ -2750,6 +2787,7 @@ def _decode_data_envelope_cursor(
         ("di", data_id),
         ("a", created_after),
         ("b", created_before),
+        ("c", classification),
     ):
         if not hmac.compare_digest(str(decoded.get(key, "")), expected):
             return None
@@ -3151,6 +3189,10 @@ class CreateDataEnvelopeRequest(BaseModel):
     # Arbitrary non-empty payload content; whitespace-only is permitted
     # (it is data, not an identifier), so only emptiness is rejected.
     payload: StrictStr = Field(min_length=1)
+    # Optional metadata label; omitted means ``unclassified``. The shape
+    # is validated in the handler so a malformed value is one
+    # indistinguishable 422 before any state is read or written.
+    classification: StrictStr | None = None
 
     _non_blank = field_validator("tenant_id", "workload_id", "data_id")(
         _require_non_blank
@@ -3163,6 +3205,7 @@ class DataEnvelopeCreatedResponse(BaseModel):
     workload_id: str
     key_version: int
     created_at: str
+    classification: str
 
 
 class DataEnvelopeResponse(BaseModel):
@@ -3171,6 +3214,7 @@ class DataEnvelopeResponse(BaseModel):
     workload_id: str
     key_version: int
     created_at: str
+    classification: str
     ciphertext: str
     iv: str
     tag: str
@@ -3308,6 +3352,9 @@ def _migrate_additive(engine) -> None:
         # The read-only data-envelope directory query gained the per-scope
         # commit-order marker that fixes its replayable snapshot.
         _migrate_data_envelope_commit_sequence(engine)
+        # Envelope classification metadata shipped after the envelope and
+        # its idempotency record first existed.
+        _migrate_data_envelope_classification(engine)
         return
     additions = {
         "evidence": (
@@ -3450,6 +3497,10 @@ def _migrate_additive(engine) -> None:
     # The read-only data-envelope directory query gained the per-scope
     # commit-order marker that fixes its replayable snapshot.
     _migrate_data_envelope_commit_sequence(engine)
+    # Envelope classification metadata shipped after the envelope and its
+    # idempotency record first existed; legacy databases are upgraded
+    # identically on every backend.
+    _migrate_data_envelope_classification(engine)
 
 
 def _migrate_proof_event_commit_sequence(engine) -> None:
@@ -4244,6 +4295,54 @@ def _migrate_data_envelope_commit_sequence(engine) -> None:
                 if idx.name == "ix_data_envelopes_scope_commit_seq"
             )
             model_index.create(conn, checkfirst=True)
+
+
+def _migrate_data_envelope_classification(engine) -> None:
+    """Bring a deployment written before envelope classification up to date.
+
+    Classification is queryable creation-time metadata on the envelope
+    and part of the request identity on its idempotency record. Both
+    columns shipped after their tables first existed, so databases
+    written by older deployments are upgraded on open on every backend:
+    the nullable ``classification`` column is added to ``data_envelopes``
+    and ``data_envelope_idempotency_records`` when missing, and every
+    pre-existing row is backfilled to ``unclassified`` — a legacy
+    envelope reads as unclassified and a legacy idempotency record
+    replays as the record of an unclassified request (its stored first
+    response body, which carries no classification field, is still
+    replayed byte-for-byte).
+
+    The upgrade is one transaction, touches no material column, response
+    shape or secret-handling rule, and short-circuits on a
+    current-metadata database.
+    """
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        table_names = set(inspector.get_table_names())
+        for table_name in (
+            DataEnvelope.__tablename__,
+            DataEnvelopeIdempotencyRecord.__tablename__,
+        ):
+            if table_name not in table_names:
+                continue
+            column_names = {
+                col["name"] for col in inspector.get_columns(table_name)
+            }
+            if "classification" not in column_names:
+                conn.execute(
+                    text(
+                        f"ALTER TABLE {table_name} "
+                        "ADD COLUMN classification VARCHAR(32) NULL"
+                    )
+                )
+            conn.execute(
+                text(
+                    f"UPDATE {table_name} "
+                    "SET classification = :default "
+                    "WHERE classification IS NULL"
+                ),
+                {"default": DATA_ENVELOPE_DEFAULT_CLASSIFICATION},
+            )
 
 
 def _rebuild_release_grant_events(engine) -> None:
@@ -12542,7 +12641,9 @@ def create_app(
         return Response(content=body_bytes, media_type="application/json")
 
     def _create_data_envelope_keyed(
-        body: CreateDataEnvelopeRequest, idempotency_key: str
+        body: CreateDataEnvelopeRequest,
+        idempotency_key: str,
+        classification: str,
     ) -> Response:
         """Create one envelope under an ``Idempotency-Key``.
 
@@ -12576,13 +12677,22 @@ def create_app(
                     # A replay never re-encrypts, never creates an
                     # envelope, never advances the directory sequence and
                     # never changes a key version: the stored first 201
-                    # is returned verbatim. A same-key request whose
-                    # data_id or payload differs is a stable 409 that
-                    # changes nothing.
+                    # is returned verbatim (a record written before
+                    # classification existed replays its original body,
+                    # which carries no classification field, byte-for-
+                    # byte). A same-key request whose data_id, payload or
+                    # effective classification differs is a stable 409
+                    # that changes nothing; a pre-upgrade record matches
+                    # only an unclassified request.
                     if not (
                         hmac.compare_digest(existing.data_id, body.data_id)
                         and hmac.compare_digest(
                             existing.payload_sha256, payload_digest
+                        )
+                        and hmac.compare_digest(
+                            existing.classification
+                            or DATA_ENVELOPE_DEFAULT_CLASSIFICATION,
+                            classification,
                         )
                     ):
                         raise HTTPException(
@@ -12653,6 +12763,7 @@ def create_app(
                         workload_id=body.workload_id,
                         data_id=body.data_id,
                         key_version=keyring.current_version,
+                        classification=classification,
                         ciphertext=sealed.ciphertext,
                         iv=sealed.iv,
                         tag=sealed.tag,
@@ -12671,6 +12782,7 @@ def create_app(
                     body.workload_id,
                     keyring.current_version,
                     now,
+                    classification,
                 )
                 session.add(
                     DataEnvelopeIdempotencyRecord(
@@ -12679,6 +12791,7 @@ def create_app(
                         workload_id=body.workload_id,
                         idempotency_key=idempotency_key,
                         data_id=body.data_id,
+                        classification=classification,
                         payload_sha256=payload_digest,
                         response_body=saved_body,
                         created_at=now,
@@ -12723,6 +12836,14 @@ def create_app(
     def create_data_envelope(
         request: Request, body: CreateDataEnvelopeRequest
     ) -> DataEnvelopeCreatedResponse | Response:
+        # The classification is optional metadata validated before any
+        # state is touched: an omitted value defaults to ``unclassified``
+        # and a malformed one (blank, wrongly cased, off-alphabet or
+        # over-long) is a 422 that never encrypts, never creates an
+        # envelope, never advances the directory sequence and never
+        # writes an idempotency record. It never participates in the
+        # encryption itself.
+        classification = _effective_classification(body.classification)
         # The idempotency key is optional and lives only in a header; the
         # body contract is unchanged. A missing key preserves the original
         # one-envelope-per-request semantics exactly. An illegal key
@@ -12733,7 +12854,7 @@ def create_app(
         idem_present, idempotency_key = _read_idempotency_key(request)
 
         if idem_present:
-            return _create_data_envelope_keyed(body, idempotency_key)
+            return _create_data_envelope_keyed(body, idempotency_key, classification)
 
         # The master keyring is required for this operation; its absence or
         # malformed value is a server configuration failure, never a client
@@ -12786,6 +12907,7 @@ def create_app(
                 workload_id=body.workload_id,
                 data_id=body.data_id,
                 key_version=keyring.current_version,
+                classification=classification,
                 ciphertext=sealed.ciphertext,
                 iv=sealed.iv,
                 tag=sealed.tag,
@@ -12815,6 +12937,7 @@ def create_app(
             workload_id=body.workload_id,
             key_version=keyring.current_version,
             created_at=_rfc3339(now),
+            classification=classification,
         )
 
     @app.get(
@@ -12827,20 +12950,22 @@ def create_app(
         data_id: str | None = Query(default=None),
         created_after: str | None = Query(default=None),
         created_before: str | None = Query(default=None),
+        classification: str | None = Query(default=None),
         cursor: str | None = Query(default=None),
         _empty_body: None = Depends(_require_empty_query_body),
     ) -> Response:
         """Return a read-only, cursor-stable page of envelope metadata.
 
         The range is fixed by the mandatory non-blank tenant and workload
-        and may be narrowed by one explicit non-blank ``data_id`` and an
-        inclusive UTC creation-time window. Ordering is stable
-        ``data_id`` ascending with an exclusive keyset cursor. The cursor
-        carries its own kind tag, is HMAC-authenticated and is bound to
-        the scope, every active filter *and* the fixed snapshot
-        established by the range's first (cursor-less or explicit
-        empty-cursor) query, so it can be neither forged nor replayed
-        against a different scope, filter set, snapshot or query family.
+        and may be narrowed by one explicit non-blank ``data_id``, an
+        inclusive UTC creation-time window and an exact ``classification``
+        match. Ordering is stable ``data_id`` ascending with an exclusive
+        keyset cursor. The cursor carries its own kind tag, is
+        HMAC-authenticated and is bound to the scope, every active filter
+        *and* the fixed snapshot established by the range's first
+        (cursor-less or explicit empty-cursor) query, so it can be neither
+        forged nor replayed against a different scope, filter set,
+        snapshot or query family.
 
         The snapshot is fixed at the per-scope envelope-creation commit
         boundary: only creation advances the per-scope gap-free counter,
@@ -12861,6 +12986,7 @@ def create_app(
             "data_id",
             "created_after",
             "created_before",
+            "classification",
             "cursor",
         }
         supplied = request.query_params.multi_items()
@@ -12892,6 +13018,18 @@ def create_app(
                     status_code=422, detail="invalid data identifier"
                 )
             data_filter = data_id
+
+        # Explicit classification selector: an exact metadata match within
+        # the scope. A blank, wrongly cased, off-alphabet or over-long
+        # value is a shape error rejected before any state is read; a
+        # well-formed value that matches nothing is simply an empty range.
+        classification_filter: str | None = None
+        if classification is not None:
+            if not _CLASSIFICATION_RE.fullmatch(classification):
+                raise HTTPException(
+                    status_code=422, detail="invalid classification"
+                )
+            classification_filter = classification
 
         def _time_bound(value: str | None, name: str) -> tuple[str, datetime | None]:
             if value is None:
@@ -12946,6 +13084,7 @@ def create_app(
                 data_id=data_filter or "",
                 created_after=after_raw,
                 created_before=before_raw,
+                classification=classification_filter or "",
             )
             if decoded_boundary is None:
                 raise HTTPException(status_code=422, detail="invalid cursor")
@@ -12990,7 +13129,7 @@ def create_app(
                     # No committed envelope in the scope yet.
                     snapshot_seq = int(fixed_seq) if fixed_seq is not None else 0
 
-                # Select only the five metadata fields. The material
+                # Select only the metadata fields. The material
                 # columns (ciphertext, iv, tag, wrapped_key) are never
                 # read, so neither plaintext nor sealed material exists on
                 # this path; commit_seq bounds membership but is not
@@ -13001,6 +13140,7 @@ def create_app(
                     DataEnvelope.workload_id,
                     DataEnvelope.key_version,
                     DataEnvelope.created_at,
+                    DataEnvelope.classification,
                 ).where(
                     DataEnvelope.tenant_id == tenant_id,
                     DataEnvelope.workload_id == workload_id,
@@ -13010,6 +13150,10 @@ def create_app(
                 )
                 if data_filter is not None:
                     stmt = stmt.where(DataEnvelope.data_id == data_filter)
+                if classification_filter is not None:
+                    stmt = stmt.where(
+                        DataEnvelope.classification == classification_filter
+                    )
                 if after_dt is not None:
                     stmt = stmt.where(DataEnvelope.created_at >= after_dt)
                 if before_dt is not None:
@@ -13040,13 +13184,17 @@ def create_app(
 
         envelopes = [
             {
-                # Exactly the five metadata fields, in fixed order; no
-                # ciphertext, iv, tag, wrapped_key, payload or key.
+                # Exactly the six metadata fields, in fixed order; no
+                # ciphertext, iv, tag, wrapped_key, payload or key. A row
+                # written before classification existed reports the
+                # backfilled default.
                 "data_id": row.data_id,
                 "tenant_id": row.tenant_id,
                 "workload_id": row.workload_id,
                 "key_version": int(row.key_version),
                 "created_at": _rfc3339(row.created_at),
+                "classification": row.classification
+                or DATA_ENVELOPE_DEFAULT_CLASSIFICATION,
             }
             for row in page
         ]
@@ -13060,6 +13208,7 @@ def create_app(
                 data_id=data_filter or "",
                 created_after=after_raw,
                 created_before=before_raw,
+                classification=classification_filter or "",
                 snapshot_seq=snapshot_seq,
             )
             complete = False
@@ -13109,13 +13258,17 @@ def create_app(
                 raise HTTPException(status_code=404, detail="data envelope not found")
             # Read-only path: the stored material is returned encoded as
             # received and is never unwrapped, decrypted, or logged, so the
-            # plaintext never exists on this path at all.
+            # plaintext never exists on this path at all. The
+            # classification is pure metadata stored beside the material;
+            # a row written before it existed reports the default.
             return DataEnvelopeResponse(
                 data_id=envelope.data_id,
                 tenant_id=envelope.tenant_id,
                 workload_id=envelope.workload_id,
                 key_version=envelope.key_version,
                 created_at=_rfc3339(envelope.created_at),
+                classification=envelope.classification
+                or DATA_ENVELOPE_DEFAULT_CLASSIFICATION,
                 ciphertext=b64url_encode(envelope.ciphertext),
                 iv=b64url_encode(envelope.iv),
                 tag=b64url_encode(envelope.tag),

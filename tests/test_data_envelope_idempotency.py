@@ -274,9 +274,11 @@ def test_first_keyed_create_writes_envelope_and_record_atomically(app, client):
         "workload_id",
         "key_version",
         "created_at",
+        "classification",
     }
     assert data["data_id"] == DATA_ID
     assert data["key_version"] == 1
+    assert data["classification"] == "unclassified"
 
     assert _count_rows(app, DataEnvelope) == 1
     records = _records(app)
@@ -286,6 +288,7 @@ def test_first_keyed_create_writes_envelope_and_record_atomically(app, client):
     assert record.workload_id == WORKLOAD
     assert record.idempotency_key == "key-1"
     assert record.data_id == DATA_ID
+    assert record.classification == "unclassified"
     # Only the irreversible payload digest is stored, never the payload.
     assert record.payload_sha256 == hashlib.sha256(
         PAYLOAD.encode("utf-8")
@@ -500,19 +503,21 @@ def test_record_stores_no_payload_or_key_material(app, client):
         "workload_id": record.workload_id,
         "idempotency_key": record.idempotency_key,
         "data_id": record.data_id,
+        "classification": record.classification,
         "payload_sha256": record.payload_sha256,
         "response_body": record.response_body,
     }
     for value in stored.values():
         assert PAYLOAD not in value
         assert KEY_V1 not in value
-    # The response body carries only the five public metadata fields.
+    # The response body carries only the six public metadata fields.
     assert set(json.loads(record.response_body)) == {
         "data_id",
         "tenant_id",
         "workload_id",
         "key_version",
         "created_at",
+        "classification",
     }
 
 
