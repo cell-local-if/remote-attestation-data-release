@@ -481,6 +481,11 @@ def _rfc3339(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat()
 
 
+def _rfc3339_z(value: datetime) -> str:
+    """UTC RFC3339 with the ``Z`` designator rather than the ``+00:00`` offset."""
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def _utc_minute_window(now: datetime) -> datetime:
     """Return the UTC natural-minute boundary containing ``now``.
 
@@ -10114,6 +10119,135 @@ def create_app(
                     "envelopes": envelopes_count,
                     "current_key_envelopes": current_key_envelopes,
                     "historical_key_envelopes": historical_key_envelopes,
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
+
+    @app.get("/v1/observability/rate-limits")
+    def get_rate_limits(
+        request: Request,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return a read-only snapshot of the three per-minute rate budgets.
+
+        The scope is fixed entirely by the two mandatory, non-blank query
+        parameters; the request body is always empty. Every shape failure
+        (a missing or blank parameter, a wrong-typed or unknown parameter,
+        or any non-empty body) is rejected as a 422 before any state is
+        read — such a rejection reads no counter, consumes no budget and
+        writes no audit.
+
+        On success the handler reads the current UTC natural minute's
+        persisted admission counts for the three independent budgets —
+        challenge issuance, evidence verification and one-time-grant
+        actions — from one consistent read-only snapshot (a single
+        statement of scalar subqueries), so all three figures and the two
+        window timestamps always belong to the same minute and can never
+        observe a half-committed admission. The handler never writes: it
+        issues no challenge, verifies no evidence, creates or consumes no
+        grant, changes no counter, appends no audit or lifecycle event,
+        and returns no nonce, evidence, payload, capability or key
+        material — only the scope, the window and the three
+        limit/used/remaining triples. A scope with no counter row this
+        minute reports zero used. A storage failure is a 500 with no
+        partial summary and no state change.
+        """
+        # --- request shape (all 422, no state is read) ------------------
+        allowed_params = {"tenant_id", "workload_id"}
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+        # Each scope parameter is a single scalar string; a repeated
+        # parameter (a multi-valued/list value) is the wrong shape, not a
+        # silently last-wins scalar.
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(
+                status_code=422, detail="query parameter must appear once"
+            )
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        now = _utcnow()
+        window_start = _utc_minute_window(now)
+        reset_at = window_start + timedelta(minutes=1)
+
+        def _used(counter_model):
+            return (
+                select(counter_model.count)
+                .where(
+                    counter_model.tenant_id == tenant_id,
+                    counter_model.workload_id == workload_id,
+                    counter_model.window_start == window_start,
+                )
+                .scalar_subquery()
+            )
+
+        # One statement of independent scalar subqueries evaluates against
+        # a single consistent database snapshot on every backend, so the
+        # three budgets are always read from the same minute and a
+        # concurrently committing admission is never observed half-applied.
+        # The three counter tables are deliberately separate: the budgets
+        # never share rows, quota or lock traffic, and this read borrows
+        # nothing across tenants, workloads or minutes.
+        usage_stmt = select(
+            _used(ChallengeIssuanceCounter).label("challenge_issuance_used"),
+            _used(VerificationAdmissionCounter).label("verification_used"),
+            _used(RateLimitCounter).label("grant_actions_used"),
+        )
+        try:
+            with session_factory() as session:
+                result = session.execute(usage_stmt).one()
+        except Exception:
+            logger.error("rate limit summary query failed")
+            raise HTTPException(
+                status_code=500, detail="rate limit summary unavailable"
+            )
+
+        def _budget(limit: int, used: int | None) -> dict:
+            # A scope with no admitted request this minute has no counter
+            # row, so the scalar subquery returns NULL: zero used, the full
+            # budget remaining. remaining is never negative.
+            used_value = used or 0
+            return {
+                "limit": limit,
+                "used": used_value,
+                "remaining": max(0, limit - used_value),
+            }
+
+        # Fixed field order: the two scope strings, the two window
+        # timestamps (UTC RFC3339 with the Z designator, both from the same
+        # minute), then the three budget objects each carrying limit, used
+        # and remaining as JSON integers. Compact JSON terminated by a
+        # single newline.
+        body = (
+            json.dumps(
+                {
+                    "tenant_id": tenant_id,
+                    "workload_id": workload_id,
+                    "window_start": _rfc3339_z(window_start),
+                    "reset_at": _rfc3339_z(reset_at),
+                    "challenge_issuance": _budget(
+                        CHALLENGE_ISSUANCE_BUDGET_PER_MINUTE,
+                        result.challenge_issuance_used,
+                    ),
+                    "verification": _budget(
+                        VERIFICATION_BUDGET_PER_MINUTE,
+                        result.verification_used,
+                    ),
+                    "grant_actions": _budget(
+                        GRANT_BUDGET_PER_MINUTE,
+                        result.grant_actions_used,
+                    ),
                 },
                 separators=(",", ":"),
                 allow_nan=False,
