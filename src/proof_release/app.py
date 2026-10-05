@@ -134,6 +134,7 @@ from proof_release.db import (
     RewrapJob,
     RewrapJobEvent,
     RewrapJobIdempotencyRecord,
+    RewrapJobItem,
     TrustRoot,
     TrustRootCommitCounter,
     VerificationAdmissionCounter,
@@ -306,6 +307,50 @@ def _record_rewrap_job_event(
             new_status=new_status,
             reason=reason,
             created_at=now,
+        )
+    )
+
+
+def _record_rewrap_job_item(
+    session,
+    *,
+    tenant_id: str,
+    workload_id: str,
+    job_id: str,
+    data_id: str,
+    old_key_version: int,
+    new_key_version: int,
+    result: str,
+    now: datetime,
+) -> None:
+    """Append one per-envelope result row inside the caller's open transaction.
+
+    The per-job ``seq`` is the current maximum plus one, allocated in the
+    same transaction as the envelope material change, the audit event and
+    the job progress update it accompanies, so it is gap-free and commits
+    atomically with that envelope's outcome. Only the runner holding the
+    job's claim can be inside such a transaction (the claim guard makes
+    advancement mutually exclusive, and on SQLite every writer transaction
+    already begins as BEGIN IMMEDIATE), so the MAX+1 allocation can never
+    race another envelope commit of the same job. The caller commits (or
+    rolls back) the unit of work; an envelope operation that is discarded
+    — a cancel, a lost claim or a failure settlement — leaves no item.
+    """
+    max_seq = session.scalar(
+        select(func.max(RewrapJobItem.seq)).where(RewrapJobItem.job_id == job_id)
+    )
+    session.add(
+        RewrapJobItem(
+            item_id=str(uuid.uuid4()),
+            tenant_id=tenant_id,
+            workload_id=workload_id,
+            job_id=job_id,
+            seq=(max_seq or 0) + 1,
+            data_id=data_id,
+            old_key_version=old_key_version,
+            new_key_version=new_key_version,
+            result=result,
+            occurred_at=now,
         )
     )
 
@@ -1744,6 +1789,105 @@ def _decode_rewrap_job_event_cursor(
     return boundary_seq, snapshot_seq
 
 
+def _rewrap_job_item_cursor_payload(
+    tenant_id: str,
+    workload_id: str,
+    job_id: str,
+    boundary_seq: int,
+) -> bytes:
+    """Canonical byte payload authenticated inside a job-item cursor.
+
+    The cursor marks an exclusive per-job ``seq`` position and the scope
+    and job are part of the signed payload, so a cursor minted for one
+    job's item listing can never be replayed against another scope, job or
+    pagination family. The kind tag distinguishes these cursors from every
+    other cursor family even though all share the same HMAC secret.
+    """
+    return json.dumps(
+        {
+            "k": _REWRAP_JOB_ITEM_CURSOR_KIND,
+            "t": tenant_id,
+            "w": workload_id,
+            "j": job_id,
+            "q": boundary_seq,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _encode_rewrap_job_item_cursor(
+    tenant_id: str,
+    workload_id: str,
+    job_id: str,
+    boundary_seq: int,
+) -> str:
+    """Build an opaque, scope- and job-bound exclusive item cursor."""
+    payload = _rewrap_job_item_cursor_payload(
+        tenant_id, workload_id, job_id, boundary_seq
+    )
+    mac = hmac.new(_cursor_secret(), payload, hashlib.sha256).digest()
+    return b64url_encode(payload + mac)
+
+
+def _decode_rewrap_job_item_cursor(
+    token: str,
+    tenant_id: str,
+    workload_id: str,
+    job_id: str,
+) -> int | None:
+    """Validate a job-item cursor and return its exclusive seq boundary.
+
+    Returns the exclusive sequence boundary on success or ``None`` for a
+    malformed/forged token, a cursor of another kind (rewrap batch, grant
+    audit, compliance audit events, revocations, job history or job
+    events), or one minted for any other scope or job. The beginning
+    marker (``""``) never reaches this function.
+    """
+    if not _CURSOR_RE.fullmatch(token):
+        return None
+    try:
+        raw = b64url_decode(token)
+    except ValueError:
+        return None
+    # The MAC is a fixed 32-byte suffix; the JSON payload precedes it.
+    if len(raw) <= 32:
+        return None
+    payload, mac = raw[:-32], raw[-32:]
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    if decoded.get("k") != _REWRAP_JOB_ITEM_CURSOR_KIND:
+        return None
+    boundary_seq = decoded.get("q")
+    # Sequence positions are positive ints (bools are rejected as ints).
+    if not isinstance(boundary_seq, int) or isinstance(boundary_seq, bool):
+        return None
+    if boundary_seq < 1:
+        return None
+    expected_mac = hmac.new(
+        _cursor_secret(),
+        _rewrap_job_item_cursor_payload(
+            tenant_id, workload_id, job_id, boundary_seq
+        ),
+        hashlib.sha256,
+    ).digest()
+    if not hmac.compare_digest(mac, expected_mac):
+        return None
+    # Defense in depth: the MAC already covers every field, but confirm
+    # the scope and job explicitly.
+    if not hmac.compare_digest(str(decoded.get("t", "")), tenant_id):
+        return None
+    if not hmac.compare_digest(str(decoded.get("w", "")), workload_id):
+        return None
+    if not hmac.compare_digest(str(decoded.get("j", "")), job_id):
+        return None
+    return boundary_seq
+
+
 def _release_grant_event_cursor_payload(
     tenant_id: str,
     workload_id: str,
@@ -2570,6 +2714,13 @@ REWRAP_JOB_EVENT_PAGE_SIZE = 100
 #: revocations or job history — all authenticated with the same secret)
 #: can never be replayed against a job's event timeline, and vice versa.
 _REWRAP_JOB_EVENT_CURSOR_KIND = "rewrap-job-events-v1"
+
+#: Discriminator embedded in rewrap-job-item cursors so a cursor from any
+#: other family (rewrap batch, grant audit, compliance audit events,
+#: revocations, job history or job events — all authenticated with the
+#: same secret) can never be replayed against a job's item listing, and
+#: vice versa.
+_REWRAP_JOB_ITEM_CURSOR_KIND = "rewrap-job-items-v1"
 
 #: Fixed page size for the read-only proof-lifecycle event timeline.
 #: Like the other audit listings it is an internal constant and never
@@ -5371,6 +5522,25 @@ def create_app(
                             capability_sha256=None,
                             occurred_at=item_occurred_at,
                         )
+                    )
+                    # The per-job item row commits in the same transaction
+                    # as the material change, the audit event and the
+                    # progress update below: a committed envelope always
+                    # has exactly one item, and an envelope operation that
+                    # rolls back (cancel, lost claim, commit failure)
+                    # leaves none. Only rewrapped/skipped outcomes reach
+                    # this point; a failed envelope settles the job above
+                    # without committing an item.
+                    _record_rewrap_job_item(
+                        session,
+                        tenant_id=tenant_id,
+                        workload_id=workload_id,
+                        job_id=job_id,
+                        data_id=data_id,
+                        old_key_version=audit_old_version,
+                        new_key_version=new_version,
+                        result=result,
+                        now=item_occurred_at,
                     )
                     next_boundary = (
                         _encode_cursor(tenant_id, workload_id, data_id)
@@ -14836,6 +15006,182 @@ def create_app(
             json.dumps(
                 {
                     "events": events,
+                    "next_cursor": next_cursor,
+                    "complete": complete,
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
+
+    @app.get("/v1/rewrap-jobs//items")
+    def rewrap_job_items_identifier_required() -> Response:
+        # An empty path segment is a missing job identifier: a 422 client
+        # error rather than a routing-level 404. It never reads a job.
+        raise HTTPException(status_code=422, detail="invalid job identifier")
+
+    @app.get("/v1/rewrap-jobs/{job_id}/items")
+    def list_rewrap_job_items(
+        request: Request,
+        job_id: str,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        limit: str | None = Query(default=None),
+        cursor: str | None = Query(default=None),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return the read-only per-envelope result listing of one rewrap job.
+
+        The range is exactly one job fixed by the mandatory
+        tenant/workload scope and the canonical-UUID path id; only
+        ``tenant_id``, ``workload_id``, an optional 1..200 ``limit``
+        (default 50) and an optional ``cursor`` are accepted. Items are
+        the job's committed per-envelope outcomes in their stable,
+        immutable per-job ``seq`` order, each carrying only ``seq``,
+        ``data_id``, ``old_key_version``, ``new_key_version``, ``result``
+        (``rewrapped`` or ``skipped``) and a UTC RFC3339 ``occurred_at``.
+        Every item commits in the same transaction as its envelope change
+        and the job's progress, so a page only ever reads committed
+        results; an envelope whose rewrap failed never appears here (its
+        failure classification stays on the job's event timeline), while
+        the results committed before it remain queryable.
+
+        An omitted or empty cursor starts at the job's first item;
+        otherwise the cursor must be a next-page cursor this job's listing
+        previously issued. The cursor is HMAC-authenticated and bound to
+        the scope, the job and this pagination family, so it cannot be
+        forged, tampered with, or replayed against another job or cursor
+        family. Items are append-only and immutable once committed, so
+        paging a still-advancing job is stable: each page continues
+        strictly after the last returned ``seq`` and later commits only
+        ever append. A job created before per-item recording existed has
+        no rows and pages as an empty, complete listing. The handler
+        issues only SELECTs — a query changes neither the job nor any
+        envelope — and a storage failure aborts the whole request with a
+        500 rather than returning half a page.
+        """
+        # --- request shape (all 422, no storage touched) ----------------
+        allowed_params = {"tenant_id", "workload_id", "limit", "cursor"}
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+        # Each parameter is a single scalar string; a repeated parameter
+        # (even of an allowed name) is ambiguous and rejected rather than
+        # silently treated as last-wins.
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(status_code=422, detail="query parameter must appear once")
+
+        # The path identifier must be a canonical lowercase UUID; an
+        # empty segment is handled by the dedicated route above.
+        if not job_id or not _UUID_RE.fullmatch(job_id):
+            raise HTTPException(status_code=422, detail="invalid job identifier")
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        # Omitted limit defaults to 50; a supplied limit must be a decimal
+        # integer in 1..200. Empty, non-integer and out-of-range values
+        # are indistinguishable 422s checked before any state is read.
+        if limit is None:
+            page_size = REWRAP_BATCH_DEFAULT_LIMIT
+        else:
+            if not re.fullmatch(r"[0-9]+", limit):
+                raise HTTPException(status_code=422, detail="invalid limit")
+            page_size = int(limit)
+            if not (
+                REWRAP_BATCH_MIN_LIMIT <= page_size <= REWRAP_BATCH_MAX_LIMIT
+            ):
+                raise HTTPException(status_code=422, detail="invalid limit")
+
+        # Omitted cursor or an explicit empty string starts before the
+        # first item. Whitespace, malformed, forged, tampered, cross-scope,
+        # cross-job or foreign-kind cursors are indistinguishable 422s and
+        # are rejected without reading any state.
+        boundary_seq = 0
+        if cursor is not None and cursor != "":
+            if not cursor.strip() or not _CURSOR_RE.fullmatch(cursor):
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            decoded = _decode_rewrap_job_item_cursor(
+                cursor, tenant_id, workload_id, job_id
+            )
+            if decoded is None:
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            boundary_seq = decoded
+
+        # --- read-only item scan ----------------------------------------
+        try:
+            with session_factory() as session:
+                # The named job must exist in exactly this scope; an
+                # unknown or cross-scope job is an indistinguishable 404.
+                job = session.get(RewrapJob, job_id)
+                if (
+                    job is None
+                    or job.tenant_id != tenant_id
+                    or job.workload_id != workload_id
+                ):
+                    raise HTTPException(status_code=404, detail="rewrap job not found")
+
+                stmt = (
+                    select(RewrapJobItem)
+                    .where(
+                        RewrapJobItem.job_id == job_id,
+                        RewrapJobItem.seq > boundary_seq,
+                    )
+                    .order_by(RewrapJobItem.seq.asc())
+                    .limit(page_size + 1)
+                )
+                # One extra row is the "more follows" probe. The scan is a
+                # single read-only statement: a storage failure aborts the
+                # whole request with a 500 rather than returning a partial
+                # page.
+                rows = list(session.scalars(stmt))
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("rewrap job items query failed")
+            raise HTTPException(
+                status_code=500, detail="rewrap job items unavailable"
+            )
+
+        has_more = len(rows) > page_size
+        page = rows[:page_size]
+
+        items = [
+            {
+                # Stable, immutable per-job sequence in committed order.
+                "seq": row.seq,
+                "data_id": row.data_id,
+                "old_key_version": row.old_key_version,
+                "new_key_version": row.new_key_version,
+                # A fixed service code: rewrapped or skipped only.
+                "result": row.result,
+                "occurred_at": _rfc3339(row.occurred_at),
+            }
+            for row in page
+        ]
+
+        if has_more:
+            next_cursor = _encode_rewrap_job_item_cursor(
+                tenant_id, workload_id, job_id, page[-1].seq
+            )
+            complete = False
+        else:
+            next_cursor = ""
+            complete = True
+
+        # Compact container (items, next_cursor, complete) with a single
+        # terminating newline. seq and the key versions are ints, complete
+        # is a bool and every other value is a string — no floats, -0.0 or
+        # non-finite values can appear.
+        body = (
+            json.dumps(
+                {
+                    "items": items,
                     "next_cursor": next_cursor,
                     "complete": complete,
                 },

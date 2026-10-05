@@ -1596,6 +1596,61 @@ class RewrapJobEvent(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
+class RewrapJobItem(Base):
+    """One committed per-envelope result row of an asynchronous rewrap job.
+
+    A row is inserted in the *same* committed transaction as the envelope
+    material change, the append-only rewrap audit event and the job
+    progress update it records, so a committed envelope always has exactly
+    one item row and a rolled-back envelope attempt (a cancel, a lost
+    claim, or a failure settlement) has none. Only successful outcomes are
+    ever recorded: an envelope whose rewrap fails settles the job without
+    committing, so ``result`` is only ever ``rewrapped`` or ``skipped``
+    and the failing envelope itself never appears here — its failure
+    classification remains readable only from the job's lifecycle events.
+    The table is append-only (rows are never updated or deleted) and the
+    per-job ``seq`` is a gap-free, stable ordering key allocated in the
+    commit transaction, so the recorded order is the order in which
+    envelopes committed, and a page read can never observe duplicates,
+    gaps or rewritten history.
+
+    Jobs created before this table existed simply have no rows; their
+    item listing is empty and complete. Only identifiers, the sequence
+    number, the old/new master key versions, the fixed result code and a
+    UTC timestamp are stored — never envelope material, payloads, cursor
+    tokens or keys.
+    """
+
+    __tablename__ = "rewrap_job_items"
+    __table_args__ = (
+        # The gap-free per-job sequence, both for MAX+1 allocation and for
+        # the item listing ordered by seq.
+        Index("ix_rewrap_job_items_job_seq", "job_id", "seq", unique=True),
+    )
+
+    item_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("rewrap_jobs.job_id"), index=True
+    )
+    # Gap-free, immutable, per-job sequence number in committed-envelope
+    # order: 1 for the first committed envelope, increasing by exactly one
+    # per later committed envelope. It is the stable listing key.
+    seq: Mapped[int] = mapped_column(Integer)
+    data_id: Mapped[str] = mapped_column(String(256))
+    # Master key version recorded on the envelope before this job touched
+    # it; identical to new_key_version for skips.
+    old_key_version: Mapped[int] = mapped_column(Integer)
+    new_key_version: Mapped[int] = mapped_column(Integer)
+    # One of REWRAP_RESULT_REWRAPPED / REWRAP_RESULT_SKIPPED; a fixed,
+    # service-defined code only. The failure codes never appear here: a
+    # failed envelope attempt is rolled back, never committed.
+    result: Mapped[str] = mapped_column(String(16))
+    # Commit time of the recorded envelope outcome.
+    occurred_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class RewrapJobIdempotencyRecord(Base):
     """The first accepted submission of an idempotency-keyed rewrap job.
 
