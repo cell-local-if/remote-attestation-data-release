@@ -1416,6 +1416,67 @@ class ReleaseGrantConsumeIdempotencyRecord(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
+class ReleaseGrantIdempotencyRecord(Base):
+    """The first (and only) idempotency-keyed issuance of one release grant.
+
+    At most one row exists per ``(tenant_id, workload_id,
+    idempotency_key)`` triple; the same key in a different tenant or
+    workload is an independent row and never conflicts. The row is
+    inserted in the *same* transaction as the :class:`ReleaseGrant` it
+    records, together with that grant's pending lifecycle event and
+    compliance audit event, so a crash can never leave a grant without
+    its idempotency record or a record pointing at no grant. A failed
+    issuance — a 404/409 judgement against the decision, a lost insert
+    race, or any rollback — inserts no row, so the key stays free and a
+    later recovery re-judges the request normally.
+
+    Grant issuance is at-most-once rather than replayable: the plaintext
+    capability is returned on the winning ``201`` response only and is
+    never stored, so a later same-key request cannot receive it. Every
+    later same-key same-scope request is therefore a stable ``409``
+    (``release grant already issued``) that mints no second grant,
+    generates no second capability, appends no event or audit row and
+    changes nothing — even if the first grant has since been consumed,
+    revoked or expired. A same-key request whose normalized content
+    differs is the distinct stable ``409``
+    (``idempotency key conflict``).
+
+    Only the scope, the caller-chosen key, a SHA-256 fingerprint of the
+    normalized request identity (scope, decision_id, data_id and
+    ttl_seconds), the resulting grant id and the creation time are
+    persisted — never the plaintext capability, its digest, a response
+    body, a payload, evidence, a key or an evidence text.
+    """
+
+    __tablename__ = "release_grant_idempotency_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "idempotency_key",
+            name="uq_release_grant_idempotency_scope_key",
+        ),
+    )
+
+    record_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # Caller-chosen key: 1..64 visible ASCII characters. Unique only
+    # within the (tenant, workload) scope; the same key in another scope
+    # is an independent row and never conflicts.
+    idempotency_key: Mapped[str] = mapped_column(String(64))
+    # Grant minted by the first legal keyed issuance; every later replay
+    # of this key is answered with "release grant already issued", never
+    # with that grant's capability.
+    grant_id: Mapped[str] = mapped_column(String(36), index=True)
+    # Hex SHA-256 over the normalized request identity (tenant_id,
+    # workload_id, decision_id, data_id and ttl_seconds under canonical
+    # JSON); used only to distinguish a same-key replay from a same-key
+    # request carrying different content.
+    request_fingerprint: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class RewrapBatch(Base):
     """One page of a scoped, cursor-driven envelope rewrap batch.
 
