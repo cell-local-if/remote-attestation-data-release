@@ -14247,6 +14247,61 @@ def create_app(
             content=body, status_code=status_code, media_type="application/json"
         )
 
+    @app.get("/v1/verifiers")
+    def list_verifiers(
+        request: Request,
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return the read-only directory of registered evidence formats.
+
+        The directory is the complete set of ``evidence_format`` names the
+        verifier registry currently accepts, de-duplicated and sorted
+        strictly ascending by Unicode code point, plus the entry count.
+        It admits no filtering or pagination: any query parameter (known,
+        unknown, repeated, or blank) and any non-empty request body is a
+        422 raised before the registry is read, so a malformed request
+        never reveals whether a format exists.
+
+        The handler is purely read-only: it touches no challenge, evidence
+        or release state, consumes no rate-limit budget, writes nothing,
+        and never invokes a verifier. The response carries only the
+        registered names — never plugin instances, class or module names,
+        configuration, secrets, certificates, evidence, or exception text.
+        A registry read or snapshot failure is a 500 with no partial list;
+        the identical request succeeds once the registry is readable again.
+        """
+        # --- request shape (all 422, registry not yet read) -------------
+        if request.query_params.multi_items():
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+
+        # One complete, consistent snapshot of the registered names. A
+        # concurrent register/replace/unregister may observe the state
+        # before or after the change, but never a partial or duplicated
+        # view; a registry failure aborts the whole request with a 500.
+        try:
+            formats = list(registry.format_names())
+        except Exception:
+            logger.error("verifier registry snapshot failed")
+            raise HTTPException(
+                status_code=500, detail="verifier registry unavailable"
+            )
+
+        # Exactly two fields in a fixed order (formats, then count). The
+        # names are emitted verbatim as registered; compact JSON
+        # terminated by a single newline.
+        body = (
+            json.dumps(
+                {"formats": formats, "count": len(formats)},
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
+
     @app.get("/v1/key-rotation/status")
     def get_key_rotation_status(
         request: Request,

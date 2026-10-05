@@ -16,6 +16,7 @@ import hmac
 import json
 import os
 import re
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -168,22 +169,39 @@ class VerifierRegistry:
 
     def __init__(self) -> None:
         self._verifiers: Dict[str, Verifier] = {}
+        self._lock = threading.Lock()
 
     def register(self, verifier: Verifier) -> None:
         """Register (or replace) a verifier for its format name."""
         name = getattr(verifier, "format_name", "")
         if not isinstance(name, str) or not name.strip():
             raise ValueError("verifier format_name must be a non-empty string")
-        self._verifiers[name] = verifier
+        with self._lock:
+            self._verifiers[name] = verifier
 
     def unregister(self, format_name: str) -> None:
-        self._verifiers.pop(format_name, None)
+        with self._lock:
+            self._verifiers.pop(format_name, None)
 
     def get(self, format_name: str) -> Verifier | None:
         return self._verifiers.get(format_name)
 
     def __contains__(self, format_name: object) -> bool:
         return format_name in self._verifiers
+
+    def format_names(self) -> tuple[str, ...]:
+        """Snapshot the registered ``evidence_format`` names.
+
+        Returns every currently registered name exactly as it was
+        registered, de-duplicated and sorted strictly ascending by Unicode
+        code point. The snapshot is taken under the registry lock so a
+        concurrent register/replace/unregister can never yield a partial
+        or inconsistent view; each call reflects one complete state of the
+        registry. Only the names are exposed — never verifier instances,
+        classes, module paths, or configuration.
+        """
+        with self._lock:
+            return tuple(sorted(self._verifiers))
 
 
 def _reject() -> VerificationResult:
