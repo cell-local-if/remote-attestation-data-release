@@ -296,6 +296,7 @@ def test_entry_has_exact_metadata_shape_and_field_order(client):
         "workload_id",
         "key_version",
         "created_at",
+        "classification",
     ]
     assert entry == {
         "data_id": "item",
@@ -303,6 +304,7 @@ def test_entry_has_exact_metadata_shape_and_field_order(client):
         "workload_id": WORKLOAD,
         "key_version": 1,
         "created_at": created["created_at"],
+        "classification": "unclassified",
     }
     # No material or secret field is ever returned.
     for name in (

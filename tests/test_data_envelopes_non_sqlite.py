@@ -138,6 +138,14 @@ def test_open_backfills_legacy_sequence_counter_and_index(app):
         assert conn.execute(
             text("SELECT count(*) FROM data_envelopes WHERE commit_seq IS NULL")
         ).scalar() == 0
+        # Legacy rows predate classification metadata and are backfilled
+        # to unclassified on open.
+        assert conn.execute(
+            text(
+                "SELECT count(*) FROM data_envelopes "
+                "WHERE classification IS NULL OR classification <> 'unclassified'"
+            )
+        ).scalar() == 0
 
 
 def test_open_is_idempotent_across_restart(app):

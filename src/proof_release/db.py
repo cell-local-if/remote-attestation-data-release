@@ -1163,6 +1163,15 @@ class DataEnvelope(Base):
     # The read-only directory bounds its replayable snapshot membership by
     # this marker, never by write timing.
     commit_seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Queryable metadata classification (1..32 lowercase ASCII characters,
+    # the first a letter). It is pure metadata: it never participates in
+    # encryption and changes neither the material columns nor the key
+    # version. NULL only on rows written before the column existed; those
+    # are backfilled to "unclassified" on open, and every new envelope
+    # carries a value.
+    classification: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
 
 
 class DataEnvelopeCommitCounter(Base):
@@ -1247,6 +1256,13 @@ class DataEnvelopeIdempotencyRecord(Base):
     # The data_id of the envelope created by the first legal keyed
     # request; part of the request identity a replay must match.
     data_id: Mapped[str] = mapped_column(String(256))
+    # The classification of the first legal keyed request; part of the
+    # request identity a replay must match. NULL only on records written
+    # before classification existed; such records are treated as
+    # "unclassified" when a replay is judged.
+    classification: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
     # Hex SHA-256 of the payload bytes; irreversible, used only to
     # detect a same-key request carrying a different payload, which is
     # a 409 that changes nothing. The plaintext payload never

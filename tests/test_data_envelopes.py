@@ -69,11 +69,13 @@ def test_create_envelope_returns_201_metadata_only(client):
         "workload_id",
         "key_version",
         "created_at",
+        "classification",
     }
     assert data["data_id"] == DATA_ID
     assert data["tenant_id"] == TENANT
     assert data["workload_id"] == WORKLOAD
     assert data["key_version"] == KEY_VERSION == 1
+    assert data["classification"] == "unclassified"
     created_at = data["created_at"]
     assert created_at.endswith("+00:00")
     assert datetime.fromisoformat(created_at).utcoffset() == timedelta(0)
@@ -101,6 +103,7 @@ def test_get_envelope_returns_material_that_decrypts_and_authenticates(client):
         "workload_id",
         "key_version",
         "created_at",
+        "classification",
         "ciphertext",
         "iv",
         "tag",
@@ -111,6 +114,7 @@ def test_get_envelope_returns_material_that_decrypts_and_authenticates(client):
     assert data["workload_id"] == WORKLOAD
     assert data["key_version"] == 1
     assert data["created_at"] == created_at
+    assert data["classification"] == "unclassified"
 
     # All four material fields are strict unpadded base64url.
     for field in ("ciphertext", "iv", "tag", "wrapped_key"):
