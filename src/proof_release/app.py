@@ -4579,6 +4579,18 @@ async def _require_empty_query_body(request: Request) -> None:
         raise HTTPException(status_code=422, detail="query body must be empty")
 
 
+def _prom_label_escape(value: str) -> str:
+    """Escape a label value per the Prometheus text exposition format.
+
+    Only backslash, double quote and line feed are escaped (as ``\\\\``,
+    ``\\"`` and ``\\n``); every other character is emitted verbatim. The
+    escaping is applied to scope label values so a tenant or workload id
+    containing any of these characters still produces a syntactically
+    valid, unambiguous series line.
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
 def _json_safe(value):
     """Replace non-finite floats so a 422 detail can always be rendered.
 
@@ -10557,6 +10569,293 @@ def create_app(
             + b"\n"
         )
         return Response(content=body, media_type="application/json")
+
+    @app.get("/v1/observability/metrics")
+    def get_observability_metrics(
+        request: Request,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Export the scope's release state in Prometheus text format.
+
+        A read-only companion to the JSON observability endpoints, rendered
+        for scrape-based monitoring. The scope is fixed entirely by the two
+        mandatory, non-blank query parameters; the request body is always
+        empty. Every shape failure (a missing or blank parameter, a
+        wrong-typed or unknown parameter, or any non-empty body) is
+        rejected as a 422 before any state is read.
+
+        On success the handler renders one consistent read-only snapshot —
+        a single statement of independent scalar subqueries — as a
+        Prometheus text exposition (version 0.0.4): the three release-grant
+        status totals, the pending grants split into live and expired, the
+        envelope population split by current versus historical master key
+        version, and the limit/used/remaining triple of each of the three
+        per-minute budgets (challenge issuance, verification, grant
+        actions). Every series carries the ``tenant_id`` and
+        ``workload_id`` labels; status and classification values are fixed
+        English tokens; label values are escaped per the exposition rules;
+        every sample is a non-negative decimal integer; and series are
+        emitted in a deterministic order (by metric name, then by label).
+        The body ends with a single newline.
+
+        The handler never writes: it creates no challenge, consumes no
+        capability, rotates no key, appends no audit or lifecycle event,
+        and reserves no rate-limit budget; it returns no payload,
+        capability, nonce, evidence or key material — only counts. A
+        storage failure is a 500 (``metrics unavailable``) and an unusable
+        master key configuration is a 500 (``master key configuration
+        unavailable``); neither returns a partial exposition.
+        """
+        # --- request shape (all 422, no state is read) ------------------
+        allowed_params = {"tenant_id", "workload_id"}
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+        # Each scope parameter is a single scalar string; a repeated
+        # parameter (a multi-valued/list value) is the wrong shape, not a
+        # silently last-wins scalar.
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(
+                status_code=422, detail="query parameter must appear once"
+            )
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        # The current master key version classifies the envelope rows; it
+        # is key material metadata only (an integer version), never a key.
+        # A missing or malformed keyring is a server failure: fail closed
+        # with a 500 rather than reporting an unclassified envelope set.
+        try:
+            current_key_version = load_keyring().current_version
+        except MasterKeyError as exc:
+            logger.error("master key configuration unavailable: %s", exc)
+            raise HTTPException(
+                status_code=500, detail="master key configuration unavailable"
+            )
+
+        now = _utcnow()
+        window_start = _utc_minute_window(now)
+
+        def _grant_count(*predicates):
+            return (
+                select(func.count())
+                .select_from(ReleaseGrant)
+                .where(
+                    ReleaseGrant.tenant_id == tenant_id,
+                    ReleaseGrant.workload_id == workload_id,
+                    *predicates,
+                )
+                .scalar_subquery()
+            )
+
+        def _envelope_count(*predicates):
+            return (
+                select(func.count())
+                .select_from(DataEnvelope)
+                .where(
+                    DataEnvelope.tenant_id == tenant_id,
+                    DataEnvelope.workload_id == workload_id,
+                    *predicates,
+                )
+                .scalar_subquery()
+            )
+
+        def _used(counter_model):
+            return (
+                select(counter_model.count)
+                .where(
+                    counter_model.tenant_id == tenant_id,
+                    counter_model.workload_id == workload_id,
+                    counter_model.window_start == window_start,
+                )
+                .scalar_subquery()
+            )
+
+        # One statement of independent scalar subqueries evaluates against
+        # a single consistent database snapshot on every backend, so the
+        # grant, envelope and budget figures can never observe a
+        # half-committed change. The handler issues no writes: it consumes
+        # no rate-limit slot and appends no audit row.
+        metrics_stmt = select(
+            _grant_count(
+                ReleaseGrant.status == RELEASE_GRANT_STATUS_PENDING
+            ).label("pending"),
+            _grant_count(
+                ReleaseGrant.status == RELEASE_GRANT_STATUS_CONSUMED
+            ).label("consumed"),
+            _grant_count(
+                ReleaseGrant.status == RELEASE_GRANT_STATUS_REVOKED
+            ).label("revoked"),
+            # Live pending grants are still within their validity window;
+            # every other pending grant is expired. The expired figure is
+            # derived as pending minus live so the two parts always sum
+            # exactly to pending even at the expiry boundary.
+            _grant_count(
+                ReleaseGrant.status == RELEASE_GRANT_STATUS_PENDING,
+                ReleaseGrant.expires_at > now,
+            ).label("live_pending"),
+            _envelope_count().label("envelopes"),
+            # Envelopes recorded at the keyring's current version are
+            # migrated; every other recorded version is historical.
+            _envelope_count(
+                DataEnvelope.key_version == current_key_version
+            ).label("current_key_envelopes"),
+            _used(ChallengeIssuanceCounter).label("challenge_issuance_used"),
+            _used(VerificationAdmissionCounter).label("verification_used"),
+            _used(RateLimitCounter).label("grant_actions_used"),
+        )
+        try:
+            with session_factory() as session:
+                result = session.execute(metrics_stmt).one()
+        except Exception:
+            logger.error("metrics query failed")
+            raise HTTPException(status_code=500, detail="metrics unavailable")
+
+        pending_count = result.pending
+        live_pending_count = result.live_pending
+        expired_pending_count = pending_count - live_pending_count
+        envelopes_count = result.envelopes
+        current_key_envelopes = result.current_key_envelopes
+        historical_key_envelopes = envelopes_count - current_key_envelopes
+
+        # A scope with no admitted request this minute has no counter row,
+        # so the scalar subquery returns NULL: zero used, the full budget
+        # remaining. remaining is never negative.
+        budgets = {
+            "challenge_issuance": (
+                CHALLENGE_ISSUANCE_BUDGET_PER_MINUTE,
+                result.challenge_issuance_used or 0,
+            ),
+            "verification": (
+                VERIFICATION_BUDGET_PER_MINUTE,
+                result.verification_used or 0,
+            ),
+            "grant_actions": (
+                GRANT_BUDGET_PER_MINUTE,
+                result.grant_actions_used or 0,
+            ),
+        }
+
+        # Fixed metric names, help strings and classification label values:
+        # the exposition contract is stable, so a scraper can rely on every
+        # series below always being present (an empty scope reports zeros,
+        # never omitted series).
+        metric_help = {
+            "proof_release_data_envelopes_total": (
+                "Data envelopes stored for the scope, split by master key "
+                "version currency."
+            ),
+            "proof_release_pending_release_grants": (
+                "Pending release grants in the scope, split by "
+                "validity-window state."
+            ),
+            "proof_release_rate_limit_budget_limit": (
+                "Per-minute admission budget limit for the scope."
+            ),
+            "proof_release_rate_limit_budget_remaining": (
+                "Per-minute admission budget still available to the scope "
+                "in the current window."
+            ),
+            "proof_release_rate_limit_budget_used": (
+                "Per-minute admission budget already spent by the scope in "
+                "the current window."
+            ),
+            "proof_release_release_grants_total": (
+                "Release grants in the scope, split by status."
+            ),
+        }
+        # (metric name, classifying labels, value); the scope labels are
+        # attached to every series at render time.
+        series = [
+            (
+                "proof_release_release_grants_total",
+                {"status": "pending"},
+                pending_count,
+            ),
+            (
+                "proof_release_release_grants_total",
+                {"status": "consumed"},
+                result.consumed,
+            ),
+            (
+                "proof_release_release_grants_total",
+                {"status": "revoked"},
+                result.revoked,
+            ),
+            (
+                "proof_release_pending_release_grants",
+                {"state": "live"},
+                live_pending_count,
+            ),
+            (
+                "proof_release_pending_release_grants",
+                {"state": "expired"},
+                expired_pending_count,
+            ),
+            (
+                "proof_release_data_envelopes_total",
+                {"key_version": "current"},
+                current_key_envelopes,
+            ),
+            (
+                "proof_release_data_envelopes_total",
+                {"key_version": "historical"},
+                historical_key_envelopes,
+            ),
+        ]
+        for budget_name, (limit, used) in budgets.items():
+            series.append(
+                (
+                    "proof_release_rate_limit_budget_limit",
+                    {"budget": budget_name},
+                    limit,
+                )
+            )
+            series.append(
+                (
+                    "proof_release_rate_limit_budget_used",
+                    {"budget": budget_name},
+                    used,
+                )
+            )
+            series.append(
+                (
+                    "proof_release_rate_limit_budget_remaining",
+                    {"budget": budget_name},
+                    max(0, limit - used),
+                )
+            )
+
+        # Deterministic output: metrics in name order, series within a
+        # metric in label order, labels inside a series in name order.
+        # Every value is a Python int produced by SQL count aggregation or
+        # a fixed budget constant, so each sample renders as a non-negative
+        # decimal integer.
+        scope_labels = {"tenant_id": tenant_id, "workload_id": workload_id}
+        lines = []
+        for metric_name in sorted(metric_help):
+            lines.append(f"# HELP {metric_name} {metric_help[metric_name]}")
+            lines.append(f"# TYPE {metric_name} gauge")
+            metric_series = sorted(
+                (s for s in series if s[0] == metric_name),
+                key=lambda s: sorted(s[1].items()),
+            )
+            for _, classifying, value in metric_series:
+                rendered = ",".join(
+                    f'{key}="{_prom_label_escape(val)}"'
+                    for key, val in sorted({**scope_labels, **classifying}.items())
+                )
+                lines.append(f"{metric_name}{{{rendered}}} {value}")
+        body = ("\n".join(lines) + "\n").encode("utf-8")
+        return Response(
+            content=body,
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
 
     @app.get("/v1/compliance/audit-events")
     def list_compliance_audit_events(
