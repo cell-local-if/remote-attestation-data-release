@@ -2974,6 +2974,17 @@ class ChallengeConsumedResponse(BaseModel):
     consumed_at: str
 
 
+class ChallengeStatusResponse(BaseModel):
+    challenge_id: str
+    issued_at: str
+    expires_at: str
+    status: str
+    changed_at: str
+    evidence_id: str | None
+    evidence_format: str | None
+    verification_result: str | None
+
+
 class SubmitEvidenceRequest(BaseModel):
     tenant_id: StrictStr = Field(min_length=1)
     workload_id: StrictStr = Field(min_length=1)
@@ -5962,6 +5973,149 @@ def create_app(
             challenge_id=challenge_id,
             status="consumed",
             consumed_at=_rfc3339(now),
+        )
+
+    @app.get(
+        "/v1/challenges/{challenge_id}",
+        response_model=ChallengeStatusResponse,
+    )
+    def get_challenge_status(
+        challenge_id: str,
+        tenant_id: str | None = Query(default=None),
+        workload_id: str | None = Query(default=None),
+    ) -> ChallengeStatusResponse:
+        """Return the read-only lifecycle phase of one scoped challenge.
+
+        The challenge is addressed by its canonical UUID in the path and
+        the mandatory ``tenant_id``/``workload_id`` query parameters. Every
+        shape failure — a non-UUID path identifier or a missing, empty,
+        blank or whitespace-padded scope parameter — is the same 422 with
+        detail ``invalid challenge query``, raised before any state is
+        read. A challenge that does not exist, or exists under a different
+        tenant or workload, is the same indistinguishable 404 with detail
+        ``challenge not found``.
+
+        The reported ``status`` is computed from the committed state, never
+        stored: ``pending`` while an unconsumed challenge's ``expires_at``
+        is still in the future, ``expired`` once it has been reached,
+        ``consumed`` when the challenge was consumed without evidence,
+        ``evidence_received`` while its evidence is still ``received``, and
+        ``verified``/``rejected`` once the evidence's first verification
+        settled. ``changed_at`` is the timestamp that last moved the
+        challenge into the reported phase (``issued_at``, ``expires_at``,
+        ``consumed_at``, the evidence's ``received_at`` or its
+        ``verified_at`` respectively); all timestamps are UTC RFC3339.
+        ``evidence_id`` and ``evidence_format`` are null until evidence
+        exists; ``verification_result`` is null until the evidence settled,
+        then the fixed ``accepted``/``rejected`` code.
+
+        The handler issues only SELECTs: it writes no expiry migration, no
+        lifecycle or audit event, no rate-limit counter and no idempotency
+        record, and it consumes none of the issuance, verification-
+        admission or release-grant budgets, so repeating the query over one
+        committed state is stable and free. The response never carries the
+        nonce, its digest, the evidence or its digest, plugin text, or key
+        material. A concurrent consume, evidence reception or verification
+        is observed either completely before or completely after its
+        commit, whichever settled first. A storage failure is a sanitized
+        500 with detail ``challenge status unavailable``.
+        """
+        # --- request shape (all 422, no state is read) ------------------
+        if not _UUID_RE.fullmatch(challenge_id):
+            raise HTTPException(status_code=422, detail="invalid challenge query")
+        if (
+            tenant_id is None
+            or not tenant_id.strip()
+            or tenant_id != tenant_id.strip()
+            or workload_id is None
+            or not workload_id.strip()
+            or workload_id != workload_id.strip()
+        ):
+            raise HTTPException(status_code=422, detail="invalid challenge query")
+
+        # One timestamp for the whole read: it decides pending vs expired,
+        # so the reported phase always agrees with one observation instant.
+        now = _utcnow()
+        try:
+            with session_factory() as session:
+                challenge = session.get(Challenge, challenge_id)
+                if (
+                    challenge is None
+                    or challenge.tenant_id != tenant_id
+                    or challenge.workload_id != workload_id
+                ):
+                    # Do not reveal whether an out-of-scope challenge exists.
+                    raise HTTPException(
+                        status_code=404, detail="challenge not found"
+                    )
+                # At most one evidence row exists per challenge; it commits
+                # atomically with the consumption it accompanies, so this
+                # SELECT observes one fully committed state, never a
+                # half-received one.
+                evidence = session.scalar(
+                    select(Evidence).where(Evidence.challenge_id == challenge_id)
+                )
+                # Snapshot every field the response is computed from before
+                # the session closes; nothing below touches storage again.
+                challenge_status = challenge.status
+                issued_at = challenge.issued_at
+                expires_at = challenge.expires_at
+                consumed_at = challenge.consumed_at
+                if evidence is None:
+                    evidence_id = None
+                    evidence_format = None
+                    evidence_status = None
+                    evidence_received_at = None
+                    evidence_verified_at = None
+                    evidence_result = None
+                else:
+                    evidence_id = evidence.evidence_id
+                    evidence_format = evidence.evidence_format
+                    evidence_status = evidence.status
+                    evidence_received_at = evidence.received_at
+                    evidence_verified_at = evidence.verified_at
+                    evidence_result = evidence.verification_result
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("challenge status query failed")
+            raise HTTPException(
+                status_code=500, detail="challenge status unavailable"
+            )
+
+        # The phase is derived, never persisted: an unconsumed challenge is
+        # reported expired from the moment expires_at is reached without any
+        # write, and a settled evidence keeps its first conclusion verbatim.
+        if evidence_status in ("verified", "rejected"):
+            status = evidence_status
+            changed_at = evidence_verified_at
+            verification_result = evidence_result
+        elif evidence_status is not None:
+            status = "evidence_received"
+            changed_at = evidence_received_at
+            verification_result = None
+        elif challenge_status == "consumed":
+            status = "consumed"
+            changed_at = consumed_at
+            verification_result = None
+        elif now < expires_at:
+            status = "pending"
+            changed_at = issued_at
+            verification_result = None
+        else:
+            status = "expired"
+            changed_at = expires_at
+            verification_result = None
+
+        return ChallengeStatusResponse(
+            challenge_id=challenge_id,
+            issued_at=_rfc3339(issued_at),
+            expires_at=_rfc3339(expires_at),
+            status=status,
+            changed_at=_rfc3339(changed_at),
+            evidence_id=evidence_id,
+            evidence_format=evidence_format,
+            verification_result=verification_result,
         )
 
     @app.post("/v1/evidence", status_code=201, response_model=EvidenceReceivedResponse)
