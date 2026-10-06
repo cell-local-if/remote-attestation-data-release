@@ -2974,6 +2974,17 @@ class ChallengeConsumedResponse(BaseModel):
     consumed_at: str
 
 
+#: Read-only phase names reported by GET /v1/challenges/{challenge_id}.
+#: The first two are derived at query time (no expiry write); the
+#: remaining four follow the persisted consumption/evidence state.
+CHALLENGE_PHASE_PENDING = "pending"
+CHALLENGE_PHASE_EXPIRED = "expired"
+CHALLENGE_PHASE_CONSUMED = "consumed"
+CHALLENGE_PHASE_EVIDENCE_RECEIVED = "evidence_received"
+CHALLENGE_PHASE_VERIFIED = "verified"
+CHALLENGE_PHASE_REJECTED = "rejected"
+
+
 class SubmitEvidenceRequest(BaseModel):
     tenant_id: StrictStr = Field(min_length=1)
     workload_id: StrictStr = Field(min_length=1)
@@ -5963,6 +5974,130 @@ def create_app(
             status="consumed",
             consumed_at=_rfc3339(now),
         )
+
+    @app.get("/v1/challenges/{challenge_id}")
+    def get_challenge_status(
+        request: Request,
+        challenge_id: str,
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return the read-only current phase of one random challenge.
+
+        The phase is derived from committed state and the query instant:
+        a consumed-less challenge is ``pending`` before ``expires_at`` and
+        ``expired`` at/after it; a consumed challenge with no evidence is
+        ``consumed``; an associated evidence still ``received`` is
+        ``evidence_received``; its first verification settles the phase to
+        ``verified`` or ``rejected``. Every shape defect — a path
+        identifier that is not a canonical lowercase UUID, a missing,
+        blank or repeated ``tenant_id``/``workload_id``, or any other
+        query parameter — is one indistinguishable 422 raised before
+        storage is touched. An unknown challenge and one outside the two
+        scope parameters are one indistinguishable 404.
+
+        The handler issues only SELECTs: it performs no expiry write,
+        appends no event, audit or idempotency record and consumes no
+        issuance, verification or release budget. The response carries no
+        nonce, nonce digest, evidence or evidence digest, plugin text or
+        private material. A storage read failure is a sanitized 500 with
+        no partial state.
+        """
+        # --- request shape (all 422, no storage touched) ----------------
+        allowed_params = {"tenant_id", "workload_id"}
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="invalid challenge query"
+            )
+        # Each scope parameter is a single scalar string; a repeated
+        # parameter (a multi-valued/list value) is the wrong shape, not a
+        # silently last-wins scalar.
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(status_code=422, detail="invalid challenge query")
+        tenant_id = request.query_params.get("tenant_id")
+        workload_id = request.query_params.get("workload_id")
+        if (
+            not _UUID_RE.fullmatch(challenge_id)
+            or tenant_id is None
+            or workload_id is None
+            or not tenant_id.strip()
+            or not workload_id.strip()
+        ):
+            raise HTTPException(status_code=422, detail="invalid challenge query")
+
+        # One read-only transaction over the challenge and its at-most-one
+        # evidence row against one committed snapshot: a concurrent
+        # consume/submit/verify that commits first is the phase this query
+        # reports, and repeating the query against the same storage state
+        # returns the identical result. Nothing is written or locked for
+        # update.
+        now = _utcnow()
+        try:
+            with session_factory() as session:
+                challenge = session.get(Challenge, challenge_id)
+                if (
+                    challenge is None
+                    or challenge.tenant_id != tenant_id
+                    or challenge.workload_id != workload_id
+                ):
+                    # Unknown and cross-scope challenges are indistinguishable.
+                    raise HTTPException(status_code=404, detail="challenge not found")
+                evidence = session.scalar(
+                    select(Evidence).where(
+                        Evidence.challenge_id == challenge_id
+                    )
+                )
+                if evidence is None:
+                    if challenge.status == "consumed":
+                        status = CHALLENGE_PHASE_CONSUMED
+                        changed_at = challenge.consumed_at
+                    elif challenge.expires_at <= now:
+                        # Expiry is derived, never persisted: no write occurs.
+                        status = CHALLENGE_PHASE_EXPIRED
+                        changed_at = challenge.expires_at
+                    else:
+                        status = CHALLENGE_PHASE_PENDING
+                        changed_at = challenge.issued_at
+                    evidence_id = None
+                    evidence_format = None
+                    verification_result = None
+                else:
+                    evidence_id = evidence.evidence_id
+                    evidence_format = evidence.evidence_format
+                    if evidence.status == "received":
+                        status = CHALLENGE_PHASE_EVIDENCE_RECEIVED
+                        changed_at = evidence.received_at
+                        verification_result = None
+                    else:
+                        # The first verification settles the evidence
+                        # atomically to exactly one terminal status.
+                        status = (
+                            CHALLENGE_PHASE_VERIFIED
+                            if evidence.status == "verified"
+                            else CHALLENGE_PHASE_REJECTED
+                        )
+                        changed_at = evidence.verified_at
+                        verification_result = evidence.verification_result
+                payload = {
+                    "challenge_id": challenge.challenge_id,
+                    "issued_at": _rfc3339(challenge.issued_at),
+                    "expires_at": _rfc3339(challenge.expires_at),
+                    "status": status,
+                    "changed_at": _rfc3339(changed_at),
+                    "evidence_id": evidence_id,
+                    "evidence_format": evidence_format,
+                    "verification_result": verification_result,
+                }
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("challenge status query failed")
+            raise HTTPException(
+                status_code=500, detail="challenge status unavailable"
+            )
+
+        return _compact_json(payload)
 
     @app.post("/v1/evidence", status_code=201, response_model=EvidenceReceivedResponse)
     def submit_evidence(body: SubmitEvidenceRequest) -> EvidenceReceivedResponse:
