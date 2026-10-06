@@ -1729,6 +1729,19 @@ class AuditEvent(Base):
             "occurred_at",
             "event_id",
         ),
+        # Per-scope tamper-evident chain order: the immutable position of
+        # each committed event in its scope's SHA-256 hash chain. Unique so
+        # two concurrent appends can never mint the same sequence; together
+        # with the per-scope chain head row taken FOR UPDATE (and BEGIN
+        # IMMEDIATE on SQLite) this makes the chain gap-free on every
+        # backend, and the index covers the scoped chain walk.
+        Index(
+            "ix_audit_events_scope_chain_seq",
+            "tenant_id",
+            "workload_id",
+            "chain_seq",
+            unique=True,
+        ),
     )
 
     event_id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -1750,6 +1763,57 @@ class AuditEvent(Base):
     )
     # Commit time of the recorded transition; the stable listing key.
     occurred_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+    # Gap-free per-scope chain position allocated in the event's own commit
+    # transaction from the scope's chain head, strictly increasing in
+    # business commit order on every backend. NULL only on rows written
+    # before the chain existed (backfilled on open); every new event
+    # carries a positive value.
+    chain_seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # SHA-256 hex of the previous event in the scope's chain (the all-zero
+    # digest for the first); NULL only on pre-chain legacy rows.
+    prev_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # SHA-256 hex over the event's non-sensitive fields, its chain
+    # position and prev_hash; NULL only on pre-chain legacy rows.
+    event_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class AuditChainHead(Base):
+    """Per-scope head of the compliance audit-event hash chain.
+
+    Exactly one row exists per ``(tenant_id, workload_id)`` once the scope
+    has committed its first audit event (or its legacy events were
+    backfilled on open). It is an internal integrity device — never exposed
+    as a resource and holding no capability, payload, evidence or key —
+    whose purposes are:
+
+    * allocating the next ``chain_seq``: the row is read ``FOR UPDATE``
+      inside the appending transaction (locking backends) so concurrent
+      appends in one scope serialize on the head row itself, and on SQLite
+      every write transaction already begins as BEGIN IMMEDIATE;
+    * pinning the chain tip: ``last_seq``/``head_hash`` are the sequence
+      and event hash of the last committed event, updated in the same
+      transaction as that event, so a committed event always extends a
+      committed head and a rolled-back event leaves both untouched;
+    * recording ``legacy_count``: how many of the scope's events were
+      numbered by the first-open migration of a pre-chain database rather
+      than appended by live traffic.
+
+    The integrity query reads this row but never writes it; verification
+    failures are reported, never repaired.
+    """
+
+    __tablename__ = "audit_chain_heads"
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # Chain position of the scope's last committed event; equals the
+    # scope's committed event count because the chain is gap-free from 1.
+    last_seq: Mapped[int] = mapped_column(BigInteger)
+    # Event hash of the scope's last committed event (the chain tip).
+    head_hash: Mapped[str] = mapped_column(String(64))
+    # Number of events chained by the first-open legacy migration rather
+    # than by live appends; 0 for scopes born after the chain existed.
+    legacy_count: Mapped[int] = mapped_column(BigInteger)
 
 
 class ProofLifecycleEvent(Base):
