@@ -132,6 +132,7 @@ from proof_release.db import (
     RewrapBatch,
     RewrapBatchItem,
     RewrapJob,
+    RewrapJobAdmissionCounter,
     RewrapJobEvent,
     RewrapJobIdempotencyRecord,
     RewrapJobItem,
@@ -237,6 +238,17 @@ CHALLENGE_ISSUANCE_BUDGET_PER_MINUTE = 5
 #: its own counter table: it shares nothing with challenge issuance or
 #: the one-time-grant budget.
 VERIFICATION_BUDGET_PER_MINUTE = 5
+
+#: Per-(tenant, workload) admission budget for ``POST /v1/rewrap-jobs``:
+#: at most this many new persistent rewrap jobs may be created during one
+#: UTC natural minute. Only requests that genuinely create a job reserve a
+#: slot: every earlier rejection (422 body/cursor/idempotency-key shapes,
+#: a same-key replay or conflict, an unusable keyring) is unchanged and
+#: spends nothing. The budget uses its own counter table: it shares
+#: nothing with challenge issuance, evidence verification or the
+#: one-time-grant budget, and it is not surfaced by the observability
+#: summary or metrics, which keep their existing three-budget contract.
+REWRAP_JOB_BUDGET_PER_MINUTE = 5
 
 #: Fixed page size for the read-only release-grant audit listing. The
 #: listing is cursor-driven; the page size is an internal constant and is
@@ -582,6 +594,21 @@ def _verification_rate_limited_response() -> Response:
     )
 
 
+def _rewrap_job_rate_limited_response() -> Response:
+    """Build the rewrap-job-admission 429: fixed detail plus Retry-After.
+
+    The body carries only the fixed ``detail`` string and the whole seconds
+    until the next UTC minute travel in the ``Retry-After`` header,
+    recomputed at response time so repeated rejections may carry decreasing
+    values without extending the window.
+    """
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "rewrap job rate limit exceeded"},
+        headers={"Retry-After": str(_seconds_until_next_minute(_utcnow()))},
+    )
+
+
 
 def _nonce_digest(nonce: str) -> str:
     return hashlib.sha256(nonce.encode("ascii")).hexdigest()
@@ -877,6 +904,66 @@ def _rewrap_job_acceptance_body(
         )
         + "\n"
     )
+
+
+def _reserve_rewrap_job_slot(
+    session, tenant_id: str, workload_id: str, window_start: datetime
+) -> bool:
+    """Reserve one slot of the per-scope rewrap-job admission budget.
+
+    The reservation happens inside the caller's open transaction — the
+    same one that inserts the queued job, its birth event and (for keyed
+    submissions) its idempotency record — so the count commits or rolls
+    back together with the job it admitted and no half state is possible.
+    Returns ``True`` when one durable slot was reserved for the window,
+    ``False`` when the minute's budget is exhausted (nothing is written
+    then). A counter read or write that cannot complete propagates to the
+    caller, whose rollback leaves neither a half job nor a half count.
+    """
+    for _ in range(2):
+        # Lock the scope's minute row when one exists. SQLite ignores FOR
+        # UPDATE but every write transaction already begins as BEGIN
+        # IMMEDIATE, serializing concurrent admissions process-wide; on
+        # locking backends the row lock orders them so exactly the
+        # budgeted number of requests in the minute can be admitted.
+        row = session.scalar(
+            select(RewrapJobAdmissionCounter)
+            .where(
+                RewrapJobAdmissionCounter.tenant_id == tenant_id,
+                RewrapJobAdmissionCounter.workload_id == workload_id,
+                RewrapJobAdmissionCounter.window_start == window_start,
+            )
+            .with_for_update()
+        )
+        if row is None:
+            # The first admitted job of the minute initializes the counter
+            # at one, inside a savepoint so a concurrent initializer on a
+            # locking backend costs only the savepoint and is retried as
+            # an increment below.
+            try:
+                with session.begin_nested():
+                    session.add(
+                        RewrapJobAdmissionCounter(
+                            tenant_id=tenant_id,
+                            workload_id=workload_id,
+                            window_start=window_start,
+                            count=1,
+                        )
+                    )
+            except IntegrityError:
+                continue
+            return True
+        if row.count >= REWRAP_JOB_BUDGET_PER_MINUTE:
+            # Budget exhausted: no counter write; the caller writes
+            # nothing either and recomputes the retry hint at response
+            # time.
+            return False
+        row.count = row.count + 1
+        return True
+    # Defensive: the unique-insert retry loop failed to settle, which the
+    # single retry above makes unreachable.
+    logger.error("rewrap job rate-limit reservation could not settle")
+    raise HTTPException(status_code=500, detail="rate limit unavailable")
 
 
 def _parse_utc_rfc3339(value: str) -> datetime:
@@ -14989,8 +15076,19 @@ def create_app(
 
             job_id = str(uuid.uuid4())
             now = _utcnow()
+            window_start = _utc_minute_window(now)
             try:
                 with session_factory() as session:
+                    # Only a genuinely new job reserves admission quota,
+                    # in the same transaction that commits it: the count
+                    # and the job settle or roll back together. An
+                    # over-budget request writes nothing — no counter, no
+                    # job, no event, no envelope movement.
+                    if not _reserve_rewrap_job_slot(
+                        session, body.tenant_id, body.workload_id, window_start
+                    ):
+                        session.rollback()
+                        return _rewrap_job_rate_limited_response()
                     session.add(
                         RewrapJob(
                             job_id=job_id,
@@ -15108,6 +15206,18 @@ def create_app(
 
                     job_id = str(uuid.uuid4())
                     now = _utcnow()
+                    window_start = _utc_minute_window(now)
+                    # Only a genuinely new job reserves admission quota:
+                    # replays and conflicts returned above spend nothing,
+                    # and the slot commits in this same transaction
+                    # together with the job, its birth event and the
+                    # idempotency record — or rolls back with them. An
+                    # over-budget request writes nothing at all.
+                    if not _reserve_rewrap_job_slot(
+                        session, body.tenant_id, body.workload_id, window_start
+                    ):
+                        session.rollback()
+                        return _rewrap_job_rate_limited_response()
                     acceptance_body = _rewrap_job_acceptance_body(
                         job_id, body.limit, start_cursor, now
                     )

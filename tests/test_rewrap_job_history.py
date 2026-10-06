@@ -362,6 +362,9 @@ def test_history_is_scoped_to_tenant_and_workload(app, client, monkeypatch):
 
 def test_history_is_ordered_by_job_id_ascending(app, client, monkeypatch):
     monkeypatch.setenv("PROOF_RELEASE_KEYRING", KEYRING_V1_V2)
+    # Nine submissions exceed the per-minute admission budget; raise it
+    # in-process so this test exercises history ordering, not admission.
+    monkeypatch.setattr(app_module, "REWRAP_JOB_BUDGET_PER_MINUTE", 64)
     _seed(client, ["a"])
     for _ in range(9):
         assert _submit(client).status_code == 202
@@ -443,6 +446,9 @@ def test_time_window_is_inclusive_and_utc(app, client, monkeypatch):
 
 def test_pagination_walks_every_job_once_in_order(app, client, monkeypatch):
     monkeypatch.setenv("PROOF_RELEASE_KEYRING", KEYRING_V1_V2)
+    # Seven submissions exceed the per-minute admission budget; raise it
+    # in-process so this test exercises pagination, not admission.
+    monkeypatch.setattr(app_module, "REWRAP_JOB_BUDGET_PER_MINUTE", 64)
     _seed(client, ["a"])
     for _ in range(7):
         _submit(client)
@@ -502,6 +508,9 @@ def test_empty_string_cursor_equals_default(app, client, monkeypatch):
 
 def test_status_updates_do_not_change_page_membership(app, client, monkeypatch):
     monkeypatch.setenv("PROOF_RELEASE_KEYRING", KEYRING_V1_V2)
+    # Six submissions exceed the per-minute admission budget; raise it
+    # in-process so this test exercises page membership, not admission.
+    monkeypatch.setattr(app_module, "REWRAP_JOB_BUDGET_PER_MINUTE", 64)
     _seed(client, [f"e{i}" for i in range(6)])
     job_ids = [_submit(client).json()["job_id"] for _ in range(6)]
     monkeypatch.setattr(app_module, "REWRAP_JOB_HISTORY_PAGE_SIZE", 3)

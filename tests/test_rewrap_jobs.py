@@ -718,6 +718,10 @@ def test_restart_does_not_touch_succeeded_jobs(tmp_path, monkeypatch):
 def test_concurrent_jobs_advance_each_envelope_at_most_once(tmp_path, monkeypatch):
     monkeypatch.delenv("PROOF_RELEASE_KEYRING", raising=False)
     monkeypatch.setenv("PROOF_RELEASE_MASTER_KEY", KEY_V1)
+    # Six simultaneous submissions exceed the per-minute admission budget;
+    # raise it in-process so this test exercises envelope atomicity, not
+    # admission (the budget itself is covered by the rate-limit tests).
+    monkeypatch.setattr(app_module, "REWRAP_JOB_BUDGET_PER_MINUTE", 64)
     count = 8
     url = f"sqlite:///{tmp_path}/concurrent.db"
     application = app_module.create_app(url)

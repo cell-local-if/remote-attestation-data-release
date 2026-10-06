@@ -2004,3 +2004,48 @@ class VerificationAdmissionCounter(Base):
     # capped at the per-minute verification budget by the atomic admission
     # transaction.
     count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class RewrapJobAdmissionCounter(Base):
+    """Persistent per-scope admission counter for rewrap job creation.
+
+    One row exists per ``(tenant_id, workload_id, window_start)`` triple,
+    where ``window_start`` is the UTC natural minute (seconds and
+    sub-seconds truncated) in which a ``POST /v1/rewrap-jobs`` request
+    created a new persistent job. Only requests that genuinely create a
+    job reserve a slot: request-body, cursor and idempotency-key shape
+    failures (422), same-key replays and conflicts (202/409) and an
+    unusable keyring (500) never touch this table. The budget is
+    attributed solely to the two scope fields and is deliberately
+    separate from :class:`RateLimitCounter`,
+    :class:`ChallengeIssuanceCounter` and
+    :class:`VerificationAdmissionCounter`: rewrap job admission shares no
+    rows, quota or lock traffic with any other budget, and different
+    tenants or workloads never share a row.
+
+    A slot is reserved in the same transaction that inserts the queued
+    job, its birth event and (for keyed submissions) its idempotency
+    record, so the count is durable (it survives process restarts) and a
+    crash or failure can leave neither a counter without its job nor a
+    job without its counter. A rejected (over-budget) request writes
+    nothing. A new UTC minute starts a new row, which restores the quota
+    automatically; quotas are never borrowed across scopes or minutes.
+    """
+
+    __tablename__ = "rewrap_job_admission_counters"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "window_start",
+            name="uq_rewrap_job_admission_counter_scope_window",
+        ),
+    )
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # UTC minute boundary at which the window starts, truncated to seconds.
+    window_start: Mapped[datetime] = mapped_column(UTCDateTime(), primary_key=True)
+    # Number of jobs created during this window; capped at the per-minute
+    # admission budget by the atomic admission transaction.
+    count: Mapped[int] = mapped_column(Integer, default=0)
