@@ -1716,6 +1716,17 @@ class AuditEvent(Base):
     never have a column here. For ``rewrap`` events the grant/decision
     identifiers and the capability digest are semantically empty and are
     stored as NULL.
+
+    Every committed event also carries its tamper-evident chain metadata:
+    ``chain_seq`` is the gap-free, per-scope sequence allocated in the
+    event's own transaction, ``prev_hash`` the ``event_hash`` of the
+    preceding event in the scope's chain (the genesis constant for the
+    first), and ``event_hash`` the SHA-256 over the event's non-sensitive
+    fields and ``prev_hash``. All three commit in the same transaction as
+    the state transition and the scope's :class:`AuditChainHead` advance,
+    so a committed transition always has its chain link and a rolled-back
+    one leaves none. The columns are nullable only for rows written before
+    the chain existed; those are backfilled on open.
     """
 
     __tablename__ = "audit_events"
@@ -1728,6 +1739,16 @@ class AuditEvent(Base):
             "workload_id",
             "occurred_at",
             "event_id",
+        ),
+        # Per-scope chain order: unique so two concurrent appends can
+        # never mint the same sequence; covers the integrity walk ordered
+        # by chain_seq.
+        Index(
+            "ix_audit_events_scope_chain_seq",
+            "tenant_id",
+            "workload_id",
+            "chain_seq",
+            unique=True,
         ),
     )
 
@@ -1750,6 +1771,56 @@ class AuditEvent(Base):
     )
     # Commit time of the recorded transition; the stable listing key.
     occurred_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+    # Gap-free per-scope chain sequence allocated in the event's own
+    # transaction: 1 for the scope's first event, increasing by exactly one
+    # per later committed event. NULL only on rows written before the chain
+    # existed (backfilled on open in (occurred_at, event_id) order).
+    chain_seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # The previous event's event_hash within the scope's chain, or the
+    # genesis constant (64 lowercase hex zeros) for the first event.
+    prev_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # SHA-256 over the event's non-sensitive fields and prev_hash.
+    event_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class AuditChainHead(Base):
+    """Per-scope head of the compliance audit-event hash chain.
+
+    Exactly one row exists per ``(tenant_id, workload_id)`` once the scope
+    has committed its first audit event (or was backfilled by the chain
+    migration). The row doubles as the chain's allocation anchor and its
+    recorded range head:
+
+    * ``last_seq`` is the sequence handed to the scope's most recent
+      committed event; the next append reads this row ``FOR UPDATE``
+      (locking backends) or under SQLite's BEGIN IMMEDIATE writer
+      serialization, so concurrent appends in one scope serialize on the
+      head row and sequences stay gap-free;
+    * ``head_hash`` is that event's ``event_hash`` — the tip the integrity
+      check recomputes the whole chain up to;
+    * ``legacy_count`` records how many of the scope's events were
+      backfilled by the open-time migration (0 for scopes born with the
+      chain); it never changes afterwards.
+
+    The head advances in the same transaction as the event it seals, so a
+    committed event always has its head movement and a rolled-back
+    transition moves nothing. The row holds no business state, material or
+    secret — only the scope, the sequence and SHA-256 digests.
+    """
+
+    __tablename__ = "audit_chain_heads"
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # Chain sequence of the scope's most recent committed event; 0 only on
+    # an anchor that has not yet sealed an event within its transaction.
+    last_seq: Mapped[int] = mapped_column(BigInteger)
+    # event_hash of the scope's most recent committed event (64 lowercase
+    # hex); the genesis constant on a fresh anchor.
+    head_hash: Mapped[str] = mapped_column(String(64))
+    # Number of the scope's events that were chained by the open-time
+    # migration rather than appended with chain metadata at write time.
+    legacy_count: Mapped[int] = mapped_column(BigInteger)
 
 
 class ProofLifecycleEvent(Base):

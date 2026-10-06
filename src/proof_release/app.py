@@ -106,6 +106,7 @@ from proof_release.db import (
     PROOF_EVENT_STATUS_REJECTED,
     PROOF_EVENT_STATUS_ALLOWED,
     PROOF_EVENT_STATUS_DENIED,
+    AuditChainHead,
     AuditEvent,
     Base,
     CertificateRevocation,
@@ -536,6 +537,281 @@ def _next_data_envelope_commit_seq(
 
 def _rfc3339(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat()
+
+
+#: Prev-hash carried by a scope's first audit event and the head_hash of a
+#: fresh chain anchor: 64 lowercase hex zeros (the SHA-256 hex width).
+_AUDIT_CHAIN_GENESIS_HASH = "0" * 64
+
+#: Finite, service-defined set of audit-chain integrity failure codes.
+#: ``sequence-gap`` means the per-scope chain sequence is not the
+#: contiguous 1..N run (a deleted, renumbered, duplicated or unchained
+#: event); ``hash-mismatch`` means an event's stored hash does not
+#: recompute from its non-sensitive fields and its predecessor's hash (a
+#: modified or reordered event); ``head-mismatch`` means the recorded
+#: per-scope range head disagrees with the verified chain tip.
+AUDIT_CHAIN_FAILURE_SEQUENCE_GAP = "sequence-gap"
+AUDIT_CHAIN_FAILURE_HASH_MISMATCH = "hash-mismatch"
+AUDIT_CHAIN_FAILURE_HEAD_MISMATCH = "head-mismatch"
+
+
+def _audit_event_chain_hash(
+    *,
+    chain_seq: int,
+    prev_hash: str,
+    tenant_id: str,
+    workload_id: str,
+    event_id: str,
+    event_type: str,
+    grant_id: str | None,
+    decision_id: str | None,
+    data_id: str | None,
+    status: str,
+    capability_sha256: str | None,
+    occurred_at: datetime,
+) -> str:
+    """SHA-256 chain hash of one audit event.
+
+    Covers the event's non-sensitive stored fields — identifiers, the
+    fixed type/status codes, the capability *digest* (never the capability
+    itself), the commit timestamp and the chain position — plus the
+    preceding event's hash, so modifying, deleting or reordering any event
+    changes every later link. The canonical payload is compact JSON with
+    sorted keys and the same UTC RFC3339 timestamp spelling on write,
+    migration and verify, so a hash computed at commit time recomputes
+    byte-identically from the stored row.
+    """
+    payload = json.dumps(
+        {
+            "capability_sha256": capability_sha256,
+            "chain_seq": chain_seq,
+            "data_id": data_id,
+            "decision_id": decision_id,
+            "event_id": event_id,
+            "event_type": event_type,
+            "grant_id": grant_id,
+            "occurred_at": _rfc3339(occurred_at),
+            "prev_hash": prev_hash,
+            "status": status,
+            "tenant_id": tenant_id,
+            "workload_id": workload_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _audit_chain_head_for_update(
+    session, tenant_id: str, workload_id: str
+) -> AuditChainHead:
+    """Return the scope's chain head row, creating the anchor when absent.
+
+    Must be called inside the open write transaction of the event being
+    chained. The head row doubles as the per-scope sequence allocator:
+
+    * an existing head is read ``FOR UPDATE``, so on locking backends
+      concurrent appends in one scope serialize on the head row itself and
+      each waiter observes the preceding winner's advanced head;
+    * on SQLite every write transaction already begins as BEGIN IMMEDIATE,
+      fully serializing appends;
+    * the scope's first event has no head yet, so the genesis anchor is
+      inserted inside a savepoint: two racing first appends lose only the
+      savepoint (never the surrounding transition), and the loser re-reads
+      the winner's row. The bounded loop also covers the rare case where
+      the apparent winner rolled its whole transaction back.
+    """
+    for _ in range(10):
+        head = session.scalar(
+            select(AuditChainHead)
+            .where(
+                AuditChainHead.tenant_id == tenant_id,
+                AuditChainHead.workload_id == workload_id,
+            )
+            .with_for_update()
+        )
+        if head is not None:
+            return head
+        # First event for this scope: install the genesis anchor in a
+        # savepoint so a collision with a concurrent first event rolls
+        # back only this insert, leaving the caller's transaction intact.
+        try:
+            with session.begin_nested():
+                head = AuditChainHead(
+                    tenant_id=tenant_id,
+                    workload_id=workload_id,
+                    last_seq=0,
+                    head_hash=_AUDIT_CHAIN_GENESIS_HASH,
+                    legacy_count=0,
+                )
+                session.add(head)
+            return head
+        except IntegrityError:
+            # begin_nested() has already released the rolled-back
+            # savepoint; loop to re-read the winner's anchor (or retry the
+            # insert if that winner's whole transaction rolled back).
+            continue
+    # pragma: no cover - bounded backstop for pathological anchor contention
+    logger.error("audit chain head could not settle")
+    raise HTTPException(status_code=500, detail="audit chain unavailable")
+
+
+def _append_audit_event(
+    session,
+    *,
+    tenant_id: str,
+    workload_id: str,
+    event_type: str,
+    grant_id: str | None,
+    decision_id: str | None,
+    data_id: str | None,
+    status: str,
+    capability_sha256: str | None,
+    occurred_at: datetime,
+) -> None:
+    """Append one compliance audit event and extend the scope's hash chain.
+
+    The chain metadata (per-scope sequence, previous-event hash and this
+    event's hash) and the advanced range head are written in the caller's
+    open transaction together with the state transition being recorded:
+    a rolled-back transition leaves no event, no chain metadata and no
+    head movement, and a committed one always leaves all three. Only
+    identifiers, the fixed codes, the timestamp and SHA-256 digests enter
+    the chain — never a capability, payload, evidence or key.
+    """
+    head = _audit_chain_head_for_update(session, tenant_id, workload_id)
+    chain_seq = head.last_seq + 1
+    prev_hash = head.head_hash
+    event_id = str(uuid.uuid4())
+    event_hash = _audit_event_chain_hash(
+        chain_seq=chain_seq,
+        prev_hash=prev_hash,
+        tenant_id=tenant_id,
+        workload_id=workload_id,
+        event_id=event_id,
+        event_type=event_type,
+        grant_id=grant_id,
+        decision_id=decision_id,
+        data_id=data_id,
+        status=status,
+        capability_sha256=capability_sha256,
+        occurred_at=occurred_at,
+    )
+    head.last_seq = chain_seq
+    head.head_hash = event_hash
+    session.add(
+        AuditEvent(
+            event_id=event_id,
+            tenant_id=tenant_id,
+            workload_id=workload_id,
+            event_type=event_type,
+            grant_id=grant_id,
+            decision_id=decision_id,
+            data_id=data_id,
+            status=status,
+            capability_sha256=capability_sha256,
+            occurred_at=occurred_at,
+            chain_seq=chain_seq,
+            prev_hash=prev_hash,
+            event_hash=event_hash,
+        )
+    )
+
+
+def _verify_audit_event_chain(rows, head) -> dict:
+    """Verify one scope's audit chain and return the integrity report.
+
+    ``rows`` are the scope's committed audit events (any order) and
+    ``head`` its :class:`AuditChainHead` row or ``None``. The walk checks
+    the chain sequence (a contiguous 1..N run), every event hash
+    (recomputed from the stored non-sensitive fields and the predecessor's
+    hash) and the recorded range head, reporting the first problem found
+    in chain order. It is purely a function of the snapshot: it writes
+    nothing, repairs nothing and never advances the head.
+    """
+    event_count = len(rows)
+    legacy_count = head.legacy_count if head is not None else 0
+
+    by_seq: dict[int, object] = {}
+    sequence_broken = False
+    for row in rows:
+        if row.chain_seq is None or row.chain_seq in by_seq:
+            # A committed event always carries a unique chain sequence.
+            sequence_broken = True
+        else:
+            by_seq[row.chain_seq] = row
+
+    first_seq = min(by_seq, default=0)
+    last_seq = max(by_seq, default=0)
+    head_hash = head.head_hash if head is not None else None
+
+    failure_code: str | None = None
+    failure_seq: int | None = None
+
+    if sequence_broken:
+        failure_code = AUDIT_CHAIN_FAILURE_SEQUENCE_GAP
+        failure_seq = 0
+    else:
+        prev_hash = _AUDIT_CHAIN_GENESIS_HASH
+        tip_hash = _AUDIT_CHAIN_GENESIS_HASH
+        expected = 1
+        for seq in sorted(by_seq):
+            if seq != expected:
+                failure_code = AUDIT_CHAIN_FAILURE_SEQUENCE_GAP
+                failure_seq = expected
+                break
+            row = by_seq[seq]
+            if row.prev_hash is None or row.event_hash is None:
+                # A committed event always carries its chain hashes.
+                failure_code = AUDIT_CHAIN_FAILURE_HASH_MISMATCH
+                failure_seq = seq
+                break
+            recomputed = _audit_event_chain_hash(
+                chain_seq=seq,
+                prev_hash=row.prev_hash,
+                tenant_id=row.tenant_id,
+                workload_id=row.workload_id,
+                event_id=row.event_id,
+                event_type=row.event_type,
+                grant_id=row.grant_id,
+                decision_id=row.decision_id,
+                data_id=row.data_id,
+                status=row.status,
+                capability_sha256=row.capability_sha256,
+                occurred_at=row.occurred_at,
+            )
+            if row.prev_hash != prev_hash or row.event_hash != recomputed:
+                failure_code = AUDIT_CHAIN_FAILURE_HASH_MISMATCH
+                failure_seq = seq
+                break
+            prev_hash = row.event_hash
+            tip_hash = row.event_hash
+            expected += 1
+        else:
+            # Sequence and hashes verified; the recorded range head must
+            # agree with the chain tip (an empty scope only with a
+            # never-advanced or absent head).
+            if head is None:
+                if by_seq:
+                    failure_code = AUDIT_CHAIN_FAILURE_HEAD_MISMATCH
+                    failure_seq = last_seq
+            elif head.last_seq != last_seq or head.head_hash != tip_hash:
+                failure_code = AUDIT_CHAIN_FAILURE_HEAD_MISMATCH
+                failure_seq = head.last_seq
+
+    return {
+        "valid": failure_code is None,
+        "event_count": event_count,
+        "legacy_count": legacy_count,
+        "first_seq": first_seq,
+        "last_seq": last_seq,
+        "head_hash": head_hash,
+        "failure_code": failure_code,
+        "failure_seq": failure_seq,
+    }
+
 
 
 def _rfc3339_z(value: datetime) -> str:
@@ -3610,6 +3886,10 @@ def _migrate_additive(engine) -> None:
         # The read-only data-envelope directory query gained the per-scope
         # commit-order marker that fixes its replayable snapshot.
         _migrate_data_envelope_commit_sequence(engine)
+        # The compliance audit events gained their tamper-evident hash
+        # chain (per-event link metadata plus the per-scope range head)
+        # after the audit table first existed.
+        _migrate_audit_event_chain(engine)
         return
     additions = {
         "evidence": (
@@ -3673,6 +3953,15 @@ def _migrate_additive(engine) -> None:
             # through a per-scope commit-order marker; pre-existing rows
             # are backfilled below in rowid (commit) order.
             ("commit_seq", "BIGINT"),
+        ),
+        "audit_events": (
+            # The tamper-evident hash chain shipped after the audit table
+            # first existed; pre-existing rows are backfilled below per
+            # scope in (occurred_at, event_id) order and each scope's
+            # range head is built.
+            ("chain_seq", "BIGINT"),
+            ("prev_hash", "VARCHAR(64)"),
+            ("event_hash", "VARCHAR(64)"),
         ),
     }
     with engine.begin() as conn:
@@ -3752,6 +4041,11 @@ def _migrate_additive(engine) -> None:
     # The read-only data-envelope directory query gained the per-scope
     # commit-order marker that fixes its replayable snapshot.
     _migrate_data_envelope_commit_sequence(engine)
+    # The compliance audit events gained their tamper-evident hash chain
+    # (per-event link metadata plus the per-scope range head) after the
+    # audit table first existed; legacy databases (columns added above on
+    # SQLite) are completed identically on every backend.
+    _migrate_audit_event_chain(engine)
 
 
 def _migrate_proof_event_commit_sequence(engine) -> None:
@@ -4544,6 +4838,191 @@ def _migrate_data_envelope_commit_sequence(engine) -> None:
                 idx
                 for idx in envelopes_tbl.indexes
                 if idx.name == "ix_data_envelopes_scope_commit_seq"
+            )
+            model_index.create(conn, checkfirst=True)
+
+
+def _migrate_audit_event_chain(engine) -> None:
+    """Bring a deployment written before the audit hash chain up to date.
+
+    Every committed audit event carries its chain metadata (per-scope
+    ``chain_seq``, ``prev_hash`` and ``event_hash``) and each scope a
+    range head row, all allocated in the event's own transaction.
+    Databases written before the chain existed must be upgraded on open
+    *on every backend*, not only SQLite:
+
+    * the nullable ``chain_seq``/``prev_hash``/``event_hash`` columns are
+      added when missing (SQLite's ALTERs come from the additive table map
+      above; locking backends get them here);
+    * legacy rows are chained per scope in the audit's stable listing
+      order — ``(occurred_at, event_id)`` ascending, numbered client-side
+      so the upgrade is identical across dialects — giving each scope a
+      gap-free 1..N run whose hashes cover the stored fields;
+    * each scope's :class:`AuditChainHead` is created (only when absent)
+      at the backfilled tip with ``legacy_count`` set to the number of
+      backfilled events, so the first event written after the upgrade
+      allocates N+1 chained onto the legacy tip rather than colliding;
+    * the unique ``(tenant_id, workload_id, chain_seq)`` index is created
+      last, once no NULL sequence remains, so two concurrent appends can
+      never mint the same sequence.
+
+    The whole upgrade is one transaction and changes no business field,
+    response shape or secret-handling rule. A database created by the
+    current metadata already has the columns, heads and index, so each
+    step short-circuits.
+    """
+    is_sqlite = engine.dialect.name == "sqlite"
+    events_tbl = AuditEvent.__table__
+    heads_tbl = AuditChainHead.__table__
+
+    # A table created by a pre-audit deployment need not exist at all yet;
+    # create_all has just run on the current metadata, so on such a
+    # database the table (with every column and index) now exists empty
+    # and nothing below has work to do.
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        if events_tbl.name not in inspector.get_table_names():
+            return
+        column_names = {col["name"] for col in inspector.get_columns(events_tbl.name)}
+        if not is_sqlite:
+            for column, column_type in (
+                ("chain_seq", "BIGINT NULL"),
+                ("prev_hash", "VARCHAR(64) NULL"),
+                ("event_hash", "VARCHAR(64) NULL"),
+            ):
+                if column not in column_names:
+                    conn.execute(
+                        text(
+                            f"ALTER TABLE {events_tbl.name} "
+                            f"ADD COLUMN {column} {column_type}"
+                        )
+                    )
+
+        # Chain only legacy rows (never touch an already-chained row), per
+        # scope in the audit listing order (occurred_at, event_id).
+        legacy_rows = conn.execute(
+            select(
+                events_tbl.c.event_id,
+                events_tbl.c.tenant_id,
+                events_tbl.c.workload_id,
+                events_tbl.c.event_type,
+                events_tbl.c.grant_id,
+                events_tbl.c.decision_id,
+                events_tbl.c.data_id,
+                events_tbl.c.status,
+                events_tbl.c.capability_sha256,
+                events_tbl.c.occurred_at,
+            )
+            .where(events_tbl.c.chain_seq.is_(None))
+            .order_by(
+                events_tbl.c.tenant_id,
+                events_tbl.c.workload_id,
+                events_tbl.c.occurred_at,
+                events_tbl.c.event_id,
+            )
+        ).fetchall()
+
+        # scope -> [last_seq, tip_hash, backfilled_count], continued from
+        # any head the scope already has (a fresh scope starts at the
+        # genesis anchor).
+        scopes: dict[tuple[str, str], list] = {}
+        for row in legacy_rows:
+            scope = (row.tenant_id, row.workload_id)
+            state = scopes.get(scope)
+            if state is None:
+                existing_head = conn.execute(
+                    select(
+                        heads_tbl.c.last_seq,
+                        heads_tbl.c.head_hash,
+                        heads_tbl.c.legacy_count,
+                    ).where(
+                        heads_tbl.c.tenant_id == row.tenant_id,
+                        heads_tbl.c.workload_id == row.workload_id,
+                    )
+                ).fetchone()
+                if existing_head is not None:
+                    state = [
+                        existing_head.last_seq,
+                        existing_head.head_hash,
+                        0,
+                        existing_head.legacy_count,
+                    ]
+                else:
+                    state = [0, _AUDIT_CHAIN_GENESIS_HASH, 0, 0]
+                scopes[scope] = state
+            chain_seq = state[0] + 1
+            prev_hash = state[1]
+            event_hash = _audit_event_chain_hash(
+                chain_seq=chain_seq,
+                prev_hash=prev_hash,
+                tenant_id=row.tenant_id,
+                workload_id=row.workload_id,
+                event_id=row.event_id,
+                event_type=row.event_type,
+                grant_id=row.grant_id,
+                decision_id=row.decision_id,
+                data_id=row.data_id,
+                status=row.status,
+                capability_sha256=row.capability_sha256,
+                occurred_at=row.occurred_at,
+            )
+            conn.execute(
+                events_tbl.update()
+                .where(
+                    events_tbl.c.event_id == row.event_id,
+                    events_tbl.c.chain_seq.is_(None),
+                )
+                .values(
+                    chain_seq=chain_seq,
+                    prev_hash=prev_hash,
+                    event_hash=event_hash,
+                )
+            )
+            state[0] = chain_seq
+            state[1] = event_hash
+            state[2] += 1
+
+        # Seal each touched scope's range head at the backfilled tip,
+        # recording how many of its events were chained by this upgrade.
+        # A head that already exists is advanced, never replaced.
+        for (tenant_id, workload_id), state in scopes.items():
+            last_seq, tip_hash, backfilled, base_legacy = state
+            updated = conn.execute(
+                heads_tbl.update()
+                .where(
+                    heads_tbl.c.tenant_id == tenant_id,
+                    heads_tbl.c.workload_id == workload_id,
+                )
+                .values(
+                    last_seq=last_seq,
+                    head_hash=tip_hash,
+                    legacy_count=base_legacy + backfilled,
+                )
+            )
+            if updated.rowcount == 0:
+                conn.execute(
+                    heads_tbl.insert().values(
+                        tenant_id=tenant_id,
+                        workload_id=workload_id,
+                        last_seq=last_seq,
+                        head_hash=tip_hash,
+                        legacy_count=backfilled,
+                    )
+                )
+
+        # Build the unique chain-order index last, once every row is
+        # chained. Reuse the index object already declared on the model's
+        # table (never construct a second Index bound to the same columns —
+        # that would register a duplicate on the shared metadata and make
+        # every later create_all attempt the index twice); checkfirst makes
+        # creation a no-op on current-metadata databases and every other
+        # dialect portably.
+        index_names = {idx["name"] for idx in inspector.get_indexes(events_tbl.name)}
+        if "ix_audit_events_scope_chain_seq" not in index_names:
+            model_index = next(
+                idx
+                for idx in events_tbl.indexes
+                if idx.name == "ix_audit_events_scope_chain_seq"
             )
             model_index.create(conn, checkfirst=True)
 
@@ -5638,19 +6117,17 @@ def create_app(
                         if result == REWRAP_RESULT_REWRAPPED
                         else AUDIT_EVENT_STATUS_SKIPPED
                     )
-                    session.add(
-                        AuditEvent(
-                            event_id=str(uuid.uuid4()),
-                            tenant_id=tenant_id,
-                            workload_id=workload_id,
-                            event_type=AUDIT_EVENT_TYPE_REWRAP,
-                            grant_id=None,
-                            decision_id=None,
-                            data_id=data_id,
-                            status=event_status,
-                            capability_sha256=None,
-                            occurred_at=item_occurred_at,
-                        )
+                    _append_audit_event(
+                        session,
+                        tenant_id=tenant_id,
+                        workload_id=workload_id,
+                        event_type=AUDIT_EVENT_TYPE_REWRAP,
+                        grant_id=None,
+                        decision_id=None,
+                        data_id=data_id,
+                        status=event_status,
+                        capability_sha256=None,
+                        occurred_at=item_occurred_at,
                     )
                     # The per-job item row commits in the same transaction
                     # as the material change, the audit event and the
@@ -10210,19 +10687,17 @@ def create_app(
             # grant row, so a pending event exists if and only if the grant
             # did. Only identifiers, the fixed status, the timestamp and
             # the capability digest are recorded — never the capability.
-            session.add(
-                AuditEvent(
-                    event_id=str(uuid.uuid4()),
-                    tenant_id=body.tenant_id,
-                    workload_id=body.workload_id,
-                    event_type=AUDIT_EVENT_TYPE_GRANT,
-                    grant_id=grant_id,
-                    decision_id=body.decision_id,
-                    data_id=body.data_id,
-                    status=AUDIT_EVENT_STATUS_PENDING,
-                    capability_sha256=grant.capability_digest,
-                    occurred_at=now,
-                )
+            _append_audit_event(
+                session,
+                tenant_id=body.tenant_id,
+                workload_id=body.workload_id,
+                event_type=AUDIT_EVENT_TYPE_GRANT,
+                grant_id=grant_id,
+                decision_id=body.decision_id,
+                data_id=body.data_id,
+                status=AUDIT_EVENT_STATUS_PENDING,
+                capability_sha256=grant.capability_digest,
+                occurred_at=now,
             )
             session.commit()
         return ReleaseGrantCreatedResponse(
@@ -11299,6 +11774,111 @@ def create_app(
                     "events": events,
                     "next_cursor": next_cursor,
                     "complete": complete,
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
+
+    @app.get("/v1/compliance/audit-events/integrity")
+    def verify_compliance_audit_integrity(
+        request: Request,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Verify the tamper-evident hash chain of one scope's audit events.
+
+        The range is fixed entirely by the two mandatory, non-blank query
+        parameters; the request carries no body. Every shape failure (a
+        missing, blank or repeated scope parameter, an unknown parameter,
+        or a non-empty body) is a 422 raised before any state is read and
+        writes no audit. On success the scope's committed events are
+        walked in chain order: the per-scope sequence must be the
+        contiguous 1..N run, every event hash must recompute from its
+        stored non-sensitive fields and its predecessor's hash, and the
+        recorded range head must agree with the chain tip. A broken chain
+        is still a 200 with ``valid`` false and exactly one of the fixed
+        failure codes (``sequence-gap``, ``hash-mismatch``,
+        ``head-mismatch``) plus the sequence number at which verification
+        failed; the response never carries capabilities, payloads,
+        evidence or keys.
+
+        The handler issues only SELECTs against one consistent committed
+        snapshot: it never repairs the chain, rewrites an event or
+        advances the range head, so with no new committed events a
+        repeated request returns byte-identical bytes, and a concurrent
+        append is observed either fully before or fully after its commit.
+        A storage or verification failure is a 500 with no partial answer.
+        """
+        # --- request shape (all 422, no storage touched) ----------------
+        allowed_params = {"tenant_id", "workload_id"}
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+        # Each scope parameter is a single scalar string; a repeated
+        # parameter (a multi-valued/list value) is the wrong shape, not a
+        # silently last-wins scalar.
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(status_code=422, detail="duplicate query parameter")
+        if not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+        # --- read-only chain snapshot -----------------------------------
+        try:
+            with session_factory() as session:
+                rows = list(
+                    session.scalars(
+                        select(AuditEvent)
+                        .where(
+                            AuditEvent.tenant_id == tenant_id,
+                            AuditEvent.workload_id == workload_id,
+                        )
+                        .order_by(
+                            AuditEvent.chain_seq.asc(),
+                            AuditEvent.event_id.asc(),
+                        )
+                    )
+                )
+                head = session.get(AuditChainHead, (tenant_id, workload_id))
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("audit integrity snapshot failed")
+            raise HTTPException(
+                status_code=500, detail="audit integrity unavailable"
+            )
+
+        try:
+            report = _verify_audit_event_chain(rows, head)
+        except Exception:
+            logger.error("audit integrity verification failed")
+            raise HTTPException(
+                status_code=500, detail="audit integrity unavailable"
+            )
+
+        # Compact JSON with a single terminating newline, fields in the
+        # fixed contract order. Every value is a string, integer, boolean
+        # or null — no floats, -0.0 or non-finite values.
+        body = (
+            json.dumps(
+                {
+                    "tenant_id": tenant_id,
+                    "workload_id": workload_id,
+                    "valid": report["valid"],
+                    "event_count": report["event_count"],
+                    "legacy_count": report["legacy_count"],
+                    "first_seq": report["first_seq"],
+                    "last_seq": report["last_seq"],
+                    "head_hash": report["head_hash"],
+                    "failure_code": report["failure_code"],
+                    "failure_seq": report["failure_seq"],
                 },
                 separators=(",", ":"),
                 allow_nan=False,
@@ -13213,19 +13793,17 @@ def create_app(
                     reason=RELEASE_GRANT_EVENT_REASON_CONSUME,
                     now=now,
                 )
-                session.add(
-                    AuditEvent(
-                        event_id=str(uuid.uuid4()),
-                        tenant_id=grant.tenant_id,
-                        workload_id=grant.workload_id,
-                        event_type=AUDIT_EVENT_TYPE_GRANT,
-                        grant_id=grant_id,
-                        decision_id=grant.decision_id,
-                        data_id=grant.data_id,
-                        status=AUDIT_EVENT_STATUS_CONSUMED,
-                        capability_sha256=grant.capability_digest,
-                        occurred_at=now,
-                    )
+                _append_audit_event(
+                    session,
+                    tenant_id=grant.tenant_id,
+                    workload_id=grant.workload_id,
+                    event_type=AUDIT_EVENT_TYPE_GRANT,
+                    grant_id=grant_id,
+                    decision_id=grant.decision_id,
+                    data_id=grant.data_id,
+                    status=AUDIT_EVENT_STATUS_CONSUMED,
+                    capability_sha256=grant.capability_digest,
+                    occurred_at=now,
                 )
                 session.commit()
                 decision_id = grant.decision_id
@@ -13369,19 +13947,17 @@ def create_app(
                     reason=RELEASE_GRANT_EVENT_REASON_CONSUME,
                     now=now,
                 )
-                session.add(
-                    AuditEvent(
-                        event_id=str(uuid.uuid4()),
-                        tenant_id=grant.tenant_id,
-                        workload_id=grant.workload_id,
-                        event_type=AUDIT_EVENT_TYPE_GRANT,
-                        grant_id=grant_id,
-                        decision_id=grant.decision_id,
-                        data_id=grant.data_id,
-                        status=AUDIT_EVENT_STATUS_CONSUMED,
-                        capability_sha256=grant.capability_digest,
-                        occurred_at=now,
-                    )
+                _append_audit_event(
+                    session,
+                    tenant_id=grant.tenant_id,
+                    workload_id=grant.workload_id,
+                    event_type=AUDIT_EVENT_TYPE_GRANT,
+                    grant_id=grant_id,
+                    decision_id=grant.decision_id,
+                    data_id=grant.data_id,
+                    status=AUDIT_EVENT_STATUS_CONSUMED,
+                    capability_sha256=grant.capability_digest,
+                    occurred_at=now,
                 )
                 # The exact first 200 body, fixed before commit so the
                 # stored response and the response returned to the winner
@@ -13530,19 +14106,17 @@ def create_app(
                 reason=RELEASE_GRANT_EVENT_REASON_REVOKED,
                 now=now,
             )
-            session.add(
-                AuditEvent(
-                    event_id=str(uuid.uuid4()),
-                    tenant_id=grant.tenant_id,
-                    workload_id=grant.workload_id,
-                    event_type=AUDIT_EVENT_TYPE_GRANT,
-                    grant_id=grant_id,
-                    decision_id=grant.decision_id,
-                    data_id=grant.data_id,
-                    status=AUDIT_EVENT_STATUS_REVOKED,
-                    capability_sha256=grant.capability_digest,
-                    occurred_at=now,
-                )
+            _append_audit_event(
+                session,
+                tenant_id=grant.tenant_id,
+                workload_id=grant.workload_id,
+                event_type=AUDIT_EVENT_TYPE_GRANT,
+                grant_id=grant_id,
+                decision_id=grant.decision_id,
+                data_id=grant.data_id,
+                status=AUDIT_EVENT_STATUS_REVOKED,
+                capability_sha256=grant.capability_digest,
+                occurred_at=now,
             )
             session.commit()
             decision_id = grant.decision_id
@@ -13707,19 +14281,17 @@ def create_app(
                 reason=RELEASE_GRANT_EVENT_REASON_RELEASE,
                 now=now,
             )
-            session.add(
-                AuditEvent(
-                    event_id=str(uuid.uuid4()),
-                    tenant_id=grant.tenant_id,
-                    workload_id=grant.workload_id,
-                    event_type=AUDIT_EVENT_TYPE_GRANT,
-                    grant_id=grant_id,
-                    decision_id=grant.decision_id,
-                    data_id=grant.data_id,
-                    status=AUDIT_EVENT_STATUS_CONSUMED,
-                    capability_sha256=grant.capability_digest,
-                    occurred_at=now,
-                )
+            _append_audit_event(
+                session,
+                tenant_id=grant.tenant_id,
+                workload_id=grant.workload_id,
+                event_type=AUDIT_EVENT_TYPE_GRANT,
+                grant_id=grant_id,
+                decision_id=grant.decision_id,
+                data_id=grant.data_id,
+                status=AUDIT_EVENT_STATUS_CONSUMED,
+                capability_sha256=grant.capability_digest,
+                occurred_at=now,
             )
             session.commit()
 
@@ -14413,19 +14985,17 @@ def create_app(
                 # The compliance event commits in the same transaction as
                 # the material rotation; an already-current no-op retry
                 # (above) writes no event because it changes no material.
-                session.add(
-                    AuditEvent(
-                        event_id=str(uuid.uuid4()),
-                        tenant_id=body.tenant_id,
-                        workload_id=body.workload_id,
-                        event_type=AUDIT_EVENT_TYPE_REWRAP,
-                        grant_id=None,
-                        decision_id=None,
-                        data_id=data_id,
-                        status=AUDIT_EVENT_STATUS_REWRAPPED,
-                        capability_sha256=None,
-                        occurred_at=rotated_at,
-                    )
+                _append_audit_event(
+                    session,
+                    tenant_id=body.tenant_id,
+                    workload_id=body.workload_id,
+                    event_type=AUDIT_EVENT_TYPE_REWRAP,
+                    grant_id=None,
+                    decision_id=None,
+                    data_id=data_id,
+                    status=AUDIT_EVENT_STATUS_REWRAPPED,
+                    capability_sha256=None,
+                    occurred_at=rotated_at,
                 )
                 try:
                     session.commit()
@@ -14880,19 +15450,17 @@ def create_app(
                 # events carry the envelope data identifier and the fixed
                 # rewrapped/skipped status; grant/decision identifiers and
                 # the capability digest are empty (NULL).
-                session.add(
-                    AuditEvent(
-                        event_id=str(uuid.uuid4()),
-                        tenant_id=body.tenant_id,
-                        workload_id=body.workload_id,
-                        event_type=AUDIT_EVENT_TYPE_REWRAP,
-                        grant_id=None,
-                        decision_id=None,
-                        data_id=data_id,
-                        status=event_status,
-                        capability_sha256=None,
-                        occurred_at=item_occurred_at,
-                    )
+                _append_audit_event(
+                    session,
+                    tenant_id=body.tenant_id,
+                    workload_id=body.workload_id,
+                    event_type=AUDIT_EVENT_TYPE_REWRAP,
+                    grant_id=None,
+                    decision_id=None,
+                    data_id=data_id,
+                    status=event_status,
+                    capability_sha256=None,
+                    occurred_at=item_occurred_at,
                 )
                 counts["processed"] += 1
                 if result == REWRAP_RESULT_REWRAPPED:
