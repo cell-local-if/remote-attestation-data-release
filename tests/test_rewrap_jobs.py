@@ -725,9 +725,11 @@ def test_concurrent_jobs_advance_each_envelope_at_most_once(tmp_path, monkeypatc
     with TestClient(application) as client:
         _seed(client, [f"e{n}" for n in range(count)])  # sealed under version 1
         monkeypatch.setenv("PROOF_RELEASE_KEYRING", KEYRING_V1_V2)
-        with ThreadPoolExecutor(max_workers=6) as pool:
+        # Five concurrent submissions: exactly the per-scope, per-minute
+        # new-job admission budget, so every one is accepted.
+        with ThreadPoolExecutor(max_workers=5) as pool:
             responses = list(
-                pool.map(lambda _: _submit(client, limit=50), range(6))
+                pool.map(lambda _: _submit(client, limit=50), range(5))
             )
         assert all(r.status_code == 202 for r in responses)
         job_ids = [r.json()["job_id"] for r in responses]
@@ -740,8 +742,8 @@ def test_concurrent_jobs_advance_each_envelope_at_most_once(tmp_path, monkeypatc
         }
         assert totals["rewrapped"] == count
         assert totals["failed"] == 0
-        assert totals["processed"] == count * 6
-        assert totals["skipped"] == count * 6 - count
+        assert totals["processed"] == count * 5
+        assert totals["skipped"] == count * 5 - count
         for n in range(count):
             stored = _get_envelope(client, f"e{n}").json()
             assert stored["key_version"] == 2

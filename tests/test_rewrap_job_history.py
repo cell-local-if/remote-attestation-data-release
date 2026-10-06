@@ -68,6 +68,11 @@ JOB_FIELDS = [
 def app(tmp_path, monkeypatch):
     monkeypatch.delenv("PROOF_RELEASE_KEYRING", raising=False)
     monkeypatch.setenv("PROOF_RELEASE_MASTER_KEY", KEY_V1)
+    # History tests submit well over five jobs into one scope inside one
+    # minute; admission itself is covered by the dedicated rate-limit
+    # tests, so the budget is raised in-process to keep these tests about
+    # listing and pagination.
+    monkeypatch.setattr(app_module, "REWRAP_JOB_ADMISSION_BUDGET_PER_MINUTE", 64)
     application = app_module.create_app(f"sqlite:///{tmp_path}/history.db")
     yield application
     application.state.engine.dispose()

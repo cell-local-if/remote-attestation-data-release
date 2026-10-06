@@ -2004,3 +2004,50 @@ class VerificationAdmissionCounter(Base):
     # capped at the per-minute verification budget by the atomic admission
     # transaction.
     count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class RewrapJobAdmissionCounter(Base):
+    """Persistent per-scope admission counter for asynchronous rewrap jobs.
+
+    One row exists per ``(tenant_id, workload_id, window_start)`` triple,
+    where ``window_start`` is the UTC natural minute (seconds and
+    sub-seconds truncated) in which a ``POST /v1/rewrap-jobs`` request
+    that genuinely creates a job was admitted. Only requests whose body,
+    cursor and idempotency-key checks all passed and that are neither a
+    keyed replay nor a same-key conflict reserve a slot: validation
+    failures (422), an unusable keyring (500), stored-response replays
+    and conflicting key reuse (409) never touch this table. The budget is
+    attributed solely to the two scope fields and is deliberately
+    separate from every other admission budget (:class:`RateLimitCounter`,
+    :class:`ChallengeIssuanceCounter`, :class:`VerificationAdmissionCounter`):
+    none of them share rows, quota or lock traffic, and different tenants
+    or workloads never share a row.
+
+    A slot is reserved in the same transaction that inserts the queued
+    job, its submission event and (on the keyed path) the idempotency
+    record, so the count is durable (it survives process restarts) and a
+    crash or rollback can leave neither a counter without its job nor a
+    job without its counter. A rejected (over-budget) request writes
+    nothing — no counter, no job, no event, no idempotency record, no
+    audit row. A new UTC minute starts a new row, which restores the
+    quota automatically; quotas are never borrowed across scopes or
+    minutes.
+    """
+
+    __tablename__ = "rewrap_job_admission_counters"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "window_start",
+            name="uq_rewrap_job_admission_counter_scope_window",
+        ),
+    )
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # UTC minute boundary at which the window starts, truncated to seconds.
+    window_start: Mapped[datetime] = mapped_column(UTCDateTime(), primary_key=True)
+    # Number of new rewrap jobs admitted during this window; capped at the
+    # per-minute admission budget by the atomic admission transaction.
+    count: Mapped[int] = mapped_column(Integer, default=0)
