@@ -40,9 +40,11 @@ from typing import Any
 
 __all__ = [
     "InvalidRule",
+    "EvaluationExpansionTooLarge",
     "validate_rule",
     "evaluate_rule",
     "explain_rule",
+    "assert_evaluation_within_limits",
     "rule_structure",
     "rules_equal",
     "diff_rules",
@@ -52,6 +54,8 @@ __all__ = [
     "MAX_PATH_SEGMENTS",
     "MAX_PATH_SEGMENT_LENGTH",
     "MAX_IN_ITEMS",
+    "MAX_EVALUATION_CANDIDATES",
+    "MAX_EVALUATION_ARRAY_ELEMENTS",
 ]
 
 #: Defensive bounds so a submitted rule cannot exhaust the stack or the
