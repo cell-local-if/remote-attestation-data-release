@@ -30,16 +30,30 @@ only claim *names* (or object paths) and expected scalar values — they
 never contain raw evidence, nonces or claim material — so persisting
 their canonical serialization is compatible with the no-raw-evidence
 guarantee.
+
+Evaluation itself is resource-bounded so a wildcard path can never
+expand nested arrays into an unbounded Cartesian product: a single path
+leaf yields at most :data:`MAX_PATH_LEAF_CANDIDATES` candidates after
+any one segment expansion, the final candidate counts of all path
+leaves of one rule tree together may not exceed
+:data:`MAX_RULE_PATH_CANDIDATES`, and a ``contains``/``contains_any``/
+``contains_all`` comparison never scans past the
+:data:`MAX_CONTAINS_ELEMENTS`-th element of a located array. Crossing
+any of these bounds raises :class:`EvaluationTooLarge`; reaching them
+exactly still evaluates with the ordinary semantics. These bounds
+constrain evaluation only — rule validation and the persisted
+representation of a valid rule are unchanged.
 """
 
 from __future__ import annotations
 
 import json
 import math
-from typing import Any
+from typing import Any, Iterator
 
 __all__ = [
     "InvalidRule",
+    "EvaluationTooLarge",
     "validate_rule",
     "evaluate_rule",
     "explain_rule",
@@ -52,6 +66,9 @@ __all__ = [
     "MAX_PATH_SEGMENTS",
     "MAX_PATH_SEGMENT_LENGTH",
     "MAX_IN_ITEMS",
+    "MAX_PATH_LEAF_CANDIDATES",
+    "MAX_RULE_PATH_CANDIDATES",
+    "MAX_CONTAINS_ELEMENTS",
 ]
 
 #: Defensive bounds so a submitted rule cannot exhaust the stack or the
@@ -69,6 +86,23 @@ MAX_PATH_SEGMENT_LENGTH = 128
 #: state.
 MAX_IN_ITEMS = 32
 
+#: Evaluation-time resource bounds. They constrain only the evaluation
+#: of an already-valid rule against claims — never the rule syntax, its
+#: validation or its persisted form.
+#:
+#: A single path leaf may hold at most this many candidates after any
+#: one path-segment expansion, so one wildcard step can never multiply
+#: the candidate set past this bound.
+MAX_PATH_LEAF_CANDIDATES = 4096
+#: The final candidate counts of all path leaves of one rule tree,
+#: summed over a single evaluation of that tree, may not exceed this
+#: bound — several individually small expansions cannot combine into an
+#: unbounded total.
+MAX_RULE_PATH_CANDIDATES = 4096
+#: A ``contains``, ``contains_any`` or ``contains_all`` comparison
+#: never scans past this many elements of one located array.
+MAX_CONTAINS_ELEMENTS = 4096
+
 #: The comparison keys a leaf may carry exactly one of, next to its
 #: ``claim``/``path`` locator.
 _COMPARISON_KEYS = frozenset(
@@ -85,6 +119,38 @@ _LOCATOR_KEYS = frozenset({"claim", "path"})
 
 class InvalidRule(ValueError):
     """Raised when a submitted rule tree is not one of the valid forms."""
+
+
+class EvaluationTooLarge(ValueError):
+    """Raised when evaluating a valid rule crosses an expansion bound.
+
+    This is never raised for a rule that stays within
+    :data:`MAX_PATH_LEAF_CANDIDATES`, :data:`MAX_RULE_PATH_CANDIDATES`
+    and :data:`MAX_CONTAINS_ELEMENTS`; exactly reaching a bound still
+    evaluates with the ordinary semantics.
+    """
+
+
+class _EvaluationBudget:
+    """Per-evaluation counter for the tree-wide candidate bound.
+
+    One instance is shared by a single top-level evaluation of a rule
+    tree (one :func:`evaluate_rule` or :func:`explain_rule` call); each
+    path leaf adds its final candidate count exactly once.
+    """
+
+    __slots__ = ("path_candidates",)
+
+    def __init__(self) -> None:
+        self.path_candidates = 0
+
+    def add_path_leaf_candidates(self, count: int) -> None:
+        self.path_candidates += count
+        if self.path_candidates > MAX_RULE_PATH_CANDIDATES:
+            raise EvaluationTooLarge(
+                "rule tree path candidate total exceeds "
+                f"{MAX_RULE_PATH_CANDIDATES}"
+            )
 
 
 def _is_scalar(value: Any) -> bool:
@@ -288,7 +354,11 @@ def canonical_rule_json(rule: dict[str, Any]) -> str:
     return json.dumps(rule, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-def _read_path_candidates(claims: Any, segments: list[Any]) -> list[Any]:
+def _read_path_candidates(
+    claims: Any,
+    segments: list[Any],
+    budget: _EvaluationBudget | None = None,
+) -> list[Any]:
     """Expand a declared path into its complete candidate values.
 
     String segments descend through one same-named JSON object field and
@@ -301,6 +371,12 @@ def _read_path_candidates(claims: Any, segments: list[Any]) -> list[Any]:
     field, or a scalar/array/non-object met while further descent is still
     required all yield no candidates for that branch. The candidates of a
     fully walked path may be scalars, nulls, arrays or objects.
+
+    The expansion is bounded: after any one segment the candidate set may
+    not exceed :data:`MAX_PATH_LEAF_CANDIDATES`, and the leaf's final
+    candidate count is charged to ``budget`` (when given) against
+    :data:`MAX_RULE_PATH_CANDIDATES`. Crossing either bound raises
+    :class:`EvaluationTooLarge`.
     """
     candidates: list[Any] = [claims]
     for segment in segments:
@@ -317,9 +393,32 @@ def _read_path_candidates(claims: Any, segments: list[Any]) -> list[Any]:
                 for current in candidates
                 if isinstance(current, dict) and segment in current
             ]
+        if len(candidates) > MAX_PATH_LEAF_CANDIDATES:
+            raise EvaluationTooLarge(
+                "path leaf expansion exceeds "
+                f"{MAX_PATH_LEAF_CANDIDATES} candidates"
+            )
         if not candidates:
             break
+    if budget is not None:
+        budget.add_path_leaf_candidates(len(candidates))
     return candidates
+
+
+def _scan_elements(actual: list) -> Iterator[Any]:
+    """Yield a located array's elements up to the contains-scan bound.
+
+    Used by ``contains``, ``contains_any`` and ``contains_all``: the
+    scan still short-circuits on the first matching element exactly as
+    before, but pulling the :data:`MAX_CONTAINS_ELEMENTS` + 1-th element
+    raises :class:`EvaluationTooLarge` instead of scanning on.
+    """
+    for index, element in enumerate(actual):
+        if index >= MAX_CONTAINS_ELEMENTS:
+            raise EvaluationTooLarge(
+                f"set comparison scans past {MAX_CONTAINS_ELEMENTS} elements"
+            )
+        yield element
 
 
 def _compare_order(actual: Any, key: str, bound: Any) -> bool:
@@ -351,12 +450,16 @@ def _array_covers_all(actual: Any, candidates: list[Any]) -> bool:
     if not isinstance(actual, list):
         return False
     return all(
-        any(_scalar_equals(element, candidate) for element in actual)
+        any(_scalar_equals(element, candidate) for element in _scan_elements(actual))
         for candidate in candidates
     )
 
 
-def evaluate_rule(rule: dict[str, Any], claims: dict[str, Any]) -> bool:
+def evaluate_rule(
+    rule: dict[str, Any],
+    claims: dict[str, Any],
+    _budget: _EvaluationBudget | None = None,
+) -> bool:
     """Evaluate a validated rule against top-level verified claims.
 
     A missing claim or object path simply fails its comparison (an absent
@@ -387,7 +490,20 @@ def evaluate_rule(rule: dict[str, Any], claims: dict[str, Any]) -> bool:
     wildcard, a missing intermediate field, or a scalar/non-object where
     further descent is required — fail the leaf. Compound nodes keep
     their short-circuit semantics.
+
+    Evaluation is resource-bounded: a path leaf may not expand past
+    :data:`MAX_PATH_LEAF_CANDIDATES` candidates at any segment, the path
+    leaves of the whole tree may not yield more than
+    :data:`MAX_RULE_PATH_CANDIDATES` candidates in one evaluation, and a
+    ``contains``/``contains_any``/``contains_all`` scan never pulls more
+    than :data:`MAX_CONTAINS_ELEMENTS` elements of a located array.
+    Crossing a bound raises :class:`EvaluationTooLarge`; exactly reaching
+    it keeps the ordinary result. ``_budget`` is internal: recursion and
+    :func:`explain_rule` share one budget across the whole tree so every
+    path leaf is charged exactly once per evaluation.
     """
+    if _budget is None:
+        _budget = _EvaluationBudget()
     keys = set(rule.keys())
     locators = keys & _LOCATOR_KEYS
     if len(keys) == 2 and len(locators) == 1:
@@ -398,7 +514,7 @@ def evaluate_rule(rule: dict[str, Any], claims: dict[str, Any]) -> bool:
             else:
                 actuals = []
         else:
-            actuals = _read_path_candidates(claims, rule["path"])
+            actuals = _read_path_candidates(claims, rule["path"], _budget)
         if comparison == "exists":
             return bool(actuals)
         if comparison == "equals":
@@ -419,7 +535,7 @@ def evaluate_rule(rule: dict[str, Any], claims: dict[str, Any]) -> bool:
                 isinstance(actual, list)
                 and any(
                     _scalar_equals(element, rule["contains"])
-                    for element in actual
+                    for element in _scan_elements(actual)
                 )
                 for actual in actuals
             )
@@ -431,7 +547,7 @@ def evaluate_rule(rule: dict[str, Any], claims: dict[str, Any]) -> bool:
                 isinstance(actual, list)
                 and any(
                     _scalar_equals(element, candidate)
-                    for element in actual
+                    for element in _scan_elements(actual)
                     for candidate in rule["contains_any"]
                 )
                 for actual in actuals
@@ -454,11 +570,11 @@ def evaluate_rule(rule: dict[str, Any], claims: dict[str, Any]) -> bool:
         raise InvalidRule(f"unknown comparison: {comparison}")
     (key,) = keys
     if key == "all":
-        return all(evaluate_rule(child, claims) for child in rule["all"])
+        return all(evaluate_rule(child, claims, _budget) for child in rule["all"])
     if key == "any":
-        return any(evaluate_rule(child, claims) for child in rule["any"])
+        return any(evaluate_rule(child, claims, _budget) for child in rule["any"])
     if key == "not":
-        return not evaluate_rule(rule["not"], claims)
+        return not evaluate_rule(rule["not"], claims, _budget)
     raise InvalidRule(f"unknown rule form: {key}")
 
 
@@ -488,36 +604,58 @@ def explain_rule(
     The explanation contains only node positions, structural types and
     booleans: it never records claim names, object paths, comparison
     operators, expected scalars, actual claim values or any evidence.
+
+    The whole tree is explained in a single pass under one evaluation
+    budget: every leaf is evaluated exactly once and every compound
+    outcome is combined from its children's outcomes (the same booleans
+    :func:`evaluate_rule`'s short-circuit walk produces), so the
+    :class:`EvaluationTooLarge` bounds apply to the tree as a whole
+    exactly as they do for a plain evaluation.
     """
     nodes: list[dict[str, Any]] = []
+    budget = _EvaluationBudget()
 
-    def visit(node: dict[str, Any], path: list[int]) -> None:
+    def visit(node: dict[str, Any], path: list[int]) -> bool:
         keys = set(node.keys())
         locators = keys & _LOCATOR_KEYS
         index = len(nodes)
         if len(keys) == 2 and len(locators) == 1:
-            node_type = "leaf"
-            children: list[tuple[Any, list[int]]] = []
+            outcome = evaluate_rule(node, claims, budget)
+            nodes.append(
+                {
+                    "node_index": index,
+                    "rule_path": list(path),
+                    "node_type": "leaf",
+                    "outcome": outcome,
+                }
+            )
+            return outcome
+        (key,) = keys
+        if key in ("all", "any"):
+            children = [
+                (child, [*path, position])
+                for position, child in enumerate(node[key])
+            ]
         else:
-            (key,) = keys
-            node_type = key
-            if key in ("all", "any"):
-                children = [
-                    (child, [*path, position])
-                    for position, child in enumerate(node[key])
-                ]
-            else:
-                children = [(node[key], [*path, 0])]
-        nodes.append(
-            {
-                "node_index": index,
-                "rule_path": list(path),
-                "node_type": node_type,
-                "outcome": evaluate_rule(node, claims),
-            }
-        )
-        for child, child_path in children:
-            visit(child, child_path)
+            children = [(node[key], [*path, 0])]
+        # Reserve the parent's pre-order slot before descending; its
+        # outcome is filled in once the children are explained.
+        entry: dict[str, Any] = {
+            "node_index": index,
+            "rule_path": list(path),
+            "node_type": key,
+            "outcome": False,
+        }
+        nodes.append(entry)
+        outcomes = [visit(child, child_path) for child, child_path in children]
+        if key == "all":
+            outcome = all(outcomes)
+        elif key == "any":
+            outcome = any(outcomes)
+        else:
+            outcome = not outcomes[0]
+        entry["outcome"] = outcome
+        return outcome
 
     visit(rule, [])
     return nodes

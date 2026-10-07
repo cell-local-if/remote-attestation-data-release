@@ -159,6 +159,7 @@ from proof_release.envelopes import (
     rewrap_data_key,
 )
 from proof_release.policies import (
+    EvaluationTooLarge,
     InvalidRule,
     canonical_rule_json,
     diff_rules,
@@ -10878,9 +10879,19 @@ def create_app(
             )
 
         # Pure evaluation against the caller-supplied claims; nothing is
-        # persisted. The claims never appear in the response.
-        allowed = evaluate_rule(rule, body.claims)
-        evaluation_nodes = explain_rule(rule, body.claims)
+        # persisted. The claims never appear in the response. Evaluation
+        # is resource-bounded: a rule whose wildcard paths or set
+        # comparisons expand past the evaluation limits is a client
+        # error, and no verdict, timestamp or partial evaluation is
+        # returned for it.
+        try:
+            allowed = evaluate_rule(rule, body.claims)
+            evaluation_nodes = explain_rule(rule, body.claims)
+        except EvaluationTooLarge:
+            raise HTTPException(
+                status_code=422,
+                detail="policy evaluation expansion too large",
+            )
         if not evaluation_nodes or evaluation_nodes[0]["outcome"] != allowed:
             # Defensive: a validated rule always has a root whose outcome
             # is the overall verdict. Treat a mismatch as a server-side
@@ -11048,7 +11059,19 @@ def create_app(
                 )
 
             rule = json.loads(policy.rule_json)
-            satisfied = evaluate_rule(rule, claims)
+            # Evaluation is resource-bounded with the same limits the
+            # trial-evaluation endpoint applies. A rule whose expansion
+            # crosses them is a client error here too: no decision,
+            # explanation node, audit event, proof-lifecycle event or
+            # grant state is created — the transaction has written
+            # nothing at this point and rolls back cleanly.
+            try:
+                satisfied = evaluate_rule(rule, claims)
+            except EvaluationTooLarge:
+                raise HTTPException(
+                    status_code=422,
+                    detail="policy evaluation expansion too large",
+                )
             status = (
                 DECISION_STATUS_ALLOWED if satisfied else DECISION_STATUS_DENIED
             )
@@ -11061,7 +11084,13 @@ def create_app(
             # decision's status. The explanation is historical: it is
             # written once and policy retirement, later policy versions,
             # identity/revocation changes or key rotation never touch it.
-            evaluation_nodes = explain_rule(rule, claims)
+            try:
+                evaluation_nodes = explain_rule(rule, claims)
+            except EvaluationTooLarge:
+                raise HTTPException(
+                    status_code=422,
+                    detail="policy evaluation expansion too large",
+                )
             if not evaluation_nodes or evaluation_nodes[0]["outcome"] != satisfied:
                 # Defensive: a validated rule always has a root whose
                 # outcome is the overall verdict. Treat a mismatch as a
