@@ -12,11 +12,20 @@ claim name or an object path and carry exactly one comparison key::
     {"claim": "...", "contains_all": [<scalar>, ...]}  # array covers all of 1..32
     {"claim": "...", "lt"|"lte"|"gt"|"gte": <finite JSON number>}
     {"claim": "...", "exists": true}
+    {"claim": "...", "equals_path": ["<segment>", ...]}  # cross-field equality
     {"path": [...],
      "in"|"contains"|"contains_any"|"contains_all"|"lt"|"lte"|"gt"|"gte"|"exists": ...}
+    {"path": [...], "equals_path": ["<segment>", ...]}
     {"all": [rule, ...]}
     {"any": [rule, ...]}
     {"not": rule}
+
+An ``equals_path`` leaf compares two values found in the same verified
+claims: the leaf's own ``claim``/``path`` locator resolves one side and
+its ``equals_path`` value — a path obeying exactly the same segment
+rules (and length bounds) as a ``path`` locator, read from the top-level
+claims — resolves the other. Neither side carries a comparison value:
+both are read-only paths.
 
 A path segment is either a string naming one object field or the exact
 object ``{"wildcard": True}`` (no other keys, and the value must be the
@@ -73,7 +82,7 @@ MAX_IN_ITEMS = 32
 #: ``claim``/``path`` locator.
 _COMPARISON_KEYS = frozenset(
     {"equals", "in", "contains", "contains_any", "contains_all",
-     "lt", "lte", "gt", "gte", "exists"}
+     "lt", "lte", "gt", "gte", "exists", "equals_path"}
 )
 
 #: Comparison keys that order the actual value against one JSON number.
@@ -122,8 +131,8 @@ def _is_wildcard_segment(segment: Any) -> bool:
     )
 
 
-def _validate_path(path: Any) -> None:
-    """Validate the ``path`` sibling of a path leaf.
+def _validate_path(path: Any, label: str = "path") -> None:
+    """Validate a declared object path.
 
     It must be a non-empty list of at most :data:`MAX_PATH_SEGMENTS`
     segments; each segment is either a non-blank string no longer than
@@ -133,22 +142,28 @@ def _validate_path(path: Any) -> None:
     that single name and never split it, and the literal string ``"*"``
     is an ordinary field name. A wildcard segment expands the elements of
     the JSON array found at that position.
+
+    ``label`` names the role the path plays (a ``path`` locator or the
+    target of an ``equals_path`` leaf) and only scopes the error text;
+    the shape rules are identical for both.
     """
     if not isinstance(path, list) or not path:
-        raise InvalidRule("path must be a non-empty list of segments")
+        raise InvalidRule(f"{label} must be a non-empty list of segments")
     if len(path) > MAX_PATH_SEGMENTS:
-        raise InvalidRule(f"path may name at most {MAX_PATH_SEGMENTS} segments")
+        raise InvalidRule(
+            f"{label} may name at most {MAX_PATH_SEGMENTS} segments"
+        )
     for segment in path:
         if _is_wildcard_segment(segment):
             continue
         if not isinstance(segment, str) or not segment or not segment.strip():
             raise InvalidRule(
-                "path segments must be non-empty strings or "
+                f"{label} segments must be non-empty strings or "
                 '{"wildcard": true} objects'
             )
         if len(segment) > MAX_PATH_SEGMENT_LENGTH:
             raise InvalidRule(
-                f"path segments may be at most {MAX_PATH_SEGMENT_LENGTH} "
+                f"{label} segments may be at most {MAX_PATH_SEGMENT_LENGTH} "
                 "characters"
             )
 
@@ -221,6 +236,12 @@ def _validate_comparison(key: str, value: Any) -> None:
         if value is not True:
             raise InvalidRule("exists must be true")
         return
+    if key == "equals_path":
+        # The target is another read-only path inside the same claims,
+        # never a comparison value or a rule node; it obeys exactly the
+        # segment and total-length rules of a ``path`` locator.
+        _validate_path(value, label="equals_path")
+        return
     raise InvalidRule(f"unknown comparison: {key}")
 
 
@@ -233,7 +254,8 @@ def validate_rule(rule: Any) -> dict[str, Any]:
     ``contains_any`` or ``contains_all`` sets (empty, oversized,
     non-scalar or repeating), a
     non-scalar ``contains`` target, boolean or non-finite
-    ordinal bounds, an ``exists`` value other than ``true``, empty
+    ordinal bounds, an ``exists`` value other than ``true``, an
+    ``equals_path`` target that is not a valid path, empty
     ``all``/``any`` lists, malformed ``path`` siblings (including an
     object segment that is not exactly ``{"wildcard": True}``), or
     structures past the defensive size bounds.
@@ -380,7 +402,20 @@ def evaluate_rule(rule: dict[str, Any], claims: dict[str, Any]) -> bool:
     non-array or an array missing any candidate all fail.
     ``exists`` checks whether the claim key
     or the full object path is readable at all; a ``null`` value there
-    still exists. A path leaf carrying wildcard segments is true when
+    still exists. ``equals_path`` compares two values located inside the
+    same claims: the leaf's locator resolves one set of candidates and
+    its target path — read from the top-level claims under the same path
+    and wildcard rules — resolves the other, and the leaf is true when
+    any complete candidate from one side is type-strictly equal (under
+    the same scalar semantics ``equals`` uses) to any complete candidate
+    from the other; an explicit ``null`` matches only an explicit
+    ``null``, booleans never match numbers, strings match only strings,
+    numbers compare by value, and arrays and objects never match
+    anything. A side with no complete candidate — a missing field, an
+    unreadable descent, a non-array at a wildcard or an empty array —
+    makes the leaf false without raising, and a resolved array or object
+    candidate never compares equal. A path leaf carrying wildcard
+    segments is true when
     *any* of its complete candidates satisfies the leaf comparison
     (``exists`` is true when at least one complete candidate is
     readable); zero candidates — an empty array, a non-array at a
@@ -404,6 +439,25 @@ def evaluate_rule(rule: dict[str, Any], claims: dict[str, Any]) -> bool:
         if comparison == "equals":
             return any(
                 _scalar_equals(actual, rule["equals"]) for actual in actuals
+            )
+        if comparison == "equals_path":
+            # Cross-field equality: both sides resolve independently into
+            # complete candidate values inside the same claims, and the
+            # leaf is true when any left candidate is type-strictly equal
+            # to any right candidate under the same scalar semantics as
+            # ``equals``. Missing fields and unreadable paths simply
+            # produce no candidates, so a side without a complete
+            # candidate denies; arrays and objects are never equal to
+            # anything (and never equal each other).
+            expected_actuals = _read_path_candidates(
+                claims, rule["equals_path"]
+            )
+            return any(
+                _is_scalar(actual)
+                and _is_scalar(expected)
+                and _scalar_equals(actual, expected)
+                for actual in actuals
+                for expected in expected_actuals
             )
         if comparison == "in":
             return any(
