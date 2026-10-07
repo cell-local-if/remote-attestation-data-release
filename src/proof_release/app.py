@@ -51,6 +51,7 @@ from proof_release.db import (
     DECISION_STATUS_ALLOWED,
     DECISION_STATUS_DENIED,
     DECISION_STATUS_CODES,
+    CLASSIFICATION_CODES,
     RELEASE_GRANT_STATUS_CODES,
     RELEASE_GRANT_STATUS_CONSUMED,
     RELEASE_GRANT_STATUS_PENDING,
@@ -115,6 +116,8 @@ from proof_release.db import (
     Challenge,
     ChallengeIssuanceCounter,
     DataEnvelope,
+    DataEnvelopeClassification,
+    DataEnvelopeClassificationHistory,
     DataEnvelopeCommitCounter,
     DataEnvelopeIdempotencyRecord,
     Decision,
@@ -3353,6 +3356,119 @@ def _decode_data_envelope_cursor(
     return boundary_data_id, snapshot_seq
 
 
+#: Page size of the classification-history listing. Versions are immutable
+#: and gap-free per envelope, so a keyset over them paginates stably.
+CLASSIFICATION_HISTORY_PAGE_SIZE = 100
+
+#: Discriminator embedded in classification-history cursors so a cursor
+#: from any other family (the envelope directory, rewrap batches, grant
+#: audits, compliance audit events, proof-lifecycle events, decisions,
+#: revocations, trust roots, policies or rewrap job listings — all
+#: authenticated with the same secret) can never be replayed against the
+#: history listing, and vice versa.
+_CLASSIFICATION_HISTORY_CURSOR_KIND = "data-envelope-classification-history-v1"
+
+
+def _classification_history_cursor_payload(
+    tenant_id: str,
+    workload_id: str,
+    data_id: str,
+    boundary_version: int,
+) -> bytes:
+    """Canonical byte payload authenticated inside a history cursor.
+
+    The cursor marks an exclusive ``version`` position for exactly one
+    envelope in exactly one scope; the scope and data identifier are part
+    of the signed payload, so a cursor minted for another tenant,
+    workload or data_id — or for any other cursor family — cannot be
+    replayed here.
+    """
+    return json.dumps(
+        {
+            "k": _CLASSIFICATION_HISTORY_CURSOR_KIND,
+            "t": tenant_id,
+            "w": workload_id,
+            "d": data_id,
+            "v": boundary_version,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _encode_classification_history_cursor(
+    tenant_id: str,
+    workload_id: str,
+    data_id: str,
+    boundary_version: int,
+) -> str:
+    """Build an opaque, scope/envelope-bound exclusive version cursor."""
+    payload = _classification_history_cursor_payload(
+        tenant_id, workload_id, data_id, boundary_version
+    )
+    mac = hmac.new(_cursor_secret(), payload, hashlib.sha256).digest()
+    return b64url_encode(payload + mac)
+
+
+def _decode_classification_history_cursor(
+    token: str,
+    tenant_id: str,
+    workload_id: str,
+    data_id: str,
+) -> int | None:
+    """Validate a history cursor and return its exclusive version boundary.
+
+    Returns the boundary version on success or ``None`` for a malformed,
+    forged or tampered token, a cursor of any other kind, or one minted
+    for any other tenant, workload or data_id. The beginning marker
+    (``""``) never reaches this function.
+    """
+    if not _CURSOR_RE.fullmatch(token):
+        return None
+    try:
+        raw = b64url_decode(token)
+    except ValueError:
+        return None
+    # The MAC is a fixed 32-byte suffix; the JSON payload precedes it.
+    if len(raw) <= 32:
+        return None
+    payload, mac = raw[:-32], raw[-32:]
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    if decoded.get("k") != _CLASSIFICATION_HISTORY_CURSOR_KIND:
+        return None
+    # A resume cursor is only ever minted for a page with a following
+    # page, so its boundary always names a positive committed version
+    # (bools are rejected as ints).
+    boundary_version = decoded.get("v")
+    if not isinstance(boundary_version, int) or isinstance(boundary_version, bool):
+        return None
+    if boundary_version < 1:
+        return None
+    expected_mac = hmac.new(
+        _cursor_secret(),
+        _classification_history_cursor_payload(
+            tenant_id, workload_id, data_id, boundary_version
+        ),
+        hashlib.sha256,
+    ).digest()
+    if not hmac.compare_digest(mac, expected_mac):
+        return None
+    # Defense in depth: the MAC already covers every field, but confirm
+    # the scope and envelope explicitly.
+    if not hmac.compare_digest(str(decoded.get("t", "")), tenant_id):
+        return None
+    if not hmac.compare_digest(str(decoded.get("w", "")), workload_id):
+        return None
+    if not hmac.compare_digest(str(decoded.get("d", "")), data_id):
+        return None
+    return boundary_version
+
+
 class CreateChallengeRequest(BaseModel):
     tenant_id: StrictStr = Field(min_length=1)
     workload_id: StrictStr = Field(min_length=1)
@@ -3817,6 +3933,37 @@ class DataEnvelopeRewrappedResponse(BaseModel):
     workload_id: str
     key_version: int
     rotated_at: str
+
+
+class PutDataEnvelopeClassificationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: StrictStr = Field(min_length=1)
+    workload_id: StrictStr = Field(min_length=1)
+    # One of the CLASSIFICATION_CODES labels; anything else is a 422.
+    classification: StrictStr
+    # Optimistic-concurrency token: the current committed version, or 0
+    # when the envelope has never been classified. Booleans are rejected
+    # by StrictInt even though Python treats them as ints.
+    expected_version: StrictInt = Field(ge=0)
+
+    _non_blank = field_validator("tenant_id", "workload_id")(_require_non_blank)
+
+    @field_validator("classification")
+    @classmethod
+    def _classification_known(cls, value: str) -> str:
+        if value not in CLASSIFICATION_CODES:
+            raise ValueError("unknown classification")
+        return value
+
+
+class DataEnvelopeClassificationResponse(BaseModel):
+    data_id: str
+    tenant_id: str
+    workload_id: str
+    classification: str
+    version: int
+    updated_at: str
 
 
 class CreateRewrapBatchRequest(BaseModel):
@@ -15377,6 +15524,363 @@ def create_app(
             key_version=final_version,
             rotated_at=_rfc3339(rotated_at),
         )
+
+    @app.put(
+        "/v1/data-envelopes/{data_id}/classification",
+        response_model=DataEnvelopeClassificationResponse,
+    )
+    def put_data_envelope_classification(
+        data_id: str, body: PutDataEnvelopeClassificationRequest
+    ) -> DataEnvelopeClassificationResponse:
+        """Register or update an envelope's governance classification.
+
+        Classification is audit metadata only: it never participates in
+        proving, policy evaluation, authorization or decryption, and no
+        envelope material is read, written or returned on this path. The
+        envelope must exist in exactly the body's scope (unknown and
+        cross-scope are indistinguishable 404s). ``expected_version`` must
+        equal the current committed version — 0 when the envelope has
+        never been classified — so exactly one of any set of concurrent
+        registrations wins; a stale expectation is a 409 that changes
+        nothing. The accepted write replaces the current-value row and
+        appends the matching history entry in one transaction, so a
+        failure rolls both back and the stored current value and history
+        can never diverge or half-commit.
+        """
+        if not data_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+        now = _utcnow()
+        with session_factory() as session:
+            # The composite key binds the lookup to exactly this scope: an
+            # unknown data_id and one owned by another tenant or workload
+            # are indistinguishable and both return 404. Only the primary
+            # key is probed — never the material columns.
+            envelope_id = session.scalar(
+                select(DataEnvelope.data_id).where(
+                    DataEnvelope.tenant_id == body.tenant_id,
+                    DataEnvelope.workload_id == body.workload_id,
+                    DataEnvelope.data_id == data_id,
+                )
+            )
+            if envelope_id is None:
+                raise HTTPException(status_code=404, detail="data envelope not found")
+
+            current = session.get(
+                DataEnvelopeClassification,
+                (body.tenant_id, body.workload_id, data_id),
+            )
+            current_version = current.version if current is not None else 0
+            if body.expected_version != current_version:
+                # A stale expectation never overwrites the winner and
+                # never writes history.
+                raise HTTPException(
+                    status_code=409, detail="classification version conflict"
+                )
+            new_version = current_version + 1
+            if current is None:
+                session.add(
+                    DataEnvelopeClassification(
+                        tenant_id=body.tenant_id,
+                        workload_id=body.workload_id,
+                        data_id=data_id,
+                        classification=body.classification,
+                        version=new_version,
+                        updated_at=now,
+                    )
+                )
+            else:
+                # Guarded compare-and-swap: update only if the row still
+                # holds the version this request was based on, so a
+                # concurrent winner is never overwritten. On SQLite the
+                # transaction already holds the write lock (BEGIN
+                # IMMEDIATE); on locking backends the guard serializes
+                # concurrent registrations of the same envelope.
+                result = session.execute(
+                    update(DataEnvelopeClassification)
+                    .where(
+                        DataEnvelopeClassification.tenant_id == body.tenant_id,
+                        DataEnvelopeClassification.workload_id == body.workload_id,
+                        DataEnvelopeClassification.data_id == data_id,
+                        DataEnvelopeClassification.version == current_version,
+                    )
+                    .values(
+                        classification=body.classification,
+                        version=new_version,
+                        updated_at=now,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                if result.rowcount != 1:
+                    session.rollback()
+                    raise HTTPException(
+                        status_code=409, detail="classification version conflict"
+                    )
+            # The history entry commits in the same transaction as the
+            # current-value write it records: a crash or failure can never
+            # leave one without the other.
+            session.add(
+                DataEnvelopeClassificationHistory(
+                    tenant_id=body.tenant_id,
+                    workload_id=body.workload_id,
+                    data_id=data_id,
+                    version=new_version,
+                    classification=body.classification,
+                    updated_at=now,
+                )
+            )
+            try:
+                session.commit()
+            except IntegrityError:
+                # A concurrent first registration committed the same
+                # (scope, data_id) or version slot first; this request
+                # loses the race exactly as a stale expectation does.
+                session.rollback()
+                raise HTTPException(
+                    status_code=409, detail="classification version conflict"
+                )
+            except Exception:
+                session.rollback()
+                logger.error("data envelope classification write failed")
+                raise HTTPException(
+                    status_code=500, detail="classification unavailable"
+                )
+
+        return DataEnvelopeClassificationResponse(
+            data_id=data_id,
+            tenant_id=body.tenant_id,
+            workload_id=body.workload_id,
+            classification=body.classification,
+            version=new_version,
+            updated_at=_rfc3339(now),
+        )
+
+    def _read_classification_scope(
+        request: Request,
+        data_id: str,
+        tenant_id: str,
+        workload_id: str,
+        allowed_params: set,
+    ) -> None:
+        """Validate the shared read-path request shape (all 422s).
+
+        The scope query parameters are mandatory, non-blank and may each
+        appear exactly once; no other parameter beyond the allowed set is
+        accepted, and the request body must be empty (enforced by the
+        ``_require_empty_query_body`` dependency before this runs).
+        """
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(
+                status_code=422, detail="unsupported query parameter"
+            )
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(
+                status_code=422, detail="query parameter must appear once"
+            )
+        if not data_id.strip() or not tenant_id.strip() or not workload_id.strip():
+            raise HTTPException(status_code=422, detail="invalid scope parameters")
+
+    @app.get(
+        "/v1/data-envelopes/{data_id}/classification",
+        response_model=DataEnvelopeClassificationResponse,
+    )
+    def get_data_envelope_classification(
+        data_id: str,
+        request: Request,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> DataEnvelopeClassificationResponse:
+        """Return an envelope's current classification.
+
+        Read-only: only classification metadata columns are selected —
+        never ciphertext, iv, tag, wrapped_key, payload or any key — and
+        nothing is written. An envelope that exists but has never been
+        classified is a 404 distinct from the unknown/cross-scope 404,
+        and a storage failure aborts with a 500 rather than returning
+        partial state.
+        """
+        _read_classification_scope(
+            request, data_id, tenant_id, workload_id, {"tenant_id", "workload_id"}
+        )
+        try:
+            with session_factory() as session:
+                envelope_id = session.scalar(
+                    select(DataEnvelope.data_id).where(
+                        DataEnvelope.tenant_id == tenant_id,
+                        DataEnvelope.workload_id == workload_id,
+                        DataEnvelope.data_id == data_id,
+                    )
+                )
+                if envelope_id is None:
+                    raise HTTPException(
+                        status_code=404, detail="data envelope not found"
+                    )
+                current = session.get(
+                    DataEnvelopeClassification, (tenant_id, workload_id, data_id)
+                )
+                if current is None:
+                    raise HTTPException(
+                        status_code=404, detail="classification not found"
+                    )
+                return DataEnvelopeClassificationResponse(
+                    data_id=data_id,
+                    tenant_id=tenant_id,
+                    workload_id=workload_id,
+                    classification=current.classification,
+                    version=int(current.version),
+                    updated_at=_rfc3339(current.updated_at),
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("data envelope classification read failed")
+            raise HTTPException(
+                status_code=500, detail="classification unavailable"
+            )
+
+    @app.get(
+        "/v1/data-envelopes/{data_id}/classification/history",
+    )
+    def list_data_envelope_classification_history(
+        data_id: str,
+        request: Request,
+        tenant_id: str = Query(...),
+        workload_id: str = Query(...),
+        cursor: str | None = Query(default=None),
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return a cursor-stable page of classification history.
+
+        Entries are ordered by ``version`` ascending with an exclusive
+        keyset cursor; versions are immutable and gap-free per envelope,
+        so a repeated cursor never yields duplicates or gaps. The cursor
+        carries its own kind tag, is HMAC-authenticated and is bound to
+        the tenant, workload and data_id, so it can be neither forged nor
+        replayed against another envelope, scope or query family. An
+        envelope that exists but has never been classified yields an
+        empty, complete page; unknown and cross-scope envelopes are
+        indistinguishable 404s. The handler issues only SELECTs of
+        classification metadata — never ciphertext, iv, tag, wrapped_key,
+        payload or any key — never writes, and a storage failure aborts
+        the whole request with a 500 rather than returning a half page.
+        """
+        _read_classification_scope(
+            request,
+            data_id,
+            tenant_id,
+            workload_id,
+            {"tenant_id", "workload_id", "cursor"},
+        )
+
+        # Omitted cursor or an explicit empty string starts at version 1.
+        # Whitespace, malformed, forged, cross-scope, cross-envelope or
+        # foreign-kind cursors are indistinguishable 422s and are rejected
+        # before any state is read.
+        boundary_version: int | None = None
+        if cursor is not None and cursor != "":
+            if not cursor.strip() or not _CURSOR_RE.fullmatch(cursor):
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            decoded_boundary = _decode_classification_history_cursor(
+                cursor, tenant_id, workload_id, data_id
+            )
+            if decoded_boundary is None:
+                raise HTTPException(status_code=422, detail="invalid cursor")
+            boundary_version = decoded_boundary
+
+        rows: list = []
+        try:
+            with session_factory() as session:
+                # The envelope must exist in exactly this scope; unknown
+                # and cross-scope data_ids are indistinguishable. Only a
+                # primary-key column is read for the existence probe —
+                # never the material columns.
+                envelope_id = session.scalar(
+                    select(DataEnvelope.data_id).where(
+                        DataEnvelope.tenant_id == tenant_id,
+                        DataEnvelope.workload_id == workload_id,
+                        DataEnvelope.data_id == data_id,
+                    )
+                )
+                if envelope_id is None:
+                    raise HTTPException(
+                        status_code=404, detail="data envelope not found"
+                    )
+                stmt = select(
+                    DataEnvelopeClassificationHistory.version,
+                    DataEnvelopeClassificationHistory.classification,
+                    DataEnvelopeClassificationHistory.updated_at,
+                ).where(
+                    DataEnvelopeClassificationHistory.tenant_id == tenant_id,
+                    DataEnvelopeClassificationHistory.workload_id == workload_id,
+                    DataEnvelopeClassificationHistory.data_id == data_id,
+                )
+                if boundary_version is not None:
+                    # Exclusive version keyset; versions are immutable and
+                    # gap-free, so the boundary walks the same stable set.
+                    stmt = stmt.where(
+                        DataEnvelopeClassificationHistory.version
+                        > boundary_version
+                    )
+                stmt = stmt.order_by(
+                    DataEnvelopeClassificationHistory.version.asc()
+                ).limit(CLASSIFICATION_HISTORY_PAGE_SIZE + 1)
+                # One extra row is the "more follows" probe. The scan is a
+                # single read-only statement: a storage failure aborts the
+                # whole request with a 500 rather than returning a partial
+                # page.
+                rows = list(session.execute(stmt).all())
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("data envelope classification history query failed")
+            raise HTTPException(
+                status_code=500, detail="classification unavailable"
+            )
+
+        has_more = len(rows) > CLASSIFICATION_HISTORY_PAGE_SIZE
+        page = rows[:CLASSIFICATION_HISTORY_PAGE_SIZE]
+
+        entries = [
+            {
+                # Exactly the three history fields, in fixed order; no
+                # envelope material, payload, key or scope columns.
+                "version": int(row.version),
+                "classification": row.classification,
+                "updated_at": _rfc3339(row.updated_at),
+            }
+            for row in page
+        ]
+
+        if has_more:
+            next_cursor = _encode_classification_history_cursor(
+                tenant_id, workload_id, data_id, int(page[-1].version)
+            )
+            complete = False
+        else:
+            next_cursor = ""
+            complete = True
+
+        # Compact container (classifications, next_cursor, complete) with
+        # a single terminating newline. version is a Python int and
+        # complete a boolean, so no floats, -0.0 or non-finite values can
+        # appear. No envelope material, payload, key or exception text is
+        # ever included.
+        body = (
+            json.dumps(
+                {
+                    "classifications": entries,
+                    "next_cursor": next_cursor,
+                    "complete": complete,
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(content=body, media_type="application/json")
 
     def _compact_json(payload: dict) -> Response:
         # Compact JSON, no trailing newline. Counts and key versions are

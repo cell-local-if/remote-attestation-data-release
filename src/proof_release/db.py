@@ -1258,6 +1258,78 @@ class DataEnvelopeIdempotencyRecord(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
+#: Finite, service-defined set of governance classification labels that may
+#: be registered against a data envelope. Classification is audit metadata
+#: only: it never participates in proving, policy evaluation, authorization
+#: or decryption, and it is stored beside — never inside — the envelope's
+#: material columns.
+CLASSIFICATION_PUBLIC = "public"
+CLASSIFICATION_INTERNAL = "internal"
+CLASSIFICATION_CONFIDENTIAL = "confidential"
+CLASSIFICATION_RESTRICTED = "restricted"
+CLASSIFICATION_CODES = frozenset(
+    {
+        CLASSIFICATION_PUBLIC,
+        CLASSIFICATION_INTERNAL,
+        CLASSIFICATION_CONFIDENTIAL,
+        CLASSIFICATION_RESTRICTED,
+    }
+)
+
+
+class DataEnvelopeClassification(Base):
+    """The current governance classification of one data envelope.
+
+    At most one row exists per ``(tenant_id, workload_id, data_id)`` — the
+    same composite key that scopes the envelope itself, so a classification
+    can never name an envelope outside its scope. ``version`` starts at 1
+    for the first registration and increments by exactly one on every
+    accepted update; it is the optimistic-concurrency token callers must
+    reproduce as ``expected_version`` to update. ``updated_at`` is the UTC
+    instant of the last accepted registration.
+
+    Every accepted write replaces this row and appends the matching
+    :class:`DataEnvelopeClassificationHistory` row in the same transaction,
+    so the current value and its history can never diverge or half-commit.
+    The row carries no payload, ciphertext, key material or exception text.
+    """
+
+    __tablename__ = "data_envelope_classifications"
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    data_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # One of the CLASSIFICATION_CODES labels.
+    classification: Mapped[str] = mapped_column(String(16))
+    # 1 for the first registration, strictly increasing by one per update.
+    version: Mapped[int] = mapped_column(BigInteger)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class DataEnvelopeClassificationHistory(Base):
+    """One immutable entry per accepted classification registration.
+
+    The composite primary key ``(tenant_id, workload_id, data_id,
+    version)`` makes every accepted version exactly one row, appended in
+    the same transaction as the current-value update it records; a lost
+    concurrency race inserts nothing. Entries are never updated or
+    deleted, so the ascending-version audit trail is complete and
+    gap-free. Entries carry no payload, ciphertext, key material or
+    exception text.
+    """
+
+    __tablename__ = "data_envelope_classification_history"
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    data_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # Matches the version the current-value row held right after this
+    # entry's registration committed; starts at 1 and is gap-free.
+    version: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    classification: Mapped[str] = mapped_column(String(16))
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class ReleaseGrant(Base):
     """A one-time, TTL-bounded capability that releases one data item.
 
