@@ -319,6 +319,76 @@ class Evidence(Base):
     )
 
 
+class EvidenceSubmissionIdempotencyRecord(Base):
+    """The first successful idempotency-keyed submission of one evidence.
+
+    At most one row exists per ``(tenant_id, workload_id,
+    idempotency_key)`` triple; the same key in a different tenant or
+    workload is an independent row and never conflicts. The row is
+    inserted in the *same* transaction as the winning pending -> consumed
+    challenge claim, the :class:`Evidence` row and the proof-received
+    lifecycle event, so a crash can never leave a consumed challenge or
+    an evidence row without its idempotency record, or a record pointing
+    at no evidence. A failed submission — a 404/401/409/410/422/500
+    judgement, a lost claim race, or any rollback — inserts no row, so
+    the key stays free and a later recovery re-judges the request
+    normally.
+
+    Once committed, a same-key same-scope replay of the same fields
+    answers with the stored first 201 verbatim: it never re-checks the
+    nonce, never consumes the challenge again, never creates a second
+    evidence row and never appends a second proof-received event — even
+    when the challenge has since expired. A same-key request whose
+    challenge, nonce, evidence format or evidence differs is a stable
+    422 that changes nothing.
+
+    Only the scope, the caller-chosen key, the identifiers, the format
+    descriptor, the two irreversible digests (the nonce digest and the
+    evidence SHA-256) and the exact first response body are persisted —
+    never the plaintext nonce or evidence.
+    """
+
+    __tablename__ = "evidence_submission_idempotency_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "workload_id",
+            "idempotency_key",
+            name="uq_evidence_submission_idempotency_scope_key",
+        ),
+    )
+
+    record_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(256), index=True)
+    workload_id: Mapped[str] = mapped_column(String(256))
+    # Caller-chosen key: 1..64 visible ASCII characters. Unique only
+    # within the (tenant, workload) scope; the same key in another scope
+    # is an independent row and never conflicts.
+    idempotency_key: Mapped[str] = mapped_column(String(64))
+    # Challenge consumed by the first legal keyed submission; one of the
+    # request fields a replay must match.
+    challenge_id: Mapped[str] = mapped_column(String(36), index=True)
+    # Evidence created by the first legal keyed submission; every later
+    # replay of this key answers with that same submission's original 201.
+    evidence_id: Mapped[str] = mapped_column(String(36))
+    # The (non-sensitive) format descriptor of the first submission; a
+    # replay carrying a different format is a same-key mismatch (422).
+    evidence_format: Mapped[str] = mapped_column(String(128))
+    # Hex SHA-256 digest of the presented nonce, exactly the value
+    # already held by the challenge; used only to detect a same-key
+    # request carrying a different nonce. The plaintext nonce never
+    # participates and is never stored.
+    nonce_digest: Mapped[str] = mapped_column(String(64))
+    # Hex SHA-256 of the evidence bytes; used only to detect a same-key
+    # request carrying different evidence. The plaintext evidence never
+    # participates and is never stored.
+    evidence_sha256: Mapped[str] = mapped_column(String(64))
+    # The exact first 201 response body, stored verbatim (compact JSON)
+    # and replayed byte-for-byte on every later same-key replay.
+    response_body: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class TrustRoot(Base):
     __tablename__ = "trust_roots"
     # A certificate is configured at most once per tenant and workload;

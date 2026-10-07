@@ -124,6 +124,7 @@ from proof_release.db import (
     DecisionCommitCounter,
     DecisionEvaluationNode,
     Evidence,
+    EvidenceSubmissionIdempotencyRecord,
     Policy,
     PolicyCommitCounter,
     PolicyIdempotencyRecord,
@@ -990,6 +991,35 @@ def _read_idempotency_key(request: Request) -> tuple[bool, str | None]:
     if len(raw_values) != 1 or not _IDEMPOTENCY_KEY_RE.fullmatch(raw_values[0]):
         raise HTTPException(status_code=422, detail="invalid idempotency key")
     return True, raw_values[0]
+
+
+_IDEMPOTENCY_MISMATCH_DETAIL = "idempotency key reused with a different request"
+_EVIDENCE_SUBMISSION_FAILED_DETAIL = "evidence submission failed"
+
+
+def _evidence_received_body(
+    evidence_id: str, challenge_id: str, received_at: datetime
+) -> str:
+    """Render the exact compact 201 evidence body stored for replay.
+
+    This is the wire form persisted verbatim by the first successful
+    idempotency-keyed submission and returned byte-for-byte on every
+    later same-key replay (including the original ``received_at``), so
+    its serialization must never depend on response-time clock or state.
+    The field order and compact shape match the unkeyed response model
+    exactly.
+    """
+    return json.dumps(
+        {
+            "evidence_id": evidence_id,
+            "challenge_id": challenge_id,
+            "status": "received",
+            "received_at": _rfc3339(received_at),
+        },
+        separators=(",", ":"),
+        allow_nan=False,
+        ensure_ascii=False,
+    )
 
 
 def _release_grant_consume_fingerprint(
@@ -6863,82 +6893,333 @@ def create_app(
 
         return _compact_json(payload)
 
+    def _submit_evidence_keyed(
+        body: SubmitEvidenceRequest,
+        idempotency_key: str,
+        digest: str,
+        evidence_digest: str,
+    ) -> Response:
+        """Submit one evidence under an ``Idempotency-Key``.
+
+        The challenge claim, the evidence row, the proof-received event
+        and the idempotency record are one atomic commit: the
+        lookup-then-insert runs in a single transaction, with the unique
+        (scope, key) constraint plus the IntegrityError reread below
+        settling concurrent identical retries so at most one submission
+        per key ever consumes a challenge or creates evidence. Every
+        judgement failure raises out of the context manager, which rolls
+        back, so a failed attempt leaves no consumed challenge, no
+        evidence, no event and no idempotency record, and the key stays
+        free for a recovered retry.
+        """
+
+        def _stored_record(session):
+            return session.scalar(
+                select(EvidenceSubmissionIdempotencyRecord).where(
+                    EvidenceSubmissionIdempotencyRecord.tenant_id
+                    == body.tenant_id,
+                    EvidenceSubmissionIdempotencyRecord.workload_id
+                    == body.workload_id,
+                    EvidenceSubmissionIdempotencyRecord.idempotency_key
+                    == idempotency_key,
+                )
+            )
+
+        def _replay(record) -> Response:
+            # A replay answers with the stored first 201 verbatim: it
+            # never re-judges the challenge or nonce (so expiry,
+            # consumption or any later change is irrelevant), appends no
+            # event and creates no second evidence. A same-key request
+            # outside the stored field identity is a stable 422 that
+            # likewise writes nothing. The identifiers and format are
+            # non-secret and may carry non-ASCII characters, so they use
+            # plain equality; only the hex digests warrant constant-time
+            # comparison — and neither plaintext is ever present.
+            if not (
+                record.challenge_id == body.challenge_id
+                and record.evidence_format == body.evidence_format
+                and hmac.compare_digest(record.nonce_digest, digest)
+                and hmac.compare_digest(record.evidence_sha256, evidence_digest)
+            ):
+                raise HTTPException(
+                    status_code=422, detail=_IDEMPOTENCY_MISMATCH_DETAIL
+                )
+            return Response(
+                content=record.response_body.encode("utf-8"),
+                status_code=201,
+                media_type="application/json",
+            )
+
+        saved_body: str | None = None
+        for _ in range(2):
+            with session_factory() as session:
+                try:
+                    existing = _stored_record(session)
+                    if existing is not None:
+                        return _replay(existing)
+                    # First keyed request for this scope+key. Judgement runs
+                    # in its existing order; every failure raises out of the
+                    # context manager, which rolls back, so no idempotency
+                    # row is left behind and the key stays free for a
+                    # recovered retry.
+                    now = _utcnow()
+                    evidence_id = str(uuid.uuid4())
+                    challenge = session.get(Challenge, body.challenge_id)
+                    if (
+                        challenge is None
+                        or challenge.tenant_id != body.tenant_id
+                        or challenge.workload_id != body.workload_id
+                    ):
+                        raise HTTPException(
+                            status_code=404, detail="challenge not found"
+                        )
+                    if not hmac.compare_digest(challenge.nonce_digest, digest):
+                        raise HTTPException(status_code=401, detail="invalid nonce")
+                    if challenge.status == "consumed":
+                        raise HTTPException(
+                            status_code=409, detail="challenge already consumed"
+                        )
+                    if challenge.expires_at <= now:
+                        raise HTTPException(status_code=410, detail="challenge expired")
+                    # Atomic claim shared with the keyless path: only one
+                    # concurrent caller can flip pending -> consumed, so
+                    # concurrent same-key retries can never settle the
+                    # challenge twice.
+                    result = session.execute(
+                        update(Challenge)
+                        .where(
+                            Challenge.challenge_id == body.challenge_id,
+                            Challenge.status == "pending",
+                            Challenge.expires_at > now,
+                        )
+                        .values(status="consumed", consumed_at=now)
+                        .execution_options(synchronize_session=False)
+                    )
+                    if result.rowcount != 1:
+                        # A concurrent submission consumed the challenge
+                        # first, or it expired between check and write. On
+                        # locking backends a same-key loser reaches here (its
+                        # pre-lock snapshot showed no record and a pending
+                        # challenge); because the winning claim and its
+                        # idempotency record are one commit, the record is
+                        # now visible when the winner carried this same key,
+                        # in which case this request is a replay (201) or a
+                        # same-key mismatch (422), never the state conflict
+                        # below. No record means a different key, a keyless
+                        # winner or an expiry: observe final state only.
+                        session.rollback()
+                        winner_record = _stored_record(session)
+                        if winner_record is not None:
+                            return _replay(winner_record)
+                        fresh = session.get(Challenge, body.challenge_id)
+                        if fresh is not None and fresh.status == "consumed":
+                            raise HTTPException(
+                                status_code=409,
+                                detail="challenge already consumed",
+                            )
+                        raise HTTPException(
+                            status_code=410, detail="challenge expired"
+                        )
+                    # The evidence itself is never persisted, only its
+                    # SHA-256 digest.
+                    session.add(
+                        Evidence(
+                            evidence_id=evidence_id,
+                            challenge_id=body.challenge_id,
+                            tenant_id=body.tenant_id,
+                            workload_id=body.workload_id,
+                            evidence_format=body.evidence_format,
+                            status="received",
+                            received_at=now,
+                            evidence_sha256=evidence_digest,
+                        )
+                    )
+                    # The proof-lifecycle reception event commits in the same
+                    # transaction as the evidence row and the idempotency
+                    # record, so it exists if and only if the reception did.
+                    session.add(
+                        ProofLifecycleEvent(
+                            event_id=str(uuid.uuid4()),
+                            tenant_id=body.tenant_id,
+                            workload_id=body.workload_id,
+                            event_type=PROOF_EVENT_TYPE_RECEIVED,
+                            evidence_id=evidence_id,
+                            commit_seq=_next_proof_event_commit_seq(
+                                session, body.tenant_id, body.workload_id
+                            ),
+                            policy_version=None,
+                            evidence_format=body.evidence_format,
+                            status=PROOF_EVENT_STATUS_RECEIVED,
+                            occurred_at=now,
+                        )
+                    )
+                    # The exact first 201 body, fixed before commit so the
+                    # stored response and the response returned to the winner
+                    # are byte-for-byte the same, including the original
+                    # received_at.
+                    saved_body = _evidence_received_body(
+                        evidence_id, body.challenge_id, now
+                    )
+                    session.add(
+                        EvidenceSubmissionIdempotencyRecord(
+                            record_id=str(uuid.uuid4()),
+                            tenant_id=body.tenant_id,
+                            workload_id=body.workload_id,
+                            idempotency_key=idempotency_key,
+                            challenge_id=body.challenge_id,
+                            evidence_id=evidence_id,
+                            evidence_format=body.evidence_format,
+                            nonce_digest=digest,
+                            evidence_sha256=evidence_digest,
+                            response_body=saved_body,
+                            created_at=now,
+                        )
+                    )
+                    # Challenge claim, evidence, event and idempotency
+                    # record commit together: a crash can never leave a
+                    # consumed challenge or evidence without the record
+                    # or a record pointing at no evidence.
+                    session.commit()
+                except HTTPException:
+                    raise
+                except IntegrityError:
+                    # A concurrent request for the same scope+key
+                    # committed first (the claim race above is the usual
+                    # path; this covers the unique-record race). Reread
+                    # its record on the next pass and answer as a replay
+                    # (verbatim 201) or a mismatch (422).
+                    session.rollback()
+                    continue
+                except Exception:
+                    # Any other persistence failure rolls the whole
+                    # submission back: no half-consumed challenge, no
+                    # evidence, no event and no key occupation, so the
+                    # identical request may succeed once storage recovers.
+                    session.rollback()
+                    logger.error("evidence submission write failed")
+                    raise HTTPException(
+                        status_code=500,
+                        detail=_EVIDENCE_SUBMISSION_FAILED_DETAIL,
+                    )
+                break
+        else:  # pragma: no cover - defensive: the reread always settles
+            logger.error("evidence submission idempotency race did not settle")
+            raise HTTPException(
+                status_code=500, detail=_EVIDENCE_SUBMISSION_FAILED_DETAIL
+            )
+
+        assert saved_body is not None
+        return Response(
+            content=saved_body.encode("utf-8"),
+            status_code=201,
+            media_type="application/json",
+        )
+
     @app.post("/v1/evidence", status_code=201, response_model=EvidenceReceivedResponse)
-    def submit_evidence(body: SubmitEvidenceRequest) -> EvidenceReceivedResponse:
+    def submit_evidence(
+        request: Request, body: SubmitEvidenceRequest
+    ) -> EvidenceReceivedResponse | Response:
         digest = _nonce_digest(body.nonce)
         evidence_digest = hashlib.sha256(body.evidence.encode("utf-8")).hexdigest()
+        # The idempotency key is optional and lives only in a header; the
+        # body contract is unchanged. A missing key preserves the original
+        # one-submission-per-challenge semantics exactly. A present but
+        # illegal key (a duplicated header line, an empty value,
+        # surrounding whitespace, a control or non-ASCII character, or an
+        # over-long value) is rejected here, after body validation and
+        # before any challenge read or write, so an invalid key never
+        # consumes a challenge, creates evidence or writes a record.
+        idem_present, idempotency_key = _read_idempotency_key(request)
+        if idem_present:
+            return _submit_evidence_keyed(
+                body, idempotency_key, digest, evidence_digest
+            )
+
         now = _utcnow()
         evidence_id = str(uuid.uuid4())
         with session_factory() as session:
-            challenge = session.get(Challenge, body.challenge_id)
-            if (
-                challenge is None
-                or challenge.tenant_id != body.tenant_id
-                or challenge.workload_id != body.workload_id
-            ):
-                raise HTTPException(status_code=404, detail="challenge not found")
-            if not hmac.compare_digest(challenge.nonce_digest, digest):
-                raise HTTPException(status_code=401, detail="invalid nonce")
-            if challenge.status == "consumed":
-                raise HTTPException(status_code=409, detail="challenge already consumed")
-            if challenge.expires_at <= now:
-                raise HTTPException(status_code=410, detail="challenge expired")
-            # Atomic claim: only one concurrent submission can flip pending -> consumed.
-            result = session.execute(
-                update(Challenge)
-                .where(
-                    Challenge.challenge_id == body.challenge_id,
-                    Challenge.status == "pending",
-                    Challenge.expires_at > now,
-                )
-                .values(status="consumed", consumed_at=now)
-                .execution_options(synchronize_session=False)
-            )
-            if result.rowcount != 1:
-                session.rollback()
-                fresh = session.get(Challenge, body.challenge_id)
-                if fresh is not None and fresh.status == "consumed":
-                    raise HTTPException(
-                        status_code=409, detail="challenge already consumed"
+            try:
+                challenge = session.get(Challenge, body.challenge_id)
+                if (
+                    challenge is None
+                    or challenge.tenant_id != body.tenant_id
+                    or challenge.workload_id != body.workload_id
+                ):
+                    raise HTTPException(status_code=404, detail="challenge not found")
+                if not hmac.compare_digest(challenge.nonce_digest, digest):
+                    raise HTTPException(status_code=401, detail="invalid nonce")
+                if challenge.status == "consumed":
+                    raise HTTPException(status_code=409, detail="challenge already consumed")
+                if challenge.expires_at <= now:
+                    raise HTTPException(status_code=410, detail="challenge expired")
+                # Atomic claim: only one concurrent submission can flip pending -> consumed.
+                result = session.execute(
+                    update(Challenge)
+                    .where(
+                        Challenge.challenge_id == body.challenge_id,
+                        Challenge.status == "pending",
+                        Challenge.expires_at > now,
                     )
-                raise HTTPException(status_code=410, detail="challenge expired")
-            # The evidence itself is never persisted, only its SHA-256 digest.
-            session.add(
-                Evidence(
-                    evidence_id=evidence_id,
-                    challenge_id=body.challenge_id,
-                    tenant_id=body.tenant_id,
-                    workload_id=body.workload_id,
-                    evidence_format=body.evidence_format,
-                    status="received",
-                    received_at=now,
-                    evidence_sha256=evidence_digest,
+                    .values(status="consumed", consumed_at=now)
+                    .execution_options(synchronize_session=False)
                 )
-            )
-            # The proof-lifecycle reception event commits in the same
-            # transaction as the evidence row, so it exists if and only if
-            # the reception did. Only identifiers, the fixed received
-            # status, the (non-sensitive) format descriptor and a
-            # timestamp are recorded — never the evidence, nonce or claims.
-            # Its per-scope commit sequence fixes the event's snapshot
-            # position to this transaction's commit boundary.
-            session.add(
-                ProofLifecycleEvent(
-                    event_id=str(uuid.uuid4()),
-                    tenant_id=body.tenant_id,
-                    workload_id=body.workload_id,
-                    event_type=PROOF_EVENT_TYPE_RECEIVED,
-                    evidence_id=evidence_id,
-                    commit_seq=_next_proof_event_commit_seq(
-                        session, body.tenant_id, body.workload_id
-                    ),
-                    policy_version=None,
-                    evidence_format=body.evidence_format,
-                    status=PROOF_EVENT_STATUS_RECEIVED,
-                    occurred_at=now,
+                if result.rowcount != 1:
+                    session.rollback()
+                    fresh = session.get(Challenge, body.challenge_id)
+                    if fresh is not None and fresh.status == "consumed":
+                        raise HTTPException(
+                            status_code=409, detail="challenge already consumed"
+                        )
+                    raise HTTPException(status_code=410, detail="challenge expired")
+                # The evidence itself is never persisted, only its SHA-256 digest.
+                session.add(
+                    Evidence(
+                        evidence_id=evidence_id,
+                        challenge_id=body.challenge_id,
+                        tenant_id=body.tenant_id,
+                        workload_id=body.workload_id,
+                        evidence_format=body.evidence_format,
+                        status="received",
+                        received_at=now,
+                        evidence_sha256=evidence_digest,
+                    )
                 )
-            )
-            session.commit()
+                # The proof-lifecycle reception event commits in the same
+                # transaction as the evidence row, so it exists if and only if
+                # the reception did. Only identifiers, the fixed received
+                # status, the (non-sensitive) format descriptor and a
+                # timestamp are recorded — never the evidence, nonce or claims.
+                # Its per-scope commit sequence fixes the event's snapshot
+                # position to this transaction's commit boundary.
+                session.add(
+                    ProofLifecycleEvent(
+                        event_id=str(uuid.uuid4()),
+                        tenant_id=body.tenant_id,
+                        workload_id=body.workload_id,
+                        event_type=PROOF_EVENT_TYPE_RECEIVED,
+                        evidence_id=evidence_id,
+                        commit_seq=_next_proof_event_commit_seq(
+                            session, body.tenant_id, body.workload_id
+                        ),
+                        policy_version=None,
+                        evidence_format=body.evidence_format,
+                        status=PROOF_EVENT_STATUS_RECEIVED,
+                        occurred_at=now,
+                    )
+                )
+                # The claim, evidence row and event commit together: any
+                # write failure rolls the whole submission back, leaving
+                # no half state, and the caller may retry unchanged once
+                # storage recovers.
+                session.commit()
+            except HTTPException:
+                raise
+            except Exception:
+                session.rollback()
+                logger.error("evidence submission write failed")
+                raise HTTPException(
+                    status_code=500, detail=_EVIDENCE_SUBMISSION_FAILED_DETAIL
+                )
         return EvidenceReceivedResponse(
             evidence_id=evidence_id,
             challenge_id=body.challenge_id,
