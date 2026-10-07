@@ -1165,6 +1165,93 @@ class DataEnvelope(Base):
     commit_seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
 
+#: Finite, service-defined set of data-envelope governance
+#: classifications. A classification is audit metadata only: it never
+#: participates in proving, policy evaluation, authorization or
+#: decryption, and it never changes the envelope's material, key version
+#: or directory ordering.
+CLASSIFICATION_PUBLIC = "public"
+CLASSIFICATION_INTERNAL = "internal"
+CLASSIFICATION_CONFIDENTIAL = "confidential"
+CLASSIFICATION_RESTRICTED = "restricted"
+CLASSIFICATION_CODES = frozenset(
+    {
+        CLASSIFICATION_PUBLIC,
+        CLASSIFICATION_INTERNAL,
+        CLASSIFICATION_CONFIDENTIAL,
+        CLASSIFICATION_RESTRICTED,
+    }
+)
+
+
+class DataEnvelopeClassification(Base):
+    """The current governance classification of one data envelope.
+
+    Exactly one row exists per ``(tenant_id, workload_id, data_id)`` once
+    the envelope has been classified; an envelope without a row is
+    unclassified (version 0). The row is governance audit metadata only:
+    it is never consulted by proving, policy evaluation, authorization or
+    decryption and it carries no payload, key or envelope material.
+
+    ``version`` starts at 1 on the first registration and increases by
+    exactly one per committed reclassification; every update is a guarded
+    compare-and-swap on the stored version, so two concurrent requests
+    that both name the same ``expected_version`` settle exactly once and
+    the loser observes a conflict without overwriting the winner.
+    ``updated_at`` is the commit time of the transition that produced the
+    current version. Every committed transition also appends one
+    :class:`DataEnvelopeClassificationEvent` row in the same transaction,
+    so the current value and its history can never diverge.
+    """
+
+    __tablename__ = "data_envelope_classifications"
+
+    # Mirrors the envelope's composite primary key: a classification never
+    # crosses tenants or workloads, and an unknown or cross-scope
+    # (scope, data_id) is indistinguishable from a missing envelope.
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    data_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # One of CLASSIFICATION_*; a fixed, service-defined code only.
+    classification: Mapped[str] = mapped_column(String(16))
+    # 1 for the first registration, increasing by exactly one per
+    # committed reclassification; the optimistic-concurrency guard.
+    version: Mapped[int] = mapped_column(BigInteger)
+    # Commit time of the transition that produced the current version.
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class DataEnvelopeClassificationEvent(Base):
+    """One immutable entry in one envelope's classification history.
+
+    A row is inserted in the *same* committed transaction as the
+    :class:`DataEnvelopeClassification` transition it records, so exactly
+    one row exists per committed version of an envelope's classification:
+    a request that fails, rolls back, or loses the guarded version race
+    leaves no row, and the table is never updated or deleted by the
+    service. ``version`` is the transition's resulting version (1 for the
+    first registration), so the composite primary key is also the stable
+    ascending listing key and two concurrent winners can never mint the
+    same version.
+
+    Only the scope, the envelope identifier, the version, the fixed
+    classification code and the commit timestamp are stored — never a
+    payload, key, envelope material or exception text.
+    """
+
+    __tablename__ = "data_envelope_classification_events"
+
+    tenant_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    data_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    # The version this transition committed; gap-free per envelope from 1.
+    version: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    # One of CLASSIFICATION_*; a fixed, service-defined code only.
+    classification: Mapped[str] = mapped_column(String(16))
+    # Commit time of the recorded transition.
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class DataEnvelopeCommitCounter(Base):
     """Per-scope monotonic allocator for data-envelope ``commit_seq``.
 
