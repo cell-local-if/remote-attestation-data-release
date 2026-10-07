@@ -7484,6 +7484,93 @@ def create_app(
             verified_at=_rfc3339(verified_at),
         )
 
+    @app.get("/v1/evidence/{evidence_id}")
+    def get_evidence_status(
+        request: Request,
+        evidence_id: str,
+        _empty_body: None = Depends(_require_empty_query_body),
+    ) -> Response:
+        """Return the read-only current state of one submitted evidence.
+
+        The state is the committed evidence row verbatim: ``received``
+        before the first verification settles it, then ``verified`` or
+        ``rejected`` with the first settlement's timestamp and result
+        code. Every shape defect — a path identifier that is not a
+        canonical lowercase UUID, a missing, blank or repeated
+        ``tenant_id``/``workload_id``, or any other query parameter — is
+        one indistinguishable 422 raised before storage is touched. An
+        unknown evidence and one outside the two scope parameters are one
+        indistinguishable 404: the response never reveals whether the
+        identifier exists under another tenant or workload.
+
+        The handler issues only SELECTs: it runs no verifier, consumes no
+        challenge, verification-admission, release or rate-limit budget,
+        appends no event, audit or idempotency record and writes back no
+        derived state. The response carries no nonce, nonce digest,
+        evidence or evidence digest, plugin text, exception detail or
+        private material. A storage read failure is a sanitized 500 with
+        no partial state.
+        """
+        # --- request shape (all 422, no storage touched) ----------------
+        allowed_params = {"tenant_id", "workload_id"}
+        supplied = request.query_params.multi_items()
+        supplied_keys = {key for key, _ in supplied}
+        if supplied_keys - allowed_params:
+            raise HTTPException(status_code=422, detail="invalid evidence query")
+        # Each scope parameter is a single scalar string; a repeated
+        # parameter (a multi-valued/list value) is the wrong shape, not a
+        # silently last-wins scalar.
+        if len(supplied) != len(supplied_keys):
+            raise HTTPException(status_code=422, detail="invalid evidence query")
+        tenant_id = request.query_params.get("tenant_id")
+        workload_id = request.query_params.get("workload_id")
+        if (
+            not _UUID_RE.fullmatch(evidence_id)
+            or tenant_id is None
+            or workload_id is None
+            or not tenant_id.strip()
+            or not workload_id.strip()
+        ):
+            raise HTTPException(status_code=422, detail="invalid evidence query")
+
+        # One read-only transaction over the evidence row against one
+        # committed snapshot: a concurrent verification that commits first
+        # is the conclusion this query reports, and repeating the query
+        # against the same storage state returns the identical bytes.
+        # Nothing is written or locked for update.
+        try:
+            with session_factory() as session:
+                evidence = session.get(Evidence, evidence_id)
+                if (
+                    evidence is None
+                    or evidence.tenant_id != tenant_id
+                    or evidence.workload_id != workload_id
+                ):
+                    # Unknown and cross-scope evidence are indistinguishable.
+                    raise HTTPException(status_code=404, detail="evidence not found")
+                payload = {
+                    "evidence_id": evidence.evidence_id,
+                    "challenge_id": evidence.challenge_id,
+                    "evidence_format": evidence.evidence_format,
+                    "status": evidence.status,
+                    "received_at": _rfc3339(evidence.received_at),
+                    "verified_at": (
+                        _rfc3339(evidence.verified_at)
+                        if evidence.verified_at is not None
+                        else None
+                    ),
+                    "verification_result": evidence.verification_result,
+                }
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("evidence status query failed")
+            raise HTTPException(
+                status_code=500, detail="evidence status unavailable"
+            )
+
+        return _compact_json(payload)
+
     @app.post(
         "/v1/trust-roots", status_code=201, response_model=TrustRootCreatedResponse
     )
