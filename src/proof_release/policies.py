@@ -8,9 +8,10 @@ claim name or an object path and carry exactly one comparison key::
     {"path": ["items", {"wildcard": True}, "id"], "equals": <scalar>}
     {"claim": "...", "in": [<scalar>, ...]}        # 1..32 unique scalars
     {"claim": "...", "contains": <scalar>}          # array has an equal element
+    {"claim": "...", "contains_any": [<scalar>, ...]}  # array hits >=1 of 1..32
     {"claim": "...", "lt"|"lte"|"gt"|"gte": <finite JSON number>}
     {"claim": "...", "exists": true}
-    {"path": [...], "in"|"contains"|"lt"|"lte"|"gt"|"gte"|"exists": ...}
+    {"path": [...], "in"|"contains"|"contains_any"|"lt"|"lte"|"gt"|"gte"|"exists": ...}
     {"all": [rule, ...]}
     {"any": [rule, ...]}
     {"not": rule}
@@ -61,14 +62,15 @@ MAX_RULE_NODES = 256
 MAX_PATH_SEGMENTS = 8
 MAX_PATH_SEGMENT_LENGTH = 128
 
-#: Bound on the candidate set of an ``in`` leaf so an unbounded set can
-#: never enter persisted state.
+#: Bound on the candidate set of an ``in`` or ``contains_any`` leaf so an
+#: unbounded set can never enter persisted state.
 MAX_IN_ITEMS = 32
 
 #: The comparison keys a leaf may carry exactly one of, next to its
 #: ``claim``/``path`` locator.
 _COMPARISON_KEYS = frozenset(
-    {"equals", "in", "contains", "lt", "lte", "gt", "gte", "exists"}
+    {"equals", "in", "contains", "contains_any", "lt", "lte", "gt", "gte",
+     "exists"}
 )
 
 #: Comparison keys that order the actual value against one JSON number.
@@ -173,6 +175,25 @@ def _scalar_equals(actual: Any, expected: Any) -> bool:
     return False
 
 
+def _validate_scalar_candidates(key: str, value: Any) -> None:
+    """Validate a 1..32 list of unique scalars for ``in``/``contains_any``.
+
+    Candidates must not repeat under the same type-strict equality the
+    evaluator applies: 1 and 1.0 repeat, 1 and true do not.
+    """
+    if not isinstance(value, list) or not value:
+        raise InvalidRule(f"{key} must be a non-empty list of scalars")
+    if len(value) > MAX_IN_ITEMS:
+        raise InvalidRule(f"{key} may name at most {MAX_IN_ITEMS} candidates")
+    for item in value:
+        if not _is_scalar(item):
+            raise InvalidRule(f"{key} candidates must be scalars")
+    for index in range(len(value)):
+        for earlier in value[:index]:
+            if _scalar_equals(value[index], earlier):
+                raise InvalidRule(f"{key} candidates must not repeat")
+
+
 def _validate_comparison(key: str, value: Any) -> None:
     """Validate the comparison value of a leaf against its comparison key."""
     if key == "equals":
@@ -185,20 +206,8 @@ def _validate_comparison(key: str, value: Any) -> None:
         if not _is_scalar(value):
             raise InvalidRule("contains must compare against a scalar")
         return
-    if key == "in":
-        if not isinstance(value, list) or not value:
-            raise InvalidRule("in must be a non-empty list of scalars")
-        if len(value) > MAX_IN_ITEMS:
-            raise InvalidRule(f"in may name at most {MAX_IN_ITEMS} candidates")
-        for item in value:
-            if not _is_scalar(item):
-                raise InvalidRule("in candidates must be scalars")
-        # Candidates must not repeat under the same type-strict equality
-        # the evaluator applies: 1 and 1.0 repeat, 1 and true do not.
-        for index in range(len(value)):
-            for earlier in value[:index]:
-                if _scalar_equals(value[index], earlier):
-                    raise InvalidRule("in candidates must not repeat")
+    if key in ("in", "contains_any"):
+        _validate_scalar_candidates(key, value)
         return
     if key in _ORDER_KEYS:
         if not _is_number(value):
@@ -216,9 +225,9 @@ def validate_rule(rule: Any) -> dict[str, Any]:
 
     Raises :class:`InvalidRule` for anything that is not exactly one of the
     documented forms: unknown node keys, multiple/unknown keys on a node,
-    missing siblings, non-scalar comparisons, malformed ``in`` sets
-    (empty, oversized, non-scalar or repeating), a non-scalar
-    ``contains`` target, boolean or non-finite
+    missing siblings, non-scalar comparisons, malformed ``in`` or
+    ``contains_any`` sets (empty, oversized, non-scalar or repeating), a
+    non-scalar ``contains`` target, boolean or non-finite
     ordinal bounds, an ``exists`` value other than ``true``, empty
     ``all``/``any`` lists, malformed ``path`` siblings (including an
     object segment that is not exactly ``{"wildcard": True}``), or
@@ -337,7 +346,11 @@ def evaluate_rule(rule: dict[str, Any], claims: dict[str, Any]) -> bool:
     itself to be a JSON array holding at least one element equal to the
     expected scalar under that same type-strict equality; a missing value,
     a non-array (including a bare scalar) or an empty/non-matching array
-    all fail. ``exists`` checks whether the claim key
+    all fail. ``contains_any`` generalizes that membership test to a
+    candidate set: the located value must be a JSON array and at least one
+    of its elements must equal at least one candidate scalar under the
+    same type-strict equality, with the same missing/non-array/empty
+    failures. ``exists`` checks whether the claim key
     or the full object path is readable at all; a ``null`` value there
     still exists. A path leaf carrying wildcard segments is true when
     *any* of its complete candidates satisfies the leaf comparison
@@ -379,6 +392,19 @@ def evaluate_rule(rule: dict[str, Any], claims: dict[str, Any]) -> bool:
                 and any(
                     _scalar_equals(element, rule["contains"])
                     for element in actual
+                )
+                for actual in actuals
+            )
+        if comparison == "contains_any":
+            # Like ``contains`` against a candidate set: only an actual
+            # JSON array can hit, and only its scalar elements can equal
+            # a candidate — objects and arrays never do.
+            return any(
+                isinstance(actual, list)
+                and any(
+                    _scalar_equals(element, candidate)
+                    for element in actual
+                    for candidate in rule["contains_any"]
                 )
                 for actual in actuals
             )
