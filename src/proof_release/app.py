@@ -132,6 +132,7 @@ from proof_release.db import (
     ProofLifecycleEvent,
     RateLimitCounter,
     ReleaseGrant,
+    ReleaseGrantBulkRevokeIdempotencyRecord,
     ReleaseGrantConsumeIdempotencyRecord,
     ReleaseGrantEvent,
     ReleaseGrantRevokeIdempotencyRecord,
@@ -1139,6 +1140,146 @@ def _release_grant_revoked_body(
             "data_id": data_id,
             "revoked": True,
             "revoked_at": _rfc3339(revoked_at),
+        },
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+#: A bulk revoke batch carries one to this many distinct grant entries.
+BULK_REVOKE_MAX_GRANTS = 100
+
+
+def _parse_bulk_revoke_request(
+    raw: bytes,
+) -> tuple[str, str, list[tuple[str, str]]]:
+    """Validate a bulk revoke body purely on its request shape.
+
+    Runs before any budget reservation, grant read or write. The body
+    must be a JSON object carrying exactly ``tenant_id``, ``workload_id``
+    and ``grants``; the scope strings must be non-blank (but, as on the
+    consume/revoke paths, are otherwise used verbatim); ``grants`` must
+    be a list of one to :data:`BULK_REVOKE_MAX_GRANTS` objects, each
+    carrying exactly a canonical lowercase UUID ``grant_id`` (surrounding
+    whitespace and uppercase hex are normalized exactly as on the
+    single-grant revoke path) and an unpadded-base64url ``capability``,
+    with no repeated grant id. Any other shape — malformed JSON, a
+    non-object body, an unknown or missing field, a wrong type, a bad
+    UUID or capability format, an empty or over-long list, or a
+    duplicate grant id — raises the single indistinguishable 422.
+    Returns the scope verbatim plus the grant entries sorted ascending
+    by grant id (the order in which they are judged and reported).
+    """
+    invalid = HTTPException(
+        status_code=422, detail="invalid bulk revoke request"
+    )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+        raise invalid
+    if not isinstance(payload, dict) or set(payload) != {
+        "tenant_id",
+        "workload_id",
+        "grants",
+    }:
+        raise invalid
+    tenant_id = payload["tenant_id"]
+    workload_id = payload["workload_id"]
+    raw_entries = payload["grants"]
+    if (
+        not isinstance(tenant_id, str)
+        or not tenant_id.strip()
+        or not isinstance(workload_id, str)
+        or not workload_id.strip()
+    ):
+        raise invalid
+    if not isinstance(raw_entries, list) or not (
+        1 <= len(raw_entries) <= BULK_REVOKE_MAX_GRANTS
+    ):
+        raise invalid
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for item in raw_entries:
+        if not isinstance(item, dict) or set(item) != {
+            "grant_id",
+            "capability",
+        }:
+            raise invalid
+        grant_id = item["grant_id"]
+        capability = item["capability"]
+        if (
+            not isinstance(grant_id, str)
+            or not grant_id.strip()
+            or not _UUID_RE.fullmatch(grant_id.strip().lower())
+        ):
+            raise invalid
+        grant_id = grant_id.strip().lower()
+        if (
+            not isinstance(capability, str)
+            or not capability
+            or not _NONCE_RE.fullmatch(capability)
+        ):
+            raise invalid
+        if grant_id in seen:
+            raise invalid
+        seen.add(grant_id)
+        entries.append((grant_id, capability))
+    entries.sort(key=lambda entry: entry[0])
+    return tenant_id, workload_id, entries
+
+
+def _bulk_revoke_fingerprint(
+    tenant_id: str,
+    workload_id: str,
+    entries: list[tuple[str, str]],
+) -> str:
+    """Hash the request identity a keyed bulk revoke replay must match.
+
+    Covers exactly the equivalence range fixed by the contract: the
+    scope and the batch in its fixed lexicographic order, pairing each
+    normalized grant id with the capability *digest* presented for it.
+    Only this non-sensitive identity is hashed — plaintext capabilities
+    never participate and are not recoverable from the digest. Canonical
+    JSON with sorted keys makes equivalent requests hash identically.
+    """
+    payload = json.dumps(
+        {
+            "tenant_id": tenant_id,
+            "workload_id": workload_id,
+            "grants": [[grant_id, digest] for grant_id, digest in entries],
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _bulk_revoke_body(
+    tenant_id: str,
+    workload_id: str,
+    revoked_at: datetime,
+    grants: list[tuple[str, str, str]],
+) -> str:
+    """Render the exact compact 200 bulk revoke body stored for replay.
+
+    ``grants`` are the ``(grant_id, decision_id, data_id)`` triples in
+    ascending grant id order. This is the wire form persisted verbatim
+    by the first successful idempotency-keyed bulk revoke and returned
+    byte-for-byte on every later same-key replay (including the original
+    shared ``revoked_at``), so its serialization never depends on
+    response-time clock or state. Only identifiers are rendered: never a
+    capability, payload, evidence, claim or key.
+    """
+    return json.dumps(
+        {
+            "tenant_id": tenant_id,
+            "workload_id": workload_id,
+            "revoked_count": len(grants),
+            "revoked_at": _rfc3339(revoked_at),
+            "revoked_grants": [
+                {"grant_id": grant_id, "decision_id": decision_id, "data_id": data_id}
+                for grant_id, decision_id, data_id in grants
+            ],
         },
         separators=(",", ":"),
         allow_nan=False,
@@ -14948,6 +15089,360 @@ def create_app(
         else:  # pragma: no cover - defensive: the reread always settles
             logger.error("release grant revoke idempotency race did not settle")
             raise HTTPException(status_code=500, detail="grant unavailable")
+
+        assert saved_body is not None
+        return Response(
+            content=saved_body.encode("utf-8"),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def _require_bulk_revoke_body(
+        request: Request,
+    ) -> tuple[str, str, list[tuple[str, str]]]:
+        # Read the raw body directly (rather than trusting
+        # Content-Length) and validate it purely on its wire shape, so
+        # every malformed request — including malformed JSON or a
+        # non-object body — is the single indistinguishable 422 raised
+        # before the idempotency header check, the budget reservation
+        # and any grant read or write.
+        raw = await request.body()
+        return _parse_bulk_revoke_request(raw)
+
+    @app.post("/v1/release-grants/bulk-revoke")
+    def bulk_revoke_release_grants(
+        request: Request,
+        parsed: tuple[str, str, list[tuple[str, str]]] = Depends(
+            _require_bulk_revoke_body
+        ),
+    ) -> Response:
+        tenant_id, workload_id, entries = parsed
+
+        # As on the single-grant endpoints, the optional idempotency key
+        # lives only in a header; an illegal key is a 422 raised after the
+        # body checks but before the budget reservation or any storage
+        # access, so it never spends quota and touches nothing.
+        idem_present, idempotency_key = _read_idempotency_key(request)
+
+        # One admitted bulk request draws exactly one shared per-scope
+        # minute slot, regardless of batch size: a batch of one hundred
+        # costs no more than a single revoke, and a 429 changes no state.
+        # A keyed replay draws a slot just like any other admitted
+        # request; once admitted, the replay never re-judges a grant.
+        limited = _consume_grant_budget(tenant_id, workload_id)
+        if limited is not None:
+            return limited
+        now = _utcnow()
+        # Entries are already unique and sorted ascending by grant id;
+        # precompute the capability digests (the plaintext capability is
+        # used only for this comparison and the fingerprint, never logged
+        # or persisted).
+        judged = [
+            (grant_id, capability, _nonce_digest(capability))
+            for grant_id, capability in entries
+        ]
+        grant_ids = [grant_id for grant_id, _, _ in judged]
+
+        class _ReplayWinner(Exception):
+            # A same-key loser on a locking backend observed the winner's
+            # commit at the guarded UPDATE rather than at its own record
+            # insert; carry the winner's stored record to answer as a
+            # replay instead of as a state conflict.
+            def __init__(self, record) -> None:
+                self.record = record
+
+        def _judge_batch(session) -> dict:
+            # Load every named grant in one read and judge them in
+            # lexicographic order. Within a grant the precedence is
+            # exactly that of the single-grant revoke — unknown/cross
+            # scope (404), capability mismatch (401), consumed (409),
+            # revoked (409), expired while pending (410) — and the first
+            # grant in sorted order that fails fails the whole batch.
+            rows = {
+                row.grant_id: row
+                for row in session.scalars(
+                    select(ReleaseGrant).where(
+                        ReleaseGrant.grant_id.in_(grant_ids)
+                    )
+                )
+            }
+            for grant_id, _, digest in judged:
+                grant = rows.get(grant_id)
+                if (
+                    grant is None
+                    or grant.tenant_id != tenant_id
+                    or grant.workload_id != workload_id
+                ):
+                    raise HTTPException(
+                        status_code=404, detail="grant not found"
+                    )
+                if not hmac.compare_digest(grant.capability_digest, digest):
+                    raise HTTPException(
+                        status_code=401, detail="invalid capability"
+                    )
+                if grant.status == RELEASE_GRANT_STATUS_CONSUMED:
+                    raise HTTPException(
+                        status_code=409, detail="grant already consumed"
+                    )
+                if grant.status == RELEASE_GRANT_STATUS_REVOKED:
+                    raise HTTPException(
+                        status_code=409, detail="grant already revoked"
+                    )
+                if grant.expires_at <= now:
+                    raise HTTPException(
+                        status_code=410, detail="grant expired"
+                    )
+            return rows
+
+        def _settle_batch(session, rows: dict, winner_lookup=None) -> str:
+            # All grants passed judgement while unexpired and pending.
+            # One guarded statement settles the entire batch atomically,
+            # sharing a single revoked_at: BEGIN IMMEDIATE (SQLite) / row
+            # locks (other backends) plus the status guard guarantee that
+            # a concurrent consume, release or single/bulk revoke can
+            # never settle one of these rows first without this UPDATE
+            # reporting it through a short rowcount.
+            result = session.execute(
+                update(ReleaseGrant)
+                .where(
+                    ReleaseGrant.grant_id.in_(grant_ids),
+                    ReleaseGrant.status == RELEASE_GRANT_STATUS_PENDING,
+                    ReleaseGrant.expires_at > now,
+                )
+                .values(
+                    status=RELEASE_GRANT_STATUS_REVOKED, revoked_at=now
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if result.rowcount != len(judged):
+                # A concurrent settlement or an expiry crossed between
+                # the judgement read and the write. Nothing was written;
+                # observe the final state only and report the first
+                # offending grant in the same sorted order and
+                # precedence, writing nothing.
+                session.rollback()
+                # On a keyed request, the concurrent winner may carry the
+                # same key: its settlement and idempotency record are one
+                # commit (now visible after the rollback), in which case
+                # this request is a replay (verbatim 200) or a same-key
+                # mismatch (409), never a state conflict. No record means
+                # a keyless winner, a consume/release, another key, or an
+                # expiry: fall through to the state observation.
+                if winner_lookup is not None:
+                    winner_record = winner_lookup()
+                    if winner_record is not None:
+                        raise _ReplayWinner(winner_record)
+                fresh = {
+                    row.grant_id: row
+                    for row in session.scalars(
+                        select(ReleaseGrant).where(
+                            ReleaseGrant.grant_id.in_(grant_ids)
+                        )
+                    )
+                }
+                for grant_id, _, _ in judged:
+                    grant = fresh.get(grant_id)
+                    if (
+                        grant is None
+                        or grant.tenant_id != tenant_id
+                        or grant.workload_id != workload_id
+                    ):
+                        raise HTTPException(
+                            status_code=404, detail="grant not found"
+                        )
+                    if grant.status == RELEASE_GRANT_STATUS_CONSUMED:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="grant already consumed",
+                        )
+                    if grant.status == RELEASE_GRANT_STATUS_REVOKED:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="grant already revoked",
+                        )
+                    if grant.expires_at <= now:
+                        raise HTTPException(
+                            status_code=410, detail="grant expired"
+                        )
+                # Defensive: the short rowcount must correspond to one of
+                # the observable states above.
+                logger.error("bulk revoke settlement did not settle")
+                raise HTTPException(
+                    status_code=500, detail="grant unavailable"
+                )
+            # The winning settlement: one reason-"revoked" timeline event
+            # and one revoked compliance audit per grant, in grant id
+            # order, all in this one transaction together with the
+            # guarded status flip. The audit chain head advances once per
+            # grant, so the batch leaves one contiguous chain run.
+            revoked_rows: list[tuple[str, str, str]] = []
+            for grant_id, _, _ in judged:
+                grant = rows[grant_id]
+                _record_release_grant_event(
+                    session,
+                    tenant_id=tenant_id,
+                    workload_id=workload_id,
+                    grant_id=grant_id,
+                    old_status=RELEASE_GRANT_STATUS_PENDING,
+                    new_status=RELEASE_GRANT_STATUS_REVOKED,
+                    reason=RELEASE_GRANT_EVENT_REASON_REVOKED,
+                    now=now,
+                )
+                _append_audit_event(
+                    session,
+                    tenant_id=tenant_id,
+                    workload_id=workload_id,
+                    event_type=AUDIT_EVENT_TYPE_GRANT,
+                    grant_id=grant_id,
+                    decision_id=grant.decision_id,
+                    data_id=grant.data_id,
+                    status=AUDIT_EVENT_STATUS_REVOKED,
+                    capability_sha256=grant.capability_digest,
+                    occurred_at=now,
+                )
+                revoked_rows.append(
+                    (grant_id, grant.decision_id, grant.data_id)
+                )
+            return _bulk_revoke_body(
+                tenant_id, workload_id, now, revoked_rows
+            )
+
+        if not idem_present:
+            try:
+                with session_factory() as session:
+                    rows = _judge_batch(session)
+                    saved_body = _settle_batch(session, rows)
+                    session.commit()
+            except HTTPException:
+                raise
+            except Exception:
+                logger.error("release grant bulk revoke failed")
+                raise HTTPException(
+                    status_code=500, detail="grant unavailable"
+                )
+            return Response(
+                content=saved_body.encode("utf-8"),
+                status_code=200,
+                media_type="application/json",
+            )
+
+        # Idempotency-keyed bulk revoke. The equivalence range is the
+        # scope and the lexicographically ordered grant id / capability
+        # digest pairs; a same-key request outside this fingerprint is a
+        # stable 409 that changes nothing. The record commits in the same
+        # transaction as every grant flip, event and audit.
+        fingerprint = _bulk_revoke_fingerprint(
+            tenant_id,
+            workload_id,
+            [(grant_id, digest) for grant_id, _, digest in judged],
+        )
+
+        def _stored_record(session):
+            return session.scalar(
+                select(ReleaseGrantBulkRevokeIdempotencyRecord).where(
+                    ReleaseGrantBulkRevokeIdempotencyRecord.tenant_id
+                    == tenant_id,
+                    ReleaseGrantBulkRevokeIdempotencyRecord.workload_id
+                    == workload_id,
+                    ReleaseGrantBulkRevokeIdempotencyRecord.idempotency_key
+                    == idempotency_key,
+                )
+            )
+
+        def _replay(record) -> Response:
+            # A replay answers with the stored first 200 verbatim: it
+            # never re-judges a grant (a later settlement, expiry or any
+            # other change is irrelevant), appends no event or audit and
+            # changes neither a status nor a timestamp.
+            if not hmac.compare_digest(record.request_fingerprint, fingerprint):
+                raise HTTPException(
+                    status_code=409, detail="idempotency conflict"
+                )
+            return Response(
+                content=record.response_body.encode("utf-8"),
+                status_code=200,
+                media_type="application/json",
+            )
+
+        saved_body: str | None = None
+        replay_response: Response | None = None
+        try:
+            for _ in range(2):
+                with session_factory() as session:
+                    existing = _stored_record(session)
+                    if existing is not None:
+                        return _replay(existing)
+                    # First keyed request for this scope+key. Every
+                    # judgement failure raises out of the context manager,
+                    # which rolls back, so no idempotency row is left
+                    # behind and the key stays free for a recovered retry.
+                    try:
+                        rows = _judge_batch(session)
+                        saved_body = _settle_batch(
+                            session,
+                            rows,
+                            winner_lookup=lambda: _stored_record(session),
+                        )
+                    except _ReplayWinner as exc:
+                        # On a locking backend a same-key loser reaches the
+                        # guarded UPDATE before the winner's record was
+                        # visible; the winning settlement and its record are
+                        # one commit, so answer as a replay (200) or a
+                        # same-key mismatch (409) while the session is open.
+                        replay_response = _replay(exc.record)
+                        break
+                    session.add(
+                        ReleaseGrantBulkRevokeIdempotencyRecord(
+                            record_id=str(uuid.uuid4()),
+                            tenant_id=tenant_id,
+                            workload_id=workload_id,
+                            idempotency_key=idempotency_key,
+                            request_fingerprint=fingerprint,
+                            response_body=saved_body,
+                            created_at=now,
+                        )
+                    )
+                    try:
+                        # All flips, events, audits and the idempotency
+                        # record commit together: a crash can never leave
+                        # a half-revoked batch or a record pointing at an
+                        # unsettled batch.
+                        session.commit()
+                    except IntegrityError:
+                        # A concurrent request for the same scope+key
+                        # committed first. Reread its record and answer as
+                        # a replay (verbatim 200) or a conflict (409).
+                        session.rollback()
+                        winner_record = _stored_record(session)
+                        if winner_record is not None:
+                            return _replay(winner_record)
+                        continue
+                    except Exception:
+                        session.rollback()
+                        logger.error(
+                            "release grant bulk revoke write failed"
+                        )
+                        raise HTTPException(
+                            status_code=500, detail="grant unavailable"
+                        )
+                    break
+            else:  # pragma: no cover - defensive: reread always settles
+                logger.error(
+                    "release grant bulk revoke idempotency race did not settle"
+                )
+                raise HTTPException(
+                    status_code=500, detail="grant unavailable"
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("release grant bulk revoke failed")
+            raise HTTPException(
+                status_code=500, detail="grant unavailable"
+            )
+
+        if replay_response is not None:
+            return replay_response
 
         assert saved_body is not None
         return Response(
